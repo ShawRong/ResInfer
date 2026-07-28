@@ -1,0 +1,112 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Models directory - ignore downloaded models
+models/
+checkpoints/
+*.safetensors
+*.bin
+*.pth
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Quantizer specific
+quantizers-package.bundle
+.cache
+.clangd
+compile_commands.json
+eval_results
+AGENTS.md
+CLAUDE.md
+eval_results*/
+full_results
+test/
+calibration*/full_result/
+activations_store/
+runs/
+.venv/
+.venv-download/
+.venv-downloaded/
+.vscode/
+.claude/
+.cluade/
+runs/
+artifacts/
+/exported_model/
+modal_results/
+result/
+
+# Profiling / large binary outputs
+*.sqlite
+*.nsys-rep
+*.qdrep
+*.ncu-rep
+/trace.json
+/CLAUDE.md.backup
+/run_suite.py
+
+# Generated figures / benchmark outputs
+/scripts/figures/
+/result/figures/
+
+# Local runner scratch suites.
+# Keep production/reusable suites under tests/runner/suites/*.yaml.
+# Put one-off experiments here so they do not pollute git status.
+/tests/runner/suites/_tmp/*
+!/tests/runner/suites/_tmp/README.md
+
+# Local scratch scripts.
+/scripts/_tmp/*
+!/scripts/_tmp/README.md
+/.litellm_cache
+
+# Local machine config. Tracked configs are OSS-safe defaults.
+/configs/*.local.yaml

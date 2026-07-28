@@ -1,0 +1,13 @@
+# Copy to configs/models.local.yaml and edit for your machine.
+
+models:
+  qwen3_8b:
+    path: ${MODEL_ROOT}/Qwen3-8B
+
+  qwen3_4b:
+    path: ${MODEL_ROOT}/Qwen3-4B
+
+  exported_residue_example:
+    path: /path/to/exported/residue/checkpoint
+
+default_model: qwen3_8b

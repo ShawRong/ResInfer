@@ -1,0 +1,76 @@
+# Dataset Registry
+# Suites declare dataset_ref; DatasetManager handles stable loading/caching.
+#
+# For local development, prefer setting RESIDUE_DATASET_CACHE or creating a
+# git-ignored configs/datasets.local.yaml with a machine-specific cache root.
+
+# 全局缓存配置
+cache:
+  root: .cache/huggingface
+
+# 数据集定义
+datasets:
+  # ========== Calibration Datasets ==========
+  c4:
+    repo: allenai/c4
+    config: en
+    split: train
+    revision: null  # 不传给 HF，resolved_revision 记录在 provenance
+    description: "C4 English - standard calibration dataset"
+    streaming_default: true
+    text_field: text
+    is_large: true
+
+  wikitext2:
+    repo: Salesforce/wikitext
+    config: wikitext-2-raw-v1
+    split: test
+    revision: null  # TODO: pin to specific commit after verification
+    description: "WikiText-2 - perplexity evaluation"
+
+  pile_val:
+    repo: EleutherAI/pile
+    config: default
+    split: validation
+    revision: null  # 暂不锁定，用时检查
+    description: "The Pile validation set"
+
+  # ========== Evaluation Datasets ==========
+  # 这些通常由 lm-eval-harness 管理，但我们也可以预下载
+  mmlu:
+    repo: cais/mmlu
+    config: all
+    split: test
+    revision: null
+    description: "MMLU benchmark"
+
+  gsm8k:
+    repo: openai/gsm8k
+    config: main
+    split: test
+    revision: null
+    description: "GSM8K math benchmark"
+
+  arc_challenge:
+    repo: allenai/ai2_arc
+    config: ARC-Challenge
+    split: test
+    revision: null
+    description: "ARC Challenge"
+
+  arc_easy:
+    repo: allenai/ai2_arc
+    config: ARC-Easy
+    split: test
+    revision: null
+    description: "ARC Easy"
+
+  hellaswag:
+    repo: Rowan/hellaswag
+    config: default
+    split: validation
+    revision: null
+    description: "HellaSwag"
+
+# 默认 seed（可复现抽样）
+default_seed: 42

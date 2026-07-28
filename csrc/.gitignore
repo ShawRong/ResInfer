@@ -1,0 +1,7 @@
+kernel/test/
+kernel/build/
+kernel/nvfp4/_C*.so
+kernel/nvfp4.egg-info/
+kernel/**/*.pyc
+kernel/**/__pycache__/
+/archive/
