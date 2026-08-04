@@ -21,7 +21,7 @@
 [project]
 name = "resinfer-export"
 version = "0.1.0"
-description = "ResInfer FP4 export venv (ModelOpt 0.45.0rc1 + TRT-LLM 1.1.0 + torch 2.9 cu130)"
+description = "ResInfer FP4 export venv (ModelOpt 0.45.0 + TRT-LLM 1.1.0 + torch 2.9 cu130)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     # ── Torch (cu130 for Blackwell sm_100/sm_120, ABI-compat with TRT-LLM 1.1.0) ─
@@ -32,7 +32,7 @@ dependencies = [
     # ── ModelOpt — export/calibration dependency managed only in this venv ──
     # (torch is a baseline dep of modelopt, not an extra — bracket `[torch]`
     # was an old typo that uv silently ignored. Removed for cleanliness.)
-    "nvidia-modelopt==0.45.0rc1",
+    "nvidia-modelopt==0.45.0",
 
     # ── TRT-LLM 1.1.0 — see [[tool.uv.dependency-metadata]] below for the
     #    modelopt-pin override that makes this resolvable.
@@ -84,7 +84,7 @@ tensorrt-llm = { index = "nvidia" }
 nvidia-modelopt = { index = "nvidia" }
 
 # ModelOpt is normally resolved from NVIDIA's package index as
-# nvidia-modelopt==0.45.0rc1.
+# nvidia-modelopt==0.45.0.
 # Development mode: uncomment below to point at a local sibling checkout.
 # `uv sync --project env-export --reinstall-package nvidia-modelopt` is
 # required after toggling.

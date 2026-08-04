@@ -31,8 +31,20 @@ def _maybe_patch_vllm() -> None:
         from quant.vllm_integration.patch import patch_vllm_modelopt
 
         patch_vllm_modelopt(model_dir=model_dir)
-    except Exception:
+    except Exception as exc:
         # Best-effort only: vLLM may not be installed for non-vLLM workflows.
+        # But when RESIDUE_PATCH_VLLM is explicitly on, a silent skip means the
+        # residue kernels never activate — surface the reason instead of hiding
+        # it (this was the e2e "patch didn't reach the worker" root cause).
+        if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
+            import traceback
+
+            print(
+                f"[residue:sitecustomize] patch FAILED in pid={os.getpid()}: "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            traceback.print_exc()
         return
 
 

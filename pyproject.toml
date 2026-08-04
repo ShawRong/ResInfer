@@ -23,6 +23,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -51,9 +52,13 @@ dependencies = [
     "protobuf>=6.33.1",
 
     # ── Eval stack (vllm + lm-eval) ──────────────────────────────────────
-    "vllm==0.23.1rc1.dev260+gb5a2adec4",
-    "flashinfer-python==0.6.12",
-    "flashinfer-cubin==0.6.12",
+    "vllm==0.26.0",
+    "flashinfer-python==0.6.14",
+    # flashinfer-cubin is deliberately NOT pinned: flashinfer enforces an
+    # EXACT cubin/python version match and the cubin package lags (latest
+    # 0.6.13 vs flashinfer-python 0.6.14), so installing it makes
+    # `import flashinfer` raise. Without it flashinfer fetches/JITs cubins
+    # on demand, which is verified working (nvfp4_quantize smoke).
     "xgrammar>=0.2.1,<1.0.0",             # vllm structured-output backend
     "mistral-common[image]>=1.11.3",      # vllm tokenizer / multimodal dep
     "ray>=2.53.0",
@@ -71,7 +76,7 @@ dependencies = [
     "cupti-python==13.2.0",               # used by flashinfer bench + nsys timing harnesses
 
     # ── CUTLASS runtime (also pulled by vllm; pin to match) ──────────────
-    "nvidia-cutlass-dsl[cu13]==4.5.2",
+    "nvidia-cutlass-dsl[cu13]==4.6.0",
 
     # ── Misc utilities ───────────────────────────────────────────────────
     "numpy>=2.0.0,<3.0.0",
@@ -97,10 +102,6 @@ dependencies = [
     "nvidia-nvshmem-cu12>=3.0",
     "nvidia-cublas-cu12>=12.0",
 ]
-
-[project.scripts]
-resinfer-export = "dev.export.export_residue_model:main"
-resinfer-serve = "dev.serving.serve_vllm:main"
 
 [tool.setuptools.packages.find]
 include = [

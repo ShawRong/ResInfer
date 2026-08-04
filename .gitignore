@@ -75,10 +75,8 @@ runs/
 .venv/
 .venv-download/
 .venv-downloaded/
-.vscode/
 .claude/
 .cluade/
-runs/
 artifacts/
 /exported_model/
 modal_results/
