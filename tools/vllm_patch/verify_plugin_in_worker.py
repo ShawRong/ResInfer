@@ -8,13 +8,15 @@ We deliberately do NOT patch in the main process — the plugin
 install the patch in the worker. With default multiprocessing on
 (`VLLM_ENABLE_V1_MULTIPROCESSING` unset ⇒ 1), EngineCore runs in a subprocess;
 if `[residue:plugin] applied in pid=<X>` prints with a `(EngineCore pid=<X>)`
-prefix (X ≠ main pid), the plugin fired inside the worker.
+prefix (X ≠ main pid), the plugin fired inside the worker — exactly the
+propagation that sitecustomize/.pth failed to achieve on Modal.
 
 A small bf16 model is enough: we only need the patch to reach the worker, not to
-exercise the NVFP4 fold kernel. Point at any complete local checkpoint:
+exercise the NVFP4 fold kernel (that is the B200/30B run). Point at any complete
+local checkpoint:
 
     RESIDUE_TEST_MODEL=/path/to/model \
-      .venv/bin/python tools/vllm_patch/verify_plugin_in_worker.py
+      python tools/vllm_patch/verify_plugin_in_worker.py
 
 Prereq: `pip install tools/vllm_patch/residue_vllm_plugin` so the entry point is
 discoverable, and the repo root on PYTHONPATH so the worker can import `quant`.
@@ -26,9 +28,8 @@ os.environ["RESIDUE_PATCH_MODE"] = "mext_r1"
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_LOGGING_LEVEL", "WARNING")
 
-MODEL = os.environ.get("RESIDUE_TEST_MODEL", "")
-if not MODEL:
-    raise SystemExit("set RESIDUE_TEST_MODEL=/path/to/local/checkpoint")
+MODEL = os.environ.get("RESIDUE_TEST_MODEL",
+                       "Qwen/Qwen3-0.6B")
 
 
 def main() -> None:

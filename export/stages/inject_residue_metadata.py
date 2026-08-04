@@ -164,12 +164,15 @@ class InjectResidueMetadataStage(Stage):
                     f"min={min_idx}, max={max_idx}, in_features={current_in_features}"
                 )
 
-            self._validate_weight_block_alignment(
-                module=module,
-                current_in_features=int(current_in_features),
-                num_salient=int(salient_indices.numel()),
-                layer_name=layer_name,
-            )
+            # ratio-1.0 layers are not K-extended (mext_r1 runtime mode), so
+            # the extended-K block-alignment invariant does not apply to them.
+            if int(salient_indices.numel()) != int(current_in_features):
+                self._validate_weight_block_alignment(
+                    module=module,
+                    current_in_features=int(current_in_features),
+                    num_salient=int(salient_indices.numel()),
+                    layer_name=layer_name,
+                )
             salient_map[layer_name] = salient_indices
 
         summary = inject_residue_salient_map(
@@ -184,20 +187,26 @@ class InjectResidueMetadataStage(Stage):
 
         extended_count = int(summary["newly_extended_layers"])
         already_extended_count = int(summary["already_extended_layers"])
+        mext_r1_count = int(summary.get("mext_r1_layers", 0))
 
         ctx.set_artifact("injected_residue_metadata", metadata_path)
         ctx.set_meta("residue_metadata_path", str(metadata_path))
         ctx.set_meta("residue_ratio", declared_ratio)
-        ctx.set_meta("injected_residue_layers", extended_count + already_extended_count)
+        ctx.set_meta("injected_residue_layers", extended_count + already_extended_count + mext_r1_count)
         ctx.set_meta("skipped_non_salient_metadata_layers", skipped_non_salient_layers)
-        ctx.metrics["injected_residue_layers"] = extended_count + already_extended_count
+        ctx.metrics["injected_residue_layers"] = (
+            extended_count + already_extended_count + mext_r1_count
+        )
         ctx.metrics["newly_extended_residue_layers"] = extended_count
         ctx.metrics["already_extended_residue_layers"] = already_extended_count
+        ctx.metrics["mext_r1_residue_layers"] = mext_r1_count
         ctx.metrics["skipped_non_salient_metadata_layers"] = len(skipped_non_salient_layers)
 
         print_rank_0(
-            f"✓ Injected residue metadata for {extended_count + already_extended_count} layers "
-            f"({extended_count} newly extended, {already_extended_count} already extended)"
+            f"✓ Injected residue metadata for "
+            f"{extended_count + already_extended_count + mext_r1_count} layers "
+            f"({extended_count} newly extended, {already_extended_count} already "
+            f"extended, {mext_r1_count} mext_r1/ratio-1.0 without weight extension)"
         )
         if skipped_non_salient_layers:
             print_rank_0(

@@ -8,7 +8,12 @@ import torch
 
 from .extension import ensure_loaded
 
-ensure_loaded()
+# Soft load: a missing extension only warns; the failure is deferred
+# to the first op call (see extension.py).
+ensure_loaded(required=False)
+
+
+
 
 _MEXT_R1_ELTS_MODE_AUTO = 0
 _MEXT_R1_ELTS_MODE_8 = 8
@@ -16,6 +21,11 @@ _MEXT_R1_ELTS_MODE_16 = 16
 _MEXT_R1_LAYOUT_CONCAT = 0
 _MEXT_R1_LAYOUT_ROW_PAIR = 1
 _MEXT_R1_LAYOUT_TILE8 = 2
+# K-concat: [M, 2K] geometry -- base in element cols [0, K), residue in
+# [K, 2K), data AND SF in the canonical order of the (M, 2K) grid. The
+# wrapped-K-loop GEMM's activation operand; a downstream GEMM cannot tell it
+# from a stock quantization of a 2K-wide input.
+_MEXT_R1_LAYOUT_CONCAT_K = 3
 
 
 def _resolve_mext_r1_elts_mode(elts_mode=None) -> int:
@@ -61,45 +71,36 @@ def _resolve_mext_r1_layout_mode(layout_mode=None) -> int:
             return _MEXT_R1_LAYOUT_ROW_PAIR
         if normalized in {"tile8", "tile_8", "tile8_pair", "tile8_row_pair"}:
             return _MEXT_R1_LAYOUT_TILE8
+        if normalized in {"concat_k", "kext", "k_concat", "kloop"}:
+            return _MEXT_R1_LAYOUT_CONCAT_K
         raise ValueError(
             f"Unsupported mext_r1 layout_mode '{layout_mode}'. "
-            "Expected one of: concat, row_pair, tile8."
+            "Expected one of: concat, row_pair, tile8, concat_k."
         )
 
     if layout_mode in (
         _MEXT_R1_LAYOUT_CONCAT,
         _MEXT_R1_LAYOUT_ROW_PAIR,
         _MEXT_R1_LAYOUT_TILE8,
+        _MEXT_R1_LAYOUT_CONCAT_K,
     ):
         return int(layout_mode)
 
     raise ValueError(
         f"Unsupported mext_r1 layout_mode {layout_mode!r}. "
-        "Expected one of: concat, row_pair, tile8."
+        "Expected one of: concat, row_pair, tile8, concat_k."
     )
 
 
 def scaled_fp4_quant_mext_r1(
     input_tensor: torch.Tensor,
     input_scale: torch.Tensor,
-    salient_indices,
-    use_swapped_residue: bool = False,
+    *,
     elts_mode=None,
     layout_mode=None,
     m_pad_multiple=None,
 ):
-    """Ratio=1.0 M-extension FP4 quantization entrypoint.
-
-    The public signature intentionally matches scaled_fp4_quant() for easier
-    call-site migration, but this path does not consume salient_indices or
-    use_swapped_residue internally. The underlying kernel emits a row-doubled
-    layout directly:
-
-      - output data:  [2M, K/2] packed uint8
-      - output scale: tiled layout over (2M, K)
-    """
-    del salient_indices, use_swapped_residue
-
+    'Ratio=1.0 M-extension FP4 quantization entrypoint.'
     resolved_elts_mode = _resolve_mext_r1_elts_mode(elts_mode)
     resolved_layout_mode = _resolve_mext_r1_layout_mode(layout_mode)
 
@@ -129,8 +130,14 @@ def scaled_fp4_quant_mext_r1(
         dtype=torch.uint8,
         device=input_tensor.device,
     )
-    num_m_tiles = (2 * output_m + 127) // 128
-    num_k_tiles = (k + 63) // 64
+    if resolved_layout_mode == _MEXT_R1_LAYOUT_CONCAT_K:
+        # (M, 2K) grid: same data bytes, but the SF atom tiling follows the
+        # output geometry, not the row-doubled one.
+        num_m_tiles = (output_m + 127) // 128
+        num_k_tiles = (2 * k + 63) // 64
+    else:
+        num_m_tiles = (2 * output_m + 127) // 128
+        num_k_tiles = (k + 63) // 64
     output_scale = torch.empty(
         num_m_tiles * num_k_tiles * 512,
         dtype=torch.uint8,
@@ -148,6 +155,9 @@ def scaled_fp4_quant_mext_r1(
         resolved_elts_mode,
         resolved_layout_mode,
     )
+    if resolved_layout_mode == _MEXT_R1_LAYOUT_CONCAT_K:
+        # [M, 2K] packed: K bytes per row (2 FP4 elements per byte).
+        return output.view(output_m, k), output_scale
     return output.view(2 * output_m, k // 2), output_scale
 
 

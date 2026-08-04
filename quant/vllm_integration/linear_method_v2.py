@@ -46,6 +46,11 @@ except ImportError:
 from .layout_utils import prepare_decode_mext_weight_layout_from_raw_scale
 from .linear_debug import maybe_tap_tensor
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
+from .residue_tp import (
+    SF_VEC_SIZE as SF_VEC_SIZE_FOR_TP,
+    current_tp_rank,
+    plan_from_partition,
+)
 # Side-effect import: registers `torch.ops.residue.nvfp4_linear`, the opaque
 # custom_op that wraps the residue NVFP4 GEMM pipeline (both mext-fold and
 # legacy K-ext kernel chains) so torch.compile sees one black-box op call per
@@ -84,6 +89,44 @@ _DECODE_MEXT_ENABLED = os.environ.get("RESIDUE_ENABLE_DECODE_MEXT", "0") == "1"
 
 def _is_kernel_instance(kernel: object, kernel_cls: type | None) -> bool:
     return kernel_cls is not None and isinstance(kernel, kernel_cls)
+
+
+_FOLD_REGISTER_WARNED = set()
+
+
+def _warn_once_fold_register(tag, exc):
+    if tag in _FOLD_REGISTER_WARNED:
+        return
+    _FOLD_REGISTER_WARNED.add(tag)
+    print(f"[residue] sm120 fold shape registration failed ({tag}): "
+          f"{type(exc).__name__}: {exc}", flush=True)
+
+
+def _register_fold_shape_for(layer, tag: str) -> None:
+    """Pre-compile the SM120 CuTeDSL fold for this layer's shape.
+
+    There are THREE places that mark a layer fold-eligible -- ext-K prefix
+    (layout_utils), plain NVFP4 with activation-side mext, and mext_r1 -- and
+    every one of them must register or the warmup silently under-covers.
+    Missing just the plain-NVFP4 branch left 4 of 9 live shapes uncompiled,
+    which showed up only as cudagraph capture taking 46 s instead of 5 s.
+
+    The key is derived from the SAME view the op will pass the kernel, so the
+    warmup and the runtime cannot disagree about the row stride.
+    """
+    try:
+        from .residue_linear_op import (_base_k_weight_view,
+                                        register_sm120_fold_shape)
+
+        k_base = int(getattr(layer, "_mext_decode_k_base", 0))
+        if k_base <= 0:
+            return
+        view = _base_k_weight_view(layer.weight, k_base)
+        register_sm120_fold_shape(
+            int(view.shape[0]), k_base, int(view.stride(0)) * 2,
+            is_mext_r1=(tag == "mext_r1"))
+    except Exception as e:                                # noqa: BLE001
+        _warn_once_fold_register(tag, e)
 
 
 class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
@@ -212,13 +255,47 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 f"decode_mext_enabled={_DECODE_MEXT_ENABLED}",
                 flush=True,
             )
+        # Row-parallel layers (o_proj / down_proj) arrive with the input
+        # already sharded, so the extended K has to be sharded too. The plan
+        # is built from these arguments alone -- `input_size_per_partition <
+        # input_size` IS the row-parallel signal -- so no process-group
+        # lookup is needed and the rule stays unit-testable. Column-parallel
+        # layers get None back: their input is whole, so the old
+        # override-with-the-full-extended-K is exactly right.
+        shard_plan = None
+        if extended_dim is not None:
+            meta = get_layer_metadata(self.quant_config, layer_name) or {}
+            num_salient_meta = int(meta.get("num_salient", 0))
+            shard_plan = plan_from_partition(
+                extended_dim=extended_dim,
+                input_size_per_partition=input_size_per_partition,
+                input_size=input_size,
+                num_salient=num_salient_meta,
+                tp_rank=current_tp_rank(),
+            )
+
         if extended_dim is not None:
             original_input = input_size_per_partition
-            input_size_per_partition = extended_dim
-            input_size = extended_dim
+            if shard_plan is not None:
+                # Per-rank extended width == K_ext / tp. `input_size` stays
+                # logical-and-whole: vLLM only uses it to derive shard sizes,
+                # and our loader does the extended gather itself.
+                input_size_per_partition = shard_plan.k_ext_shard
+                input_size = extended_dim
+            else:
+                input_size_per_partition = extended_dim
+                input_size = extended_dim
             print(
                 f"[residue] {layer_name}: overriding input_size "
-                f"{original_input} -> {extended_dim}"
+                f"{original_input} -> {input_size_per_partition}"
+                + (
+                    f" (row-parallel tp={shard_plan.tp_size} "
+                    f"rank={shard_plan.tp_rank}: "
+                    f"{shard_plan.base_shard} base + "
+                    f"{shard_plan.salient_shard} salient)"
+                    if shard_plan is not None
+                    else ""
+                )
             )
 
         ModelOptNvFp4LinearMethod.create_weights(
@@ -232,12 +309,60 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             **extra_weight_attrs,
         )
 
+        # Row-parallel: permute the checkpoint's extended columns so that the
+        # stock loader's contiguous narrow lands on this rank's two ranges.
+        # Cheaper and far less invasive than replacing the loader, and it
+        # keeps every vLLM parameter subclass working untouched.
+        if shard_plan is not None:
+            layer._residue_shard_plan = shard_plan
+            self._wrap_extended_weight_loaders(layer, shard_plan)
+
         # Receive checkpoint keys such as
         # <layer>.input_quantizer._salient_indices without changing the native
         # vLLM NVFP4 weight contract.
         layer.register_module("input_quantizer", _InputQuantizerState())
         layer._is_residue_layer = False
         layer.num_salient = 0
+
+    @staticmethod
+    def _wrap_extended_weight_loaders(layer, shard_plan) -> None:
+        """Interleave extended columns before vLLM's loader slices them.
+
+        `weight` is packed FP4 (two nibbles per byte, so K_ext/2 columns) and
+        `weight_scale` holds one scale per 16 channels -- hence the differing
+        `scale` factors. Anything whose last dim is not an extended width is
+        left alone: it is not a K-extended tensor.
+        """
+        from .residue_tp import interleave_extended_for_tp
+
+        layer_tag = getattr(layer, 'prefix', '?')
+        targets = (("weight", 2), ("weight_scale", SF_VEC_SIZE_FOR_TP))
+        for name, scale in targets:
+            param = getattr(layer, name, None)
+            if param is None:
+                continue
+            orig = getattr(param, "weight_loader", None)
+            if orig is None:
+                continue
+
+            def make(orig_loader, col_scale):
+                def loader(param_, loaded_weight, *args, **kwargs):
+                    expected = shard_plan.k_ext // col_scale
+                    fired = loaded_weight.shape[-1] == expected
+                    if fired:
+                        loaded_weight = interleave_extended_for_tp(
+                            loaded_weight, shard_plan, scale=col_scale
+                        )
+                    if os.environ.get("RESIDUE_DEBUG_TP", "0") == "1":
+                        print(f"[residue:tp-loader] {layer_tag} "
+                              f"loaded={tuple(loaded_weight.shape)} "
+                              f"expected_last={expected} interleaved={fired} "
+                              f"param={tuple(param_.data.shape)}", flush=True)
+                    return orig_loader(param_, loaded_weight, *args, **kwargs)
+
+                return loader
+
+            param.weight_loader = make(orig, scale)
 
     def _get_extended_dim(self, layer_name: str) -> int | None:
         """Look up the extended K for a residue layer.
@@ -298,6 +423,17 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 if hasattr(layer, "input_quantizer"):
                     layer.input_quantizer._salient_indices = salient_indices
 
+        # Row-parallel: everything below derives from the weight this rank
+        # actually holds (K_ext/tp wide), so the salient indices have to be
+        # this rank's too -- otherwise `original_in_features` would subtract
+        # the GLOBAL salient count from a per-rank extended width and the
+        # channel mask would be built over the wrong K. Rebasing here keeps
+        # both `num_salient` and `channel_mask` rank-local with no further
+        # changes downstream.
+        shard_plan = getattr(layer, "_residue_shard_plan", None)
+        if shard_plan is not None and salient_indices is not None:
+            salient_indices = shard_plan.local_salient_indices(salient_indices)
+
         if salient_indices is not None and salient_indices.numel() > 0:
             layer._is_residue_layer = True
             layer.num_salient = salient_indices.numel()
@@ -350,6 +486,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 layer._decode_mext_layout_enabled = True
                 layer.weight_scale_base = layer.weight_scale
                 layer._mext_decode_k_base = int(layer.original_in_features)
+                _register_fold_shape_for(layer, "plain_nvfp4")
         if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
             print(
                 "[residue:post_process_weights] "
@@ -398,6 +535,12 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         layer.original_in_features = original_in
         # Full K is the only K — fold reads the entire weight, no prefix slice.
         layer._mext_decode_k_base = int(original_in)
+        # Register AFTER _mext_decode_k_base is set: the registrar reads it and
+        # silently returns on 0. Registering ten lines earlier meant NO mext_r1
+        # layer was ever recorded, which starved both the sm120 pre-compile and
+        # the sm10x tuning-bucket ladder -- found live by the sm100 e2e warmup
+        # audit (registry empty, tune_sizes=[128], prefill on the static table).
+        _register_fold_shape_for(layer, "mext_r1")
 
         input_global_scale = layer.input_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
@@ -427,6 +570,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # Full scale doubles as "base scale" for the op dispatcher — fold reads
         # the entire weight, so no separate prefix scale is needed.
         layer.weight_scale_base = layer.weight_scale
+
 
     def apply(
         self,
@@ -546,6 +690,14 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             int(output_n),
             bool(fold_eligible),
             _USE_SWAP,
+            # mext_r1 layers were charged for a residue, so they must apply it
+            # at EVERY M -- see the dispatch comment in residue_linear_op. A
+            # plain-NVFP4 layer is also fold_eligible (the small-M fold is a
+            # free precision bonus there) but never paid, so it keeps the
+            # threshold. The two are otherwise indistinguishable in this
+            # signature: both carry num_salient=0 and k_base == full K.
+            bool(getattr(layer, "_runtime_mode", None)
+                 == self._RUNTIME_MODE_MEXT_R1),
         )
 
         if bias is not None:

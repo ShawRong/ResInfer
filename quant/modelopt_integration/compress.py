@@ -25,9 +25,9 @@ Usage:
     # Custom hook list:
     compress(model, hooks=["rebind_forward"])  # Only forward rebind
 
-The wrapper is intentionally conservative: hooks are no-ops when their target
-state is already correct, so it remains safe across ModelOpt versions that may
-fix the same behavior internally.
+See Also:
+    - .claude/reference/modelopt/75_mode.md for systematic analysis
+    - .claude/reference/modelopt/70_compress.md for compress mechanism details
 """
 
 from typing import List, Optional, Tuple, Type
@@ -229,9 +229,9 @@ def compress(
         If a hook finds nothing to do, it's a no-op. This makes the wrapper
         safe to use even if ModelOpt fixes issues in a future version.
 
-    The wrapper is intentionally conservative: hooks are no-ops when their
-    target state is already correct, so it remains safe across ModelOpt
-    versions that may fix the same behavior internally.
+    See Also:
+        - .claude/reference/modelopt/75_mode.md for systematic analysis
+        - .claude/reference/modelopt/70_compress.md for compress details
     """
     # Run compression
     if verbose:

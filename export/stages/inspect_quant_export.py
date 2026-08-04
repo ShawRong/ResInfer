@@ -159,10 +159,19 @@ class InspectQuantExportStage(Stage):
                     f"{metadata_path}: expected at least {min_metadata_layers} metadata layers, "
                     f"got {len(layers)}"
                 )
-            if min_extended_dims is not None and len(extended_dims) < int(min_extended_dims):
+            # mext_r1 (ratio-1.0) layers carry residue without weight
+            # extension, so they count as residue evidence alongside
+            # extended_linear_dims entries.
+            mext_r1_layers = sum(
+                1 for v in layers.values()
+                if isinstance(v, dict) and v.get("runtime_mode") == "mext_r1"
+            )
+            if (min_extended_dims is not None
+                    and len(extended_dims) + mext_r1_layers < int(min_extended_dims)):
                 raise AssertionError(
-                    f"{metadata_path}: expected at least {min_extended_dims} extended dims, "
-                    f"got {len(extended_dims)}"
+                    f"{metadata_path}: expected at least {min_extended_dims} extended dims "
+                    f"(or mext_r1 layers), got {len(extended_dims)} extended + "
+                    f"{mext_r1_layers} mext_r1"
                 )
 
         ctx.metrics["export_tensor_keys"] = len(keys)

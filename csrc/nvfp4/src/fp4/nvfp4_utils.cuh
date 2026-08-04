@@ -586,6 +586,8 @@ __device__ __forceinline__ uint32_t cvt_warp_fp16_to_fp4_mext_r1_fast(
         __shfl_xor_sync(uint32_t(-1), localMaxResidue, 1));
   }
 
+  // Dual-alpha: the residue half encodes its SF against its OWN global scale
+  // (SFScaleResVal == SFScaleVal in the legacy single-scale path).
   float residueSFValue = compute_sf_from_max(localMaxResidue, SFScaleResVal);
   residueSFValue = encode_sf_to_fp8<UE8M0_SF>(residueSFValue, residueSFOut);
   float residueOutputScale =
@@ -608,6 +610,34 @@ __device__ __forceinline__ uint32_t cvt_warp_fp16_to_fp4_mext_r1_fast(
 struct u32x2 {
   uint32_t lo, hi;
 };
+
+// Load 16 fp16/bf16 elements (one full SF vector, 32 bytes) in a single
+// 256-bit global load. Blackwell (sm_100+) exposes ld.global.v8.b32
+// (PTX ISA 8.8); older targets fall back to two 128-bit loads. `ptr` must be
+// 32-byte aligned -- guaranteed by K % 16 == 0 plus torch's base alignment.
+template <class Type>
+__device__ __forceinline__ void load_packed_vec16(Type const* ptr,
+                                                  PackedVec<Type>& lo,
+                                                  PackedVec<Type>& hi) {
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  union {
+    uint32_t u[8];
+    struct {
+      PackedVec<Type> lo, hi;
+    } v;
+  } tmp;
+  asm volatile(
+      "ld.global.v8.b32 {%0, %1, %2, %3, %4, %5, %6, %7}, [%8];"
+      : "=r"(tmp.u[0]), "=r"(tmp.u[1]), "=r"(tmp.u[2]), "=r"(tmp.u[3]),
+        "=r"(tmp.u[4]), "=r"(tmp.u[5]), "=r"(tmp.u[6]), "=r"(tmp.u[7])
+      : "l"(ptr));
+  lo = tmp.v.lo;
+  hi = tmp.v.hi;
+#else
+  lo = reinterpret_cast<PackedVec<Type> const*>(ptr)[0];
+  hi = reinterpret_cast<PackedVec<Type> const*>(ptr)[1];
+#endif
+}
 
 // Transitional pack16 path for mext_r1:
 // - one thread owns 16 elements
@@ -712,8 +742,11 @@ __device__ __forceinline__ u32x2 cvt_warp_fp16_to_fp4_mext_r1_fast16(
   }
 
   if (residueDataOut) {
-    residueDataOut[0] = fp32_vec_to_e2m1(loResidueScaled);
-    residueDataOut[1] = fp32_vec_to_e2m1(hiResidueScaled);
+    // Single 64-bit store (st.global.v2.b32); the residue offset is always
+    // an even uint32 index because numCols % 16 == 0.
+    *reinterpret_cast<uint2*>(residueDataOut) =
+        make_uint2(fp32_vec_to_e2m1(loResidueScaled),
+                   fp32_vec_to_e2m1(hiResidueScaled));
   }
 
   return mainPacked;

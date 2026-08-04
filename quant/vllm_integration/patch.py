@@ -63,6 +63,204 @@ def _choose_linear_method_cls(version: str = "auto"):
     return ResidueNvFp4LinearMethodV2, tag
 
 
+def _install_shared_autotune_cache() -> None:
+    "Let models with the same GEMM shapes reuse each other's tuned tactics."
+    if os.environ.get("RESIDUE_SHARE_AUTOTUNE_CACHE", "0") != "1":
+        return
+
+    # The resolver moved between vLLM generations. Newer trees factor it out
+    # as `warmup.flashinfer_autotune_cache.resolve_flashinfer_autotune_file`;
+    # the pinned dev260 serving stack defines it PRIVATELY inside
+    # kernel_warmup as `_resolve_flashinfer_autotune_file`. Missing the second
+    # made RESIDUE_SHARE_AUTOTUNE_CACHE=1 a silent no-op on the stack real
+    # serving runs on -- caught by the sm100 e2e warmup audit.
+    fac = None
+    try:
+        from vllm.model_executor.warmup import flashinfer_autotune_cache as fac
+    except ImportError:
+        pass
+    try:
+        from vllm.model_executor.warmup import kernel_warmup as kw
+    except Exception as e:                                # noqa: BLE001
+        print(f"[residue] shared autotune cache unavailable: {e}", flush=True)
+        return
+
+    holders = []                    # (module, attribute) pairs to rebind
+    if fac is not None and hasattr(fac, "resolve_flashinfer_autotune_file"):
+        holders.append((fac, "resolve_flashinfer_autotune_file"))
+        # kernel_warmup imported the symbol by name at module load, so
+        # rebinding the source module alone would leave the caller pointing
+        # at the original.
+        if hasattr(kw, "resolve_flashinfer_autotune_file"):
+            holders.append((kw, "resolve_flashinfer_autotune_file"))
+    elif hasattr(kw, "_resolve_flashinfer_autotune_file"):
+        holders.append((kw, "_resolve_flashinfer_autotune_file"))
+    if not holders:
+        print("[residue] shared autotune cache unavailable: no known "
+              "resolver in this vLLM's warmup module", flush=True)
+        return
+
+    anchor = holders[0][0]
+    if getattr(anchor, "_residue_shared_cache_installed", False):
+        return
+    _orig_resolve = getattr(*holders[0])
+
+    def _resolve_shared(runner):
+        # Reuse the original to get the fully-formed path (it also creates the
+        # directory and honours VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR), then swap
+        # the model-hash component for a fixed one. Deriving the root by hand
+        # would duplicate vLLM's version/arch layout and drift from it.
+        try:
+            per_model = _orig_resolve(runner)
+            shared_dir = per_model.parent.parent / "shared"
+            shared_dir.mkdir(parents=True, exist_ok=True)
+            return shared_dir / per_model.name
+        except Exception as e:                            # noqa: BLE001
+            print(f"[residue] shared autotune cache path failed, using "
+                  f"per-model: {type(e).__name__}: {e}", flush=True)
+            return _orig_resolve(runner)
+
+    for mod, attr in holders:
+        setattr(mod, attr, _resolve_shared)
+    anchor._residue_shared_cache_installed = True
+    print("[residue] FlashInfer autotune cache SHARED across models "
+          "(RESIDUE_SHARE_AUTOTUNE_CACHE=1). Entries are keyed by "
+          "(op, runner, shape), so only genuinely new shapes are profiled. "
+          "Do not start two servers concurrently against it -- FlashInfer "
+          "documents concurrent writes as best-effort.", flush=True)
+
+
+def _install_sm120_cutedsl_fold_warmup() -> None:
+    'Pre-compile the SM120 CuTeDSL fold BEFORE cudagraph capture.'
+    try:
+        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+    except Exception as e:                                # noqa: BLE001
+        print(f"[residue] sm120 fold warmup hook unavailable: {e}", flush=True)
+        return
+    if getattr(GPUModelRunner, "_residue_sm120_warmup_installed", False):
+        return
+    _orig_capture = GPUModelRunner.capture_model
+
+    def _capture_with_warmup(self, *args, **kwargs):
+        # Belt and braces only: the real pre-compile happens in
+        # register_sm120_fold_shape at PWAL, because this hook is NOT reliably
+        # reached (vLLM also captures from profile_cudagraph_memory). Anything
+        # PWAL already compiled is an lru_cache hit here, so this costs nothing
+        # when it does run and covers a shape PWAL somehow missed when it does.
+        try:
+            from .residue_linear_op import (_FOLD_MAX_M,
+                                            warmup_sm120_cutedsl_fold)
+
+            sizes = getattr(self.vllm_config.compilation_config,
+                            "cudagraph_capture_sizes", None) or []
+            fold_sizes = sorted({int(m) for m in sizes if int(m) <= _FOLD_MAX_M})
+            # Capture sizes are the graph shapes; the fold also runs eagerly at
+            # other M below the threshold, so cover the powers of two too.
+            fold_sizes = sorted(set(fold_sizes) | {
+                m for m in (1, 2, 4, 8, 16, 32, 64, 128) if m <= _FOLD_MAX_M})
+            if fold_sizes:
+                warmup_sm120_cutedsl_fold(fold_sizes)
+        except Exception as e:                            # noqa: BLE001
+            print(f"[residue] sm120 fold warmup skipped: "
+                  f"{type(e).__name__}: {str(e)[:90]}", flush=True)
+
+        # sm10x: shape-independent, so it needs no registration -- one call
+        # covers the whole space. Nothing did this before, which is why
+        # B200/B300 compiled the fold on first use. Cheap (a handful of
+        # kernels at ~1.3 s) and it removes the entire cold-start category.
+        try:
+            import torch
+
+            major, minor = torch.cuda.get_device_capability()
+            if major != 12:
+                from nvfp4.fold import warmup as _fold_warmup
+
+                n = _fold_warmup(int(major), int(minor))
+                if n:
+                    print(f"[residue] sm10x fold pre-compiled: {n} kernels",
+                          flush=True)
+        except Exception as e:                            # noqa: BLE001
+            print(f"[residue] sm10x fold warmup skipped: "
+                  f"{type(e).__name__}: {str(e)[:90]}", flush=True)
+
+        # OBSERVATION covers both arches. A clean capture prints nothing; if
+        # either warmup above under-covered, this names the keys it missed.
+        # Guard ONLY the import. Putting _orig_capture inside the try would
+        # re-run capture if vLLM itself raised ImportError somewhere in it.
+        try:
+            from nvfp4.fold import observe_compiles
+
+            ctx = observe_compiles("cudagraph capture")
+        except Exception:                                 # noqa: BLE001
+            import contextlib
+
+            ctx = contextlib.nullcontext()
+        with ctx:
+            return _orig_capture(self, *args, **kwargs)
+
+    GPUModelRunner.capture_model = _capture_with_warmup
+    GPUModelRunner._residue_sm120_warmup_installed = True
+
+
+def _maybe_dump_fold_tuning() -> None:
+    """Write the CuTeDSL fold tuner's decisions to RESIDUE_FOLD_TUNE_DUMP.
+
+    Purely observational: the FlashInfer layer's e2e result is already a file
+    (the autotune cache JSON), and this makes the python-tuner layer
+    comparable the same way, so scripts/audit_autotune_coverage.py can diff a
+    kernel-level tune against what the server actually ended up serving with.
+    """
+    path = os.environ.get("RESIDUE_FOLD_TUNE_DUMP")
+    if not path:
+        return
+    try:
+        import json
+
+        from nvfp4.cute_fold.tactics import dump_state
+
+        with open(path, "w") as f:
+            json.dump(dump_state(), f, indent=1, sort_keys=True)
+        print(f"[residue] fold tuning state dumped to {path}", flush=True)
+    except Exception as e:                                # noqa: BLE001
+        print(f"[residue] fold tuning dump failed: "
+              f"{type(e).__name__}: {str(e)[:70]}", flush=True)
+
+
+# (The former _MEXT_R1_PREFILL_BUCKETS injection died with the
+# fold-at-prefill route: mext_r1 prefill now goes through the
+# FlashInfer tuner, whose choose_one tunes every bucket in one forward.)
+
+
+# The fold band's bucket ladder (fold_max_m caps at 128 on sm10x).
+_FOLD_DECODE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+
+def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
+    'Token counts to run inside the fold tuning window.'
+    sizes = {warmup_tok}
+    try:
+        import torch
+
+        from .residue_linear_op import _SM120_FOLD_SHAPES
+
+        if torch.cuda.get_device_capability()[0] == 10 and _SM120_FOLD_SHAPES:
+            mnbt = int(getattr(runner.scheduler_config,
+                               "max_num_batched_tokens", 0) or 0)
+
+            def _cap(bucket: int) -> int:
+                # A dummy run above max_num_batched_tokens is not legal;
+                # min() keeps the forward legal while _m_bucket still files
+                # the measurement under the bucket serving will look up.
+                return min(bucket, mnbt) if mnbt else bucket
+
+            sizes |= {_cap(b) for b in _FOLD_DECODE_BUCKETS}
+    except Exception as e:                                # noqa: BLE001
+        print(f"[residue] fold bucket probe failed "
+              f"({type(e).__name__}: {str(e)[:70]}); tuning the given decode "
+              "size only", flush=True)
+    return sorted(sizes)
+
+
 def _install_fold_decode_autotune_warmup() -> None:
     """Make the decode-only fold participate in FlashInfer autotuning -- and
     ride vLLM's cache + rank-0 broadcast so it is correct under TP too.
@@ -93,17 +291,27 @@ def _install_fold_decode_autotune_warmup() -> None:
         print(f"[residue] fold autotune warmup unavailable: {e}", flush=True)
         return
 
+    try:
+        from nvfp4.fold import tuning_mode as _fold_tuning_mode
+    except Exception:
+        # No CuTeDSL fold in this build; the FlashInfer half still applies.
+        import contextlib as _cl
+
+        def _fold_tuning_mode():
+            return _cl.nullcontext()
+
     if getattr(kw, "_residue_fold_warmup_installed", False):
         return
     _orig_flashinfer_autotune = kw.flashinfer_autotune
 
-    # A SINGLE decode-sized forward is enough. FlashInfer's choose_one tunes
-    # EVERY bucket in the op's gen_tuning_buckets (for the fold that is
-    # RESIDUE_MEXT_AUTOTUNE_M2_BUCKETS = 16,32,64,128,256) in one call --
-    # _generate_optimization_profiles emits one profile per bucket and choose_one
-    # loops over all of them. So one forward at any decode M covers the whole
-    # bucket range; extra forwards would just re-hit the cache. Cap the M at
-    # fold_max_m (128) and at max_num_seqs so the fold path is actually taken.
+    # ONE decode-sized forward covers the FlashInfer-registered ops entirely:
+    # choose_one tunes EVERY bucket in the op's gen_tuning_buckets in one call
+    # (_generate_optimization_profiles emits one profile per bucket), so the
+    # sm120 C++ fold op is fully tuned by it. The CuTeDSL sm10x tuner is
+    # BUCKET-LOCAL instead -- run_fold_autotuned caches per (shape, m-bucket)
+    # and only measures the bucket it was called at. A mext_r1 layer takes the
+    # fold at EVERY M (4083dee), so on sm10x its prefill buckets need their own
+    # tuning forwards or they silently serve the static fallback table.
     _FOLD_MAX_M = 128
 
     def _flashinfer_autotune_with_fold(runner) -> None:
@@ -112,20 +320,36 @@ def _install_fold_decode_autotune_warmup() -> None:
             warmup_tok = max(1, min(_FOLD_MAX_M, max_seqs))
         except Exception:
             warmup_tok = _FOLD_MAX_M
+        tune_sizes = _fold_tune_sizes(runner, warmup_tok)
 
         _orig_dummy_run = runner._dummy_run
         _state = {"done": False}
 
         def _dummy_run_with_decode(*args, **kwargs):
             out = _orig_dummy_run(*args, **kwargs)
-            # After vLLM's prefill profiling forward, run ONE decode-sized forward
+            # After vLLM's prefill profiling forward, run the tuning forwards
             # -- but only while actually tuning (leader rank), so non-leaders do
             # no extra work and only the leader's cache is broadcast.
             if (not _state["done"] and kwargs.get("is_profile")
                     and AutoTuner.get().is_tuning_mode):
                 _state["done"] = True
-                _orig_dummy_run(num_tokens=warmup_tok, skip_eplb=True,
-                                is_profile=True)
+                # The same forwards prime BOTH tuners. The C++ sm120 fold is
+                # tuned by FlashInfer via this autotune(cache=) context (tactic
+                # keyed on mext_fold_fp4_gemm; all buckets in the first call).
+                # The CuTeDSL sm10x fold keeps its own python cache instead, so
+                # it needs a window in which run_fold() is allowed to measure --
+                # it must never do that while serving, where a cudagraph
+                # capture is live. Per-size guard: losing one bucket degrades
+                # that bucket to the static table, which must not stop startup.
+                with _fold_tuning_mode():
+                    for m in tune_sizes:
+                        try:
+                            _orig_dummy_run(num_tokens=m, skip_eplb=True,
+                                            is_profile=True)
+                        except Exception as e:            # noqa: BLE001
+                            print(f"[residue] fold tuning forward m={m} "
+                                  f"failed: {type(e).__name__}: "
+                                  f"{str(e)[:70]}", flush=True)
             return out
 
         runner._dummy_run = _dummy_run_with_decode
@@ -133,8 +357,18 @@ def _install_fold_decode_autotune_warmup() -> None:
             _orig_flashinfer_autotune(runner)
         finally:
             runner._dummy_run = _orig_dummy_run
-        print(f"[residue] fold decode autotune folded into flashinfer warmup "
-              f"(m_tok={warmup_tok}, tuned={_state['done']})", flush=True)
+        tuned_cutedsl = None
+        try:
+            from nvfp4.cute_fold.tactics import _AUTOTUNE_CACHE
+            tuned_cutedsl = len(_AUTOTUNE_CACHE)
+        except Exception:
+            pass
+        print(f"[residue] fold autotune folded into flashinfer warmup "
+              f"(m_tok={tune_sizes}, tuned={_state['done']}, "
+              f"cutedsl_cached={tuned_cutedsl})", flush=True)
+        _maybe_dump_fold_tuning()
+
+
 
     kw.flashinfer_autotune = _flashinfer_autotune_with_fold
     kw._residue_fold_warmup_installed = True
@@ -161,6 +395,14 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
     if model_dir is not None:
         os.environ[RESIDUE_MODEL_DIR_ENV] = str(model_dir)
         print(f"[residue] Set {RESIDUE_MODEL_DIR_ENV}={model_dir}")
+
+    # The env contract, enforced where every launcher converges. Prints one
+    # resolved-config line (so logs always say what actually ran) and refuses
+    # known-fatal combinations at startup instead of hours later -- each rule
+    # in env_contract.py names the failure it prevents.
+    # RESIDUE_ENV_CHECK=0 downgrades refusals to warnings.
+    from .env_contract import enforce as _enforce_env_contract
+    _enforce_env_contract(model_dir=os.environ.get(RESIDUE_MODEL_DIR_ENV))
 
     if _patched:
         return False
@@ -246,10 +488,49 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
         except (ImportError, AttributeError) as e:
             print(f"[residue] Warning: Could not patch WEIGHT_LOADER_V2_SUPPORTED: {e}")
 
-        # The decode-only fold is invisible to vLLM's prefill-sized autotune
-        # warmup; add a decode-sized warmup so its tactic actually gets tuned.
-        if resolved_version == "mext_r1":
-            _install_fold_decode_autotune_warmup()
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        _install_fold_decode_autotune_warmup()
+
+        # Same reasoning, already applied here: extended_k checkpoints take the
+        # fold too (via --enable_decode_mext) and need the same pre-compile.
+        _install_sm120_cutedsl_fold_warmup()
+
+        # Must run BEFORE kernel_warmup resolves the cache path. Self-gated on
+        # RESIDUE_SHARE_AUTOTUNE_CACHE=1 and a no-op otherwise.
+        _install_shared_autotune_cache()
+
+        
+        
+        
+        
+        
+        
+        if os.environ.get("RESIDUE_STACK_DUMP_SIGNAL") == "1":
+            import faulthandler
+            import signal as _signal
+
+            faulthandler.register(_signal.SIGUSR1, all_threads=True,
+                                  chain=False)
+            print(f"[residue] SIGUSR1 stack dumps armed in pid={os.getpid()}",
+                  flush=True)
 
         # Re-enable vLLM's FlashInfer PERSISTENT autotune cache so the tuned
         # tactics (fold + fp4_gemm) are written once and reloaded on later boots
@@ -261,6 +542,9 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
             from . import patch_flashinfer_persistent_cache  # noqa: F401  auto-installs on import
         except Exception as _e:  # pragma: no cover - best-effort
             print(f"[residue] persistent-cache patch import failed: {_e}", flush=True)
+
+        # FusedMoEMethodCls is not patched: MoE expert weights stay on stock
+        # NVFP4; the residue path covers attention and dense MLP projections.
 
         _patched = True
         print(

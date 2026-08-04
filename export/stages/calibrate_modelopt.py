@@ -250,13 +250,13 @@ class ModelOptCalibrateStage(Stage):
         # Get dataset spec
         spec = self.dm.get_spec(dataset_ref)
 
-        # 对大数据集使用 streaming + materialize 模式
+        # Large datasets: streaming sample + materialize to disk
         if spec.is_large or spec.streaming_default:
             return self._get_calibration_data_streaming(
                 params, tokenizer, spec, calib_samples, calib_seq_len, seed
             )
 
-        # 小数据集使用原来的方式
+        # Small datasets: the original in-memory path
         return self._get_calibration_data_standard(
             params, tokenizer, spec, calib_samples, calib_seq_len, seed
         )

@@ -32,7 +32,13 @@ from modelopt.torch.quantization.model_calib import max_calibrate
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.quantization.utils import enable_weight_access_and_writeback
 
-from .algo_helper import ResidueHelper, get_salient_indices, apply_salient_indices
+from .algo_helper import (
+    ResidueHelper,
+    apply_salient_indices,
+    get_nvfp4_error_weighted_score,
+    get_salient_indices,
+)
+from .kernel_metadata import is_mext_r1_layer
 from .residue_linear import ResidueQuantLinear
 from modelopt.torch.opt.dynamic import _DMRegistryCls
 from modelopt.torch.quantization.conversion import restore_quantizer_state
@@ -123,6 +129,11 @@ def finalize_restore_residue_model(model: nn.Module) -> nn.Module:
                             )
                             continue
 
+                    # ratio 1.0: never K-extend (served by mext_r1 instead)
+                    if is_mext_r1_layer(salient_indices.numel(), in_features):
+                        module._residue_runtime_mode = "mext_r1"
+                        continue
+
                     if extended_count < 3:  # Only print first 3 for brevity
                         print(f"  Extending {name}: {module.weight.shape} + {salient_indices.numel()} salient")
                     trigger_weight_extension(model, module, salient_indices)
@@ -198,6 +209,11 @@ def residue_restore(model, checkpoint_path, **load_kwargs):
                     if salient_indices.device != weight_device:
                         salient_indices = salient_indices.to(weight_device)
 
+                    # ratio 1.0: never K-extend (served by mext_r1 instead)
+                    if is_mext_r1_layer(salient_indices.numel(), module.weight.shape[1]):
+                        module._residue_runtime_mode = "mext_r1"
+                        continue
+
                     # Extend weights
                     if extended_count < 3:  # Only print first 3
                         print(f"  Extending {name}: {module.weight.shape} + {salient_indices.numel()} salient")
@@ -270,6 +286,7 @@ def _inject_residue_salient_map_direct(
     processed_count = 0
     newly_extended_count = 0
     already_extended_count = 0
+    mext_r1_count = 0
     verbose = debug or os.getenv("RESIDUE_DEBUG", "0") == "1"
 
     for name, indices in salient_indices_map.items():
@@ -318,6 +335,23 @@ def _inject_residue_salient_map_direct(
             already_extended_count += 1
             continue
 
+        k_base = int(getattr(module, "in_features", module.weight.shape[1]))
+        if is_mext_r1_layer(salient_indices.numel(), k_base):
+            # ratio 1.0 (full-rank residue): do NOT K-extend -- that would
+            # double the stored weight. The layer is served by the
+            # M-extension path instead (mext_r1: weight stays at K_base, the
+            # activation row-doubles at runtime). Salient indices are still
+            # recorded so kernel metadata keeps the layer entry.
+            apply_salient_indices(module, salient_indices)
+            module._residue_runtime_mode = "mext_r1"
+            mext_r1_count += 1
+            if verbose:
+                print_rank_0(
+                    f"[residue inject] ratio=1.0 layer '{name}': weight NOT "
+                    "extended; marked runtime_mode=mext_r1"
+                )
+            continue
+
         apply_salient_indices(module, salient_indices)
         saved_weight_amax = (
             _clone_quantizer_amax(module.weight_quantizer)
@@ -333,6 +367,7 @@ def _inject_residue_salient_map_direct(
         "processed_layers": processed_count,
         "newly_extended_layers": newly_extended_count,
         "already_extended_layers": already_extended_count,
+        "mext_r1_layers": mext_r1_count,
     }
 
 
@@ -344,6 +379,7 @@ def residue_max_calibrate(
     residue_ratio: float = 0.25,
     debug: bool = False,
     external_salient_metadata_path: str | None = None,
+    salience_metric: str = "activation_max",
     **kwargs,
 ):
     # DEBUG: Print received parameters to verify they're passed correctly
@@ -370,6 +406,7 @@ def residue_max_calibrate(
         block_size,
         residue_ratio,
         debug,
+        salience_metric=salience_metric,
         external_salient_metadata_path=external_salient_metadata_path,
         **kwargs,
     )
@@ -409,8 +446,14 @@ def _compute_residue_salient_indices(
     total_modules: int,
     verbose: bool,
 ):
+    score = module.residue_max.act_scale
+    if module.residue_max.salience_metric == "nvfp4_error_weighted":
+        # Accumulated squared error is additive across arbitrary calibration
+        # batches. sqrt(sum(error^2)) * ||W[:, j]||_2 estimates each input
+        # channel's output perturbation energy.
+        score = get_nvfp4_error_weighted_score(score, module.weight)
     salient_indices = get_salient_indices(
-        module.residue_max.act_scale,
+        score,
         module.residue_max.block_size,
         module.residue_max.residue_ratio,
     )
@@ -497,6 +540,7 @@ def _residue_calibrate_core(
     residue_ratio: float = 0.25,
     debug: bool = False,
     external_salient_metadata_path: str | None = None,
+    salience_metric: str = "activation_max",
     **kwargs,
 ):
     """Residue calibration core logic (assumes module replacement already done).
@@ -532,7 +576,9 @@ def _residue_calibrate_core(
     for name, module in model.named_modules():
         if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
             with enable_weight_access_and_writeback(module, model):
-                module.residue_max = ResidueHelper(module, name, block_size, residue_ratio)
+                module.residue_max = ResidueHelper(
+                    module, name, block_size, residue_ratio, salience_metric
+                )
             module.residue_max.setup()
             module._layer_name = name
 
@@ -558,7 +604,10 @@ def _residue_calibrate_core(
             and module.residue_max.num_cache_steps > 0
         ):
             module._if_calib = True
-            module.residue_max.act_scale = module.residue_max.act_scale / module.residue_max.num_cache_steps
+            if module.residue_max.salience_metric == "activation_max":
+                module.residue_max.act_scale = (
+                    module.residue_max.act_scale / module.residue_max.num_cache_steps
+                )
 
             has_nan_local = torch.any(torch.isnan(module.residue_max.act_scale))
             has_nan = DistributedProcessGroup.get_dist_syncd_obj(
@@ -675,6 +724,16 @@ class ResidueMaxCalibConfig(QuantizeAlgorithmConfig):
             "Optional residue metadata path used by auto-search candidates. It "
             "replaces the act_scale top-k selection with precomputed per-layer "
             "salient_indices, without materializing weight extension."
+        ),
+    )
+
+    salience_metric: Literal["activation_max", "nvfp4_error_weighted"] = ModeloptField(
+        default="activation_max",
+        title="Channel salience metric for residue selection.",
+        description=(
+            "activation_max preserves legacy mean-absolute-activation ranking; "
+            "nvfp4_error_weighted ranks exact NVFP4 activation error times the "
+            "corresponding weight-column L2 norm."
         ),
     )
 

@@ -1,32 +1,27 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-# SPDX-License-Identifier: BSD-3-Clause
+# SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
+# SPDX-License-Identifier: Apache-2.0
+"""CuTeDSL NVFP4 col-pair fold GEMM for SM120 (GeForce Blackwell / RTX 5090).
 
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
+Computes, in one kernel, the residue MExt-R1 fold
 
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
+    D[t, w] = alpha * A[2t, :] . B[w, :] + alpha * A[2t+1, :] . B[w, :]
 
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
+where the extended activation rows (2t, 2t+1) are the (base, residue) pair,
+i.e. the row_pair quant layout that `scaled_fp4_quant_mext_r1` already emits
+for the SM100 CuTeDSL fork. Operand assignment is swap-ab (weight on GEMM-M,
+extended activation on GEMM-N), matching the C++ SM120 production kernel; the
+fold is thread-local (the adjacent-N pair lands in consecutive accumulator
+registers) and the folded value is stored straight to the compact output with
+a predicated STG -- no epilogue SMEM, no TMA store.
 
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
+Verified against the C++ production kernel bit-for-bit: 52 randomized fuzz cases
+plus a four-corner loop against an independent plain-NVFP4 twin.
 
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+Derived from the CUTLASS CuTeDSL example
+`blackwell_geforce/.../dense_blockscaled_gemm_persistent_cooperative.py`
+(BSD-3-Clause, NVIDIA CORPORATION).
+"""
 
-import argparse
 from typing import Tuple, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -34,123 +29,27 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
-import cutlass.cute.testing as testing
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 
+from ._dsl_helpers import (
+    FP4_SHIFT_BITS,
+    make_ldmatrix_atom,
+    make_sm120_blockscaled_mma_op,
+)
+
+
 def _sfb_padN(ts):
+    """SFB is always laid out at N>=128 (C++ sm120_blockscaled_mma_builder.inl:209)."""
     return (ts[0], max(ts[1], 128), ts[2])
 
 
-try:
-    from blackwell_geforce.kernel.blockscaled_gemm.blockscaled_gemm_dispatch import (
-        FP4_SHIFT_BITS,
-        make_ldmatrix_atom,
-        make_sm120_blockscaled_mma_op,
-        validate_blockscaled_args,
-    )
-except ImportError:
-    from blockscaled_gemm_dispatch import (
-        FP4_SHIFT_BITS,
-        make_ldmatrix_atom,
-        make_sm120_blockscaled_mma_op,
-        validate_blockscaled_args,
-    )
-
-"""
-SM120 CuTeDSL col-pair fold GEMM: a dense blockscaled GEMM (C = A*SF_A * B*SF_B)
-for Blackwell GeForce-class GPUs, extended with the ResInfer col-pair fold --
-consecutive N columns hold (base, residue) pairs and are folded in the epilogue,
-storing the compact output directly from registers (no epilogue smem/TMA).
-- Matrix A is MxKxL, L is batch dimension, A can only be row-major("K")
-- Matrix B is NxKxL, L is batch dimension, B can only be column-major("K")
-- Matrix C is MxNxL, L is batch dimension, C can only be row-major("N")
-- Matrix SFA layout is filled internally according to A shape and BlockScaledBasicChunk, which has M×ceil_div(K, sf_vec_size)×L elements respectively
-- Matrix SFB layout is filled internally according to B shape and BlockScaledBasicChunk, which has N×ceil_div(K, sf_vec_size)×L elements respectively
-- Source formats for matrices A and B: The only supported source format in this example is E2M1.
-- Source formats for matrices SF_A and SF_B are controlled separately. With sf_vec_size=32, the only supported source format is E8. With sf_vec_size=16, the supported source formats are E8 and E4M3.
-
-This GEMM kernel supports the following features:
-    - Utilizes Tensor Memory Access (TMA) for efficient memory operations
-    - Utilizes warp-level block-scaled MMA for matrix multiply-accumulate (MMA) operations
-    - Supports persistent tile scheduling to better overlap memory load/store with MMA between tiles
-    - Supports warp specialization to avoid explicit pipelining between mainloop load and MMA
-    - Uses a cooperative schedule: both warp groups work together to process a single output tile.
-      The two warp groups collaboratively execute the MMA mainloop, each computing a portion of
-      the tile, and then jointly perform the epilogue. This increases computational throughput
-      per tile by leveraging both warp groups simultaneously.
-
-This GEMM works as follows:
-1. DMA warp group:
-    - Load A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-    - Load scale factor A and B matrices from global memory (GMEM) to shared memory (SMEM) using TMA operations.
-2. MMA warp groups (both warp groups cooperate on the same tile):
-    - Load A/B from shared memory (SMEM) to registers (RMEM) using ldmatrix instruction.
-    - Load scale factor A/B from shared memory (SMEM) to registers (RMEM) using universal copy.
-    - Perform matrix multiply-accumulate (MMA) operations using warp-level block-scaled MMA instruction.
-    - Store C matrix from registers (RMEM) to shared memory (SMEM), then to global memory (GMEM) with TMA operations.
-    Note: Both MMA warp groups jointly handle MMA and epilogue for the same tile.
-
-Warp-level block-scaled MMA instructions operate as follows:
-- Set matrix scale factor A/B from registers
-- Read matrix A/B from registers
-- Perform MMA operation and store the result in Accumulator(register)
-
-To run this example:
-
-.. code-block:: bash
-
-    python csrc/nvfp4/nvfp4/cute_fold/kernel_sm120_fold.py      \
-      --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,128                      \
-      --a_dtype Float4E2M1FN --b_dtype Float4E2M1FN                             \
-      --c_dtype Float16 --acc_dtype Float32                                     \
-      --sf_dtype Float8E4M3FN --sf_vec_size 16
-
-The above example command compute batched gemm with M=1024, N=1024, K=1024,
-batch_count=1. The tile shape is 128x128x128 and the cluster shape is (1,1).
-The input, mma accumulator and output data type are set as fp4, fp32
-and fp16, respectively.
-
-To collect performance with NCU profiler:
-
-.. code-block:: bash
-
-    ncu python csrc/nvfp4/nvfp4/cute_fold/kernel_sm120_fold.py  \
-      --mnkl 1024,1024,1024,1 --tile_shape_mnk 128,128,128                      \
-      --a_dtype Float4E2M1FN --b_dtype Float4E2M1FN                             \
-      --c_dtype Float16 --acc_dtype Float32                                     \
-      --sf_dtype Float8E4M3FN --sf_vec_size 16
-
-Constraints:
-* Supported input data types: Float4E2M1FN
-* Only Float32 accumulation is supported in FP4 mma
-* CTA tile shape M/N/K:
- - tile_shape_m should be divisible by 128
- - tile_shape_n should be divisible by 128
- - tile_shape_k should be divisible by 64 (sf_vec_size=16) or 128 (sf_vec_size=32)
-* Cluster shape M/N must be [1, 1] for Blackwell Gefore
-"""
-
-
-# /////////////////////////////////////////////////////////////////////////////
-#  Helpers to parse args
-# /////////////////////////////////////////////////////////////////////////////
-def parse_comma_separated_ints(s: str):
-    try:
-        return tuple([int(x.strip()) for x in s.split(",")])
-    except ValueError:
-        raise argparse.ArgumentTypeError(
-            "Invalid format. Expected comma-separated integers."
-        )
-
-
-# /////////////////////////////////////////////////////////////////////////////
-#  Host setup and device kernel launch
-# /////////////////////////////////////////////////////////////////////////////
+def _sfa_padM(ts):
+    """SFA twin of _sfb_padN: the SF block is always 128 rows."""
+    return (max(ts[0], 128), ts[1], ts[2])
 
 
 class Sm120BlockScaledGemmKernel:
@@ -160,7 +59,15 @@ class Sm120BlockScaledGemmKernel:
         sf_vec_size,
         tile_shape_mnk,
         epi_tile,
+        k_loop: bool = False,
     ):
+        # k_loop: wrapped-K variant.
+        # B is the K-concat activation [m_tok, 2K]; A (the weight) keeps K and
+        # is read twice by wrapping the producer's k coordinate at the
+        # midpoint, so the MMA's own K-reduction performs the base+residue
+        # fold and the epilogue is a plain predicated store (one output row
+        # per token, no pair-sum). Weight bytes in memory: 1x, unchanged.
+        self.k_loop = k_loop
         self.acc_dtype = acc_dtype
         self.sf_vec_size = sf_vec_size
         self.cluster_shape_mnk = (1, 1, 1)
@@ -229,7 +136,7 @@ class Sm120BlockScaledGemmKernel:
         # Compute the smem size of SFA/SFB
         sfa_smem_layout_per_stage = blockscaled_utils.sm120_make_smem_layout_sfa(
             self.tiled_mma,
-            self.tile_shape_mnk,
+            _sfa_padM(self.tile_shape_mnk),
             self.sf_vec_size,
             1,
         )
@@ -242,8 +149,8 @@ class Sm120BlockScaledGemmKernel:
         )
 
         # Compute stage before compute smem layout. No epilogue smem at all:
-        # the compact fold store is direct-STG from registers (same scheme
-        # as the C++ fold op), so ALL smem goes to the mainloop A/B/SF stages.
+        # the compact fold store is direct-STG from registers (C++ Family B
+        # style), so ALL smem goes to the mainloop A/B/SF stages.
         self.ab_stage = self._compute_stages(
             self.tile_shape_mnk,
             self.smem_alloc_a_dtype,
@@ -279,6 +186,7 @@ class Sm120BlockScaledGemmKernel:
         sfa: cute.Tensor,
         sfb: cute.Tensor,
         d: cute.Tensor,
+        alpha: cute.Tensor,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -341,7 +249,7 @@ class Sm120BlockScaledGemmKernel:
         tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
             sfa_tensor,
             self.sfa_smem_layout_staged,
-            (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
+            (max(self.tile_shape_mnk[0], 128), self.tile_shape_mnk[2]),
             1,
             internal_type=cutlass.Int16,
         )
@@ -356,8 +264,12 @@ class Sm120BlockScaledGemmKernel:
 
         # Grid from the full (unfolded) problem shape, recovered from D:
         # M = d.shape[1] (weight dim), N = 2 * d.shape[0] (extended token dim).
+        # k_loop: tokens are NOT row-doubled -- N comes from B's (possibly
+        # padded) row count so every activation row is covered; the store is
+        # predicated on D's real extent.
+        _grid_n = b.shape[0] if self.k_loop else 2 * d.shape[0]
         tile_sched_params, grid = self._compute_grid(
-            (d.shape[1], 2 * d.shape[0], d.shape[2]),
+            (d.shape[1], _grid_n, d.shape[2]),
             self.tile_shape_mnk,
             max_active_clusters,
         )
@@ -404,6 +316,7 @@ class Sm120BlockScaledGemmKernel:
             tma_atom_sfb,
             tma_tensor_sfb,
             d,
+            alpha,
             self.tiled_mma,
             self.cta_layout_mnk,
             self.a_smem_layout_staged,
@@ -432,6 +345,7 @@ class Sm120BlockScaledGemmKernel:
         tma_atom_sfb: cute.CopyAtom,
         mSFB_nkl: cute.Tensor,
         mD_nml: cute.Tensor,
+        mAlpha: cute.Tensor,
         tiled_mma: cute.TiledMma,
         cta_layout_mnk: cute.Layout,
         a_smem_layout_staged: cute.ComposedLayout,
@@ -583,7 +497,7 @@ class Sm120BlockScaledGemmKernel:
         # (tM, tK, loopM, loopK, loopL)
         gSFA_mkl = cute.local_tile(
             mSFA_mkl,
-            cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+            cute.slice_(_sfa_padM(self.tile_shape_mnk), (None, 0, None)),
             (None, None, None),
         )
         # (tN, tK, loopN, loopK, loopL)
@@ -653,8 +567,9 @@ class Sm120BlockScaledGemmKernel:
         tCrSFA = cute.group_modes(tCrSFA, 2, cute.rank(tCrSFA))
         tCrSFB_full = cute.group_modes(tCrSFB_full, 2, cute.rank(tCrSFB_full))
         _sfb_tiles_per_block = max(128, self.tile_shape_mnk[1]) // self.tile_shape_mnk[1]
+        _sfa_tiles_per_block = max(128, self.tile_shape_mnk[0]) // self.tile_shape_mnk[0]
 
-        # Physical-coord tensor for the compact fold store (same idiom as the C++ fold op):
+        # Physical-coord tensor for the compact fold store (C++ Family B idiom):
         # identity over one CTA tile, partitioned exactly like the accumulators,
         # so flat index e -> in-tile (m, n) of acc[e]. Its shape IS the
         # accumulator fragment shape — no gmem C tensor needed at all.
@@ -670,7 +585,12 @@ class Sm120BlockScaledGemmKernel:
         else:
             cute.arch.sync_threads()
 
-        k_tile_cnt = cute.size(gA_mkl, mode=[3])
+        # Loop trip count from B: identical to A's for the fold (same K), and
+        # 2x A's for k_loop (B carries the K-concat activation at 2K while A,
+        # the weight, wraps). The consumer only indexes staged smem buffers,
+        # so it needs nothing beyond this count.
+        k_tile_cnt = cute.size(gB_nkl, mode=[3])
+        k_base_tile_cnt = cute.size(gA_mkl, mode=[3])
 
         # Create the tile scheduler
         tile_sched = utils.StaticPersistentTileScheduler.create(
@@ -768,6 +688,23 @@ class Sm120BlockScaledGemmKernel:
                     tCrSFB_tile = tCrSFB_full
                     tCsSFB_tile_copy_view = tCsSFB_copy_view_full
                     tCrSFB_tile_copy_view = tCrSFB_copy_view_full
+                # SFA sub-128 tile_M: slice the 128-padded SFA block down to the
+                # real tile_M rows of this work tile (same port as SFB N>=64).
+                if cutlass.const_expr(_sfa_tiles_per_block > 1):
+                    _offm = tile_coord_mnl[0] % _sfa_tiles_per_block
+                    _sSFA_tile = cute.local_tile(
+                        sSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)),
+                        (_offm, 0, None))
+                    tCrSFA_tile = sm120_utils.partition_fragment_SFA(
+                        _sSFA_tile[None, None, 0], thr_mma, tidx)
+                    if cutlass.const_expr(cute.rank(tCrSFA_tile) > 2):
+                        tCrSFA_tile = cute.group_modes(tCrSFA_tile, 2, cute.rank(tCrSFA_tile))
+                    tCsSFA_tile_copy_view = thr_copy_ldmatrix_SFA.partition_S(_sSFA_tile)
+                    tCrSFA_tile_copy_view = thr_copy_ldmatrix_SFA.retile(tCrSFA_tile)
+                else:
+                    tCrSFA_tile = tCrSFA
+                    tCsSFA_tile_copy_view = tCsSFA_copy_view
+                    tCrSFA_tile_copy_view = tCrSFA_copy_view
                 # Clear the accumulator
                 accumulators.fill(0.0)
 
@@ -790,7 +727,7 @@ class Sm120BlockScaledGemmKernel:
                 # tCsA_p: (MMA, (4, MMA_M / 4), MMA_K), tCsA_p: (MMA, (4, MMA_N / 4), MMA_K)
                 tCsA_p = tCsA_copy_view[None, None, None, mainloop_consumer_state.index]
                 tCsB_p = tCsB_copy_view[None, None, None, mainloop_consumer_state.index]
-                tCsSFA_p = tCsSFA_copy_view[
+                tCsSFA_p = tCsSFA_tile_copy_view[
                     None, None, None, mainloop_consumer_state.index
                 ]
                 tCsSFB_p = tCsSFB_tile_copy_view[
@@ -809,7 +746,7 @@ class Sm120BlockScaledGemmKernel:
 
                 tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
                 tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                 tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
 
                 cute.copy(
@@ -845,7 +782,7 @@ class Sm120BlockScaledGemmKernel:
                             tCsB_p = tCsB_copy_view[
                                 None, None, None, mainloop_consumer_state.index
                             ]
-                            tCsSFA_p = tCsSFA_copy_view[
+                            tCsSFA_p = tCsSFA_tile_copy_view[
                                 None, None, None, mainloop_consumer_state.index
                             ]
                             tCsSFB_p = tCsSFB_tile_copy_view[
@@ -883,7 +820,7 @@ class Sm120BlockScaledGemmKernel:
                             accumulators,
                             [
                                 tCrA[None, None, k_block_idx],
-                                tCrSFA[None, None, k_block_idx],
+                                tCrSFA_tile[None, None, k_block_idx],
                             ],
                             [
                                 tCrB[None, None, k_block_idx],
@@ -904,7 +841,7 @@ class Sm120BlockScaledGemmKernel:
 
                         tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
                         tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                         tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
                         cute.copy(
                             smem_tiled_copy_SFA,
@@ -943,7 +880,7 @@ class Sm120BlockScaledGemmKernel:
                         )
                         tCsSFA_p_filtered = cute.filter_zeros(tCsSFA_p)
                         tCsSFB_p_filtered = cute.filter_zeros(tCsSFB_p)
-                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_copy_view)
+                        tCrSFA_copy_view_filtered = cute.filter_zeros(tCrSFA_tile_copy_view)
                         tCrSFB_copy_view_filtered = cute.filter_zeros(tCrSFB_tile_copy_view)
                         cute.copy(
                             smem_tiled_copy_SFA,
@@ -981,7 +918,7 @@ class Sm120BlockScaledGemmKernel:
                         accumulators,
                         [
                             tCrA[None, None, k_block_idx],
-                            tCrSFA[None, None, k_block_idx],
+                            tCrSFA_tile[None, None, k_block_idx],
                         ],
                         [
                             tCrB[None, None, k_block_idx],
@@ -994,8 +931,8 @@ class Sm120BlockScaledGemmKernel:
                 #  EPILOG
                 # /////////////////////////////////////////////////////////////////////////////
 
-                # ==== col-pair fold + compact direct-STG store (same store
-                # scheme as the C++ fold op). Consecutive accumulator elements (2e, 2e+1) are the
+                # ==== col-pair fold + compact direct-STG store (C++ Family B
+                # port). Consecutive accumulator elements (2e, 2e+1) are the
                 # adjacent-N pair (base, residue) at the SAME m. Fold in fp32,
                 # store D[tok, m] with tok = global_n // 2 - no smem, no TMA.
                 _m_lim = mD_nml.shape[1]
@@ -1003,14 +940,33 @@ class Sm120BlockScaledGemmKernel:
                 _m_base = tile_coord_mnl[0] * self.tile_shape_mnk[0]
                 _n_base = tile_coord_mnl[1] * self.tile_shape_mnk[1]
                 _l_crd = tile_coord_mnl[2]
+                # Dequant scale, applied in the C++ EVT order (alpha*a + alpha*b:
+                # ScalarBroadcast(alpha) * AccFetch feeds the fold node) so the
+                # output stays bit-identical to the production C++ kernel.
+                _alpha = mAlpha[0]
                 _nacc = cute.size(accumulators)
-                for _e in cutlass.range_constexpr(_nacc // 2):
-                    _crd = tCcC[2 * _e]
-                    _gm = _m_base + _crd[0]
-                    _tok = (_n_base + _crd[1]) // 2
-                    if cute.elem_less((_gm, _tok), (_m_lim, _tok_lim)):
-                        _v = accumulators[2 * _e] + accumulators[2 * _e + 1]
-                        mD_nml[(_tok, _gm, _l_crd)] = _v.to(self.c_dtype)
+                if cutlass.const_expr(self.k_loop):
+                    # k_loop: the fold already happened inside the MMA's
+                    # K-reduction; every accumulator element IS a finished
+                    # output. Plain predicated store, one row per token.
+                    for _e in cutlass.range_constexpr(_nacc):
+                        _crd = tCcC[_e]
+                        _gm = _m_base + _crd[0]
+                        _tok = _n_base + _crd[1]
+                        if cute.elem_less((_gm, _tok), (_m_lim, _tok_lim)):
+                            _v = accumulators[_e] * _alpha
+                            mD_nml[(_tok, _gm, _l_crd)] = _v.to(self.c_dtype)
+                else:
+                    for _e in cutlass.range_constexpr(_nacc // 2):
+                        _crd = tCcC[2 * _e]
+                        _gm = _m_base + _crd[0]
+                        _tok = (_n_base + _crd[1]) // 2
+                        if cute.elem_less((_gm, _tok), (_m_lim, _tok_lim)):
+                            _v = (
+                                accumulators[2 * _e] * _alpha
+                                + accumulators[2 * _e + 1] * _alpha
+                            )
+                            mD_nml[(_tok, _gm, _l_crd)] = _v.to(self.c_dtype)
                 # ==== end fold + store ====
 
                 # Advance to the next work tile
@@ -1027,7 +983,8 @@ class Sm120BlockScaledGemmKernel:
                 tile_coord_mnl = work_tile.tile_idx
                 tAgA_mkl = tAgA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
                 tBgB_nkl = tBgB[(None, tile_coord_mnl[1], None, tile_coord_mnl[2])]
-                tAgSFA_mkl = tAgSFA[(None, tile_coord_mnl[0], None, tile_coord_mnl[2])]
+                _ratio_m = max(1, 128 // self.tile_shape_mnk[0])
+                tAgSFA_mkl = tAgSFA[(None, tile_coord_mnl[0] // _ratio_m, None, tile_coord_mnl[2])]
                 _ratio = max(1, 128 // self.tile_shape_mnk[1])
                 tBgSFB_nkl = tBgSFB[(None, tile_coord_mnl[1] // _ratio, None, tile_coord_mnl[2])]
 
@@ -1043,13 +1000,23 @@ class Sm120BlockScaledGemmKernel:
                     # /////////////////////////////////////////////////////////////////////////////
                     #  Slice to global/shared memref to current k_tile
                     # /////////////////////////////////////////////////////////////////////////////
-                    tAgA_k = tAgA_mkl[(None, mainloop_producer_state.count)]
+                    # k_loop: the weight (A) and its SF wrap at the K midpoint
+                    # -- one compare+subtract in the producer warp, off the
+                    # critical path. An operand and its SF are tiled by the
+                    # same tiler, so one wrapped index cannot desynchronise
+                    # them (kext-via-wrapped-kloop.md).
+                    _a_k = mainloop_producer_state.count
+                    if cutlass.const_expr(self.k_loop):
+                        _a_k = cutlass.Int32(
+                            _a_k if _a_k < k_base_tile_cnt
+                            else _a_k - k_base_tile_cnt)
+                    tAgA_k = tAgA_mkl[(None, _a_k)]
                     tAsA_pipe = tAsA[(None, mainloop_producer_state.index)]
 
                     tBgB_k = tBgB_nkl[(None, mainloop_producer_state.count)]
                     tBsB_pipe = tBsB[(None, mainloop_producer_state.index)]
 
-                    tAgSFA_k = tAgSFA_mkl[(None, mainloop_producer_state.count)]
+                    tAgSFA_k = tAgSFA_mkl[(None, _a_k)]
                     tAsSFA_pipe = tAsSFA[(None, mainloop_producer_state.index)]
 
                     tBgSFB_k = tBgSFB_nkl[(None, mainloop_producer_state.count)]
@@ -1232,7 +1199,7 @@ class Sm120BlockScaledGemmKernel:
 
         sfa_smem_layout_staged = blockscaled_utils.sm120_make_smem_layout_sfa(
             tiled_mma,
-            tile_shape_mnk,
+            _sfa_padM(tile_shape_mnk),
             sf_vec_size,
             ab_stage,
         )
@@ -1373,496 +1340,3 @@ class Sm120BlockScaledGemmKernel:
         ):
             is_valid = False
         return is_valid
-
-
-@cute.jit
-def cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-    sf_ref_tensor: cute.Tensor,
-    sf_mma_tensor: cute.Tensor,
-):
-    """Convert scale factor tensor from MKL layout to mma specification M(32x4xrest_m)xK(4xrest_k)xL layout"""
-    # sf_mma_tensor has flatten shape (32, 4, rest_m, 4, rest_k, l)
-    # group to ((32, 4, rest_m), (4, rest_k), l)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 0, 3)
-    sf_mma_tensor = cute.group_modes(sf_mma_tensor, 1, 3)
-    for i in cutlass.range(cute.size(sf_ref_tensor)):
-        mkl_coord = sf_ref_tensor.layout.get_hier_coord(i)
-        sf_mma_tensor[mkl_coord] = sf_ref_tensor[mkl_coord]
-
-
-def run(
-    mnkl: Tuple[int, int, int, int],
-    a_dtype: Type[cutlass.Numeric],
-    b_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-    sf_vec_size: int,
-    c_dtype: Type[cutlass.Numeric],
-    a_major: str = "k",
-    b_major: str = "k",
-    c_major: str = "n",
-    tile_shape_mnk: Tuple[int, int, int] = (128, 128, 128),
-    epi_tile: Tuple[int, int] = (128, 128),
-    tolerance: float = 1e-01,
-    warmup_iterations: int = 0,
-    iterations: int = 1,
-    skip_ref_check: bool = False,
-    use_cold_l2: bool = False,
-    **kwargs,
-):
-    """Perf-framework-compatible entry point.
-
-    FP4 MMA only supports Float32 accumulation, so acc_dtype is always
-    Float32 regardless of what the caller passes.
-    """
-    return run_bs(
-        mnkl=mnkl,
-        a_dtype=a_dtype,
-        b_dtype=b_dtype,
-        sf_dtype=sf_dtype,
-        sf_vec_size=sf_vec_size,
-        c_dtype=c_dtype,
-        acc_dtype=cutlass.Float32,
-        a_major=a_major,
-        b_major=b_major,
-        c_major=c_major,
-        tile_shape_mnk=tile_shape_mnk,
-        epi_tile=epi_tile,
-        tolerance=tolerance,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-        skip_ref_check=skip_ref_check,
-        use_cold_l2=use_cold_l2,
-    )
-
-
-def run_bs(
-    mnkl: Tuple[int, int, int, int],
-    a_dtype: Type[cutlass.Numeric],
-    b_dtype: Type[cutlass.Numeric],
-    sf_dtype: Type[cutlass.Numeric],
-    sf_vec_size: int,
-    c_dtype: Type[cutlass.Numeric],
-    acc_dtype: Type[cutlass.Numeric],
-    a_major: str,
-    b_major: str,
-    c_major: str,
-    tile_shape_mnk: Tuple[int, int, int],
-    epi_tile: Tuple[int, int],
-    tolerance: float,
-    warmup_iterations: int,
-    iterations: int,
-    skip_ref_check: bool,
-    use_cold_l2: bool = False,
-    **kwargs,
-):
-    import torch
-    import cutlass.torch as cutlass_torch
-
-    print("Running Blackwell Geforce Blockscaled Dense GEMM with:")
-    print(f"mnkl: {mnkl}")
-    print(
-        f"A dtype: {a_dtype}, B dtype: {b_dtype}, A/B scale factor dtype: {sf_dtype}, C dtype: {c_dtype}, Acc dtype: {acc_dtype}"
-    )
-    print(f"Matrix majors - A: {a_major}, B: {b_major}, C: {c_major}")
-    print(f"Tile Shape: {tile_shape_mnk}")
-    print(f"Epilogue tile: {epi_tile}")
-    print(f"Tolerance: {tolerance}")
-    print(f"Warmup iterations: {warmup_iterations}")
-    print(f"Iterations: {iterations}")
-    print(f"Skip reference checking: {skip_ref_check}")
-    print(f"Use cold L2: {use_cold_l2}")
-
-    m, n, k, l = mnkl
-
-    if not Sm120BlockScaledGemmKernel.is_valid_tensor_alignment(
-        m, n, k, l, a_dtype, c_dtype, a_major, b_major, c_major
-    ):
-        raise ValueError("Invalid tensor alignment")
-
-    a_dtype = getattr(cutlass, a_dtype) if isinstance(a_dtype, str) else a_dtype
-    b_dtype = getattr(cutlass, b_dtype) if isinstance(b_dtype, str) else b_dtype
-    c_dtype = getattr(cutlass, c_dtype) if isinstance(c_dtype, str) else c_dtype
-    acc_dtype = getattr(cutlass, acc_dtype) if isinstance(acc_dtype, str) else acc_dtype
-
-    # Unpack parameters
-    m, n, k, l = mnkl
-    cluster_shape_mnk = (1, 1, 1)
-
-    # Prepare pytorch tensors: A, B (random from 0 to 2) and C (all zero)
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-
-    a_ref = cutlass_torch.matrix(l, m, k, a_major == "m", cutlass.Float32)
-    b_ref = cutlass_torch.matrix(l, n, k, b_major == "n", cutlass.Float32)
-
-    a_tensor, a_torch = cutlass_torch.cute_tensor_like(
-        a_ref, a_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-    b_tensor, b_torch = cutlass_torch.cute_tensor_like(
-        b_ref, b_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-
-    # Mark tensor to be byte aligned
-    a_tensor.mark_compact_shape_dynamic(
-        mode=1 if a_major == "k" else 0,
-        stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-        divisibility=2 if a_dtype == cutlass.Float4E2M1FN else 1,
-    )
-    b_tensor.mark_compact_shape_dynamic(
-        mode=1 if b_major == "k" else 0,
-        stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-        divisibility=2 if b_dtype == cutlass.Float4E2M1FN else 1,
-    )
-
-    # Compact fold output D: (n//2, m, l) with m contiguous — the production
-    # orientation D[m_tok, n_w] (kernel-M is the weight dim, kernel-N the
-    # extended token dim).
-    d_ref = cutlass_torch.matrix(l, n // 2, m, False, cutlass.Float32)
-    d_tensor, d_torch = cutlass_torch.cute_tensor_like(
-        d_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
-    )
-    d_tensor.mark_compact_shape_dynamic(
-        mode=1,
-        stride_order=(2, 0, 1),
-        divisibility=1,
-    )
-
-    # Create scale factor tensor SFA/SFB
-    def create_scale_factor_tensor(l, mn, k, sf_vec_size, dtype):
-        def ceil_div(a, b):
-            return (a + b - 1) // b
-
-        sf_k = ceil_div(k, sf_vec_size)
-        ref_shape = (l, mn, sf_k)
-
-        # The A, C, and D matrices are row-major whereas the B matrix is column-major.
-        # So only k-major (A/B) is supported.
-
-        atom_m = (32, 4)
-        atom_k = 4
-        mma_shape = (
-            l,
-            ceil_div(mn, atom_m[0] * atom_m[1]),
-            ceil_div(sf_k, atom_k),
-            atom_m[0],
-            atom_m[1],
-            atom_k,
-        )
-
-        ref_permute_order = (1, 2, 0)
-        mma_permute_order = (3, 4, 1, 5, 2, 0)
-
-        # Create f32 ref torch tensor (cpu)
-        ref_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            ref_shape,
-            torch.float32,
-            permute_order=ref_permute_order,
-            init_type=cutlass_torch.TensorInitType.RANDOM,
-            init_config=cutlass_torch.RandomInitConfig(
-                min_val=1,
-                max_val=3,
-            ),
-        )
-
-        # Create f32 cute torch tensor (cpu)
-        cute_f32_torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            mma_shape,
-            torch.float32,
-            permute_order=mma_permute_order,
-            init_type=cutlass_torch.TensorInitType.RANDOM,
-            init_config=cutlass_torch.RandomInitConfig(
-                min_val=0,
-                max_val=1,
-            ),
-        )
-
-        # convert ref f32 tensor to cute f32 tensor
-        cvt_sf_MKL_to_M32x4xrm_K4xrk_L(
-            from_dlpack(ref_f32_torch_tensor_cpu),
-            from_dlpack(cute_f32_torch_tensor_cpu),
-        )
-        cute_f32_torch_tensor = cute_f32_torch_tensor_cpu.cuda()
-
-        # reshape makes memory contiguous
-        ref_f32_torch_tensor_cpu = (
-            ref_f32_torch_tensor_cpu.permute(2, 0, 1)
-            .unsqueeze(-1)
-            .expand(l, mn, sf_k, sf_vec_size)
-            .reshape(l, mn, sf_k * sf_vec_size)
-            .permute(*ref_permute_order)
-        )
-        # prune to mkl for reference check.
-        ref_f32_torch_tensor_cpu = ref_f32_torch_tensor_cpu[:, :k, :]
-
-        # Create dtype cute torch tensor (cpu)
-        cute_tensor, torch_tensor = cutlass_torch.cute_tensor_like(
-            cute_f32_torch_tensor_cpu,
-            dtype,
-            is_dynamic_layout=True,
-            assumed_align=16,
-        )
-
-        # Convert f32 cute tensor to dtype cute tensor
-        cute_tensor = cutlass_torch.convert_cute_tensor(
-            cute_f32_torch_tensor,
-            cute_tensor,
-            dtype,
-            is_dynamic_layout=True,
-        )
-
-        return ref_f32_torch_tensor_cpu, cute_tensor, torch_tensor
-
-    sfa_ref, sfa_tensor, sfa_torch = create_scale_factor_tensor(
-        l, m, k, sf_vec_size, sf_dtype
-    )
-
-    sfb_ref, sfb_tensor, sfb_torch = create_scale_factor_tensor(
-        l, n, k, sf_vec_size, sf_dtype
-    )
-
-    # configure gemm kernel
-    gemm = Sm120BlockScaledGemmKernel(
-        acc_dtype,
-        sf_vec_size,
-        tile_shape_mnk,
-        epi_tile,
-    )
-
-    # Compute max active clusters on current device
-    hardware_info = cutlass.utils.HardwareInfo()
-    max_active_clusters = hardware_info.get_max_active_clusters(
-        cluster_shape_mnk[0] * cluster_shape_mnk[1]
-    )
-
-    # Initialize stream
-    stream = cutlass_torch.default_stream()
-
-    # compile gemm kernel
-    compiled_gemm = cute.compile(
-        gemm,
-        a_tensor,
-        b_tensor,
-        sfa_tensor,
-        sfb_tensor,
-        d_tensor,
-        max_active_clusters,
-        stream,
-    )
-
-    if not skip_ref_check:
-        print("Reference checking ...")
-        # execution
-        compiled_gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, d_tensor, stream)
-        torch.cuda.synchronize()
-
-        # Ref check (compact): D[tok, m] = C_full[m, 2*tok] + C_full[m, 2*tok+1]
-        res_a = torch.einsum("mkl,mkl->mkl", a_ref, sfa_ref)
-        res_b = torch.einsum("nkl,nkl->nkl", b_ref, sfb_ref)
-        ref_full = torch.einsum("mkl,nkl->mnl", res_a, res_b)
-        ref = (ref_full[:, 0::2, :] + ref_full[:, 1::2, :]).permute(1, 0, 2).contiguous()
-
-        # Convert d back to f32 for comparison.
-        d_ref_device = d_ref.cuda()
-        cute.testing.convert(
-            d_tensor,
-            from_dlpack(d_ref_device, assumed_align=16).mark_layout_dynamic(
-                leading_dim=1
-            ),
-        )
-        d_out = d_ref_device.cpu()
-
-        if c_dtype in (cutlass.Float32, cutlass.Float16, cutlass.BFloat16):
-            torch.testing.assert_close(d_out, ref, atol=tolerance, rtol=1e-02)
-        else:
-            raise ValueError(
-                f"compact fold harness supports f32/f16/bf16 D only, got {c_dtype}"
-            )
-
-    def generate_tensors():
-        a_tensor, _ = cutlass_torch.cute_tensor_like(
-            a_ref, a_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        b_tensor, _ = cutlass_torch.cute_tensor_like(
-            b_ref, b_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        # Mark tensor to be byte aligned
-        a_tensor.mark_compact_shape_dynamic(
-            mode=1 if a_major == "k" else 0,
-            stride_order=(2, 0, 1) if a_major == "k" else (2, 1, 0),
-            divisibility=2 if a_dtype == cutlass.Float4E2M1FN else 1,
-        )
-        b_tensor.mark_compact_shape_dynamic(
-            mode=1 if b_major == "k" else 0,
-            stride_order=(2, 0, 1) if b_major == "k" else (2, 1, 0),
-            divisibility=2 if b_dtype == cutlass.Float4E2M1FN else 1,
-        )
-
-        d_tensor, _ = cutlass_torch.cute_tensor_like(
-            d_ref, c_dtype, is_dynamic_layout=True, assumed_align=16
-        )
-        d_tensor.mark_compact_shape_dynamic(
-            mode=1,
-            stride_order=(2, 0, 1),
-            divisibility=1,
-        )
-        _, sfa_tensor, _ = create_scale_factor_tensor(l, m, k, sf_vec_size, sf_dtype)
-        _, sfb_tensor, _ = create_scale_factor_tensor(l, n, k, sf_vec_size, sf_dtype)
-        return cute.testing.JitArguments(
-            a_tensor, b_tensor, sfa_tensor, sfb_tensor, d_tensor, stream
-        )
-
-    workspace_count = 1
-    if use_cold_l2:
-        one_workspace_bytes = (
-            a_ref.numel() * a_ref.element_size()
-            + b_ref.numel() * b_ref.element_size()
-            + sfa_ref.numel() * sfa_ref.element_size()
-            + sfb_ref.numel() * sfb_ref.element_size()
-            + d_ref.numel() * d_ref.element_size()
-        )
-        workspace_count = testing.get_workspace_count(
-            one_workspace_bytes, warmup_iterations, iterations
-        )
-
-    exec_time = testing.benchmark(
-        compiled_gemm,
-        workspace_generator=generate_tensors,
-        workspace_count=workspace_count,
-        stream=stream,
-        warmup_iterations=warmup_iterations,
-        iterations=iterations,
-    )
-
-    gflop = 2 * m * n * k / 1e9
-    gflops = gflop / exec_time * 1e6
-
-    print(f"Execution time: {exec_time} microseconds per iteration")
-    print(f"GFLOPS: {gflops}")
-
-    return exec_time  # Return execution time in microseconds
-
-
-def parse_arguments() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Example of MxNxKxL GEMM on Blackwell Geforce."
-    )
-
-    parser.add_argument(
-        "--mnkl",
-        type=parse_comma_separated_ints,
-        default=(
-            1024,
-            1024,
-            1024,
-            1,
-        ),
-        help="mnkl dimensions (comma-separated)",
-    )
-    parser.add_argument(
-        "--tile_shape_mnk",
-        type=parse_comma_separated_ints,
-        default=(128, 128, 128),
-        help="CTA tile shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--epi_tile",
-        type=parse_comma_separated_ints,
-        default=(128, 128),
-        help="Epilogue tile shape (comma-separated)",
-    )
-    parser.add_argument(
-        "--a_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float4E2M1FN,
-    )
-    parser.add_argument(
-        "--b_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float4E2M1FN,
-    )
-    parser.add_argument(
-        "--sf_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float8E4M3FN,
-    )
-    parser.add_argument(
-        "--sf_vec_size",
-        type=int,
-        choices=[16, 32],  # 16 for NVFP4, 32 for MXFP4 / MXFP8.
-        default=16,
-    )
-    parser.add_argument(
-        "--c_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float16,
-    )
-    parser.add_argument(
-        "--acc_dtype",
-        type=cutlass.dtype,
-        default=cutlass.Float32,
-    )
-    parser.add_argument("--a_major", choices=["k"], type=str, default="k")
-    parser.add_argument("--b_major", choices=["k"], type=str, default="k")
-    parser.add_argument("--c_major", choices=["n"], type=str, default="n")
-    parser.add_argument(
-        "--tolerance", type=float, default=1e-01, help="Tolerance for validation"
-    )
-    parser.add_argument(
-        "--warmup_iterations", type=int, default=0, help="Warmup iterations"
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=1,
-        help="Number of iterations to run the kernel",
-    )
-    parser.add_argument(
-        "--skip_ref_check",
-        action="store_true",
-        default=False,
-        help="Skip reference checking",
-    )
-    parser.add_argument(
-        "--use_cold_l2",
-        action="store_true",
-        default=False,
-        help="Use circular buffer tensor sets to ensure L2 cold cache",
-    )
-
-    args = parser.parse_args()
-
-    if len(args.mnkl) != 4:
-        parser.error("--mnkl must contain exactly 4 values")
-
-    fp4_allowed_tiles = {(128,128,128),(128,128,256),(128,64,128),(128,32,128),(128,64,256),(128,32,256)}
-    fp8_allowed_tiles = {(128, 128, 128)}
-    try:
-        validate_blockscaled_args(args, fp4_allowed_tiles, fp8_allowed_tiles)
-    except ValueError as e:
-        parser.error(str(e))
-
-    return args
-
-
-if __name__ == "__main__":
-    args = parse_arguments()
-    run_bs(
-        args.mnkl,
-        args.a_dtype,
-        args.b_dtype,
-        args.sf_dtype,
-        args.sf_vec_size,
-        args.c_dtype,
-        args.acc_dtype,
-        args.a_major,
-        args.b_major,
-        args.c_major,
-        args.tile_shape_mnk,
-        args.epi_tile,
-        args.tolerance,
-        args.warmup_iterations,
-        args.iterations,
-        args.skip_ref_check,
-        args.use_cold_l2,
-    )
-    print("PASS")

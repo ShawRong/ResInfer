@@ -55,14 +55,6 @@ if os.getenv("NVFP4_ENABLE_LINEINFO", "0") == "1":
 if os.getenv("NVFP4_ROWPAIR_SMOKE_ONLY", "0") == "1":
     extra_compile_args["nvcc"].append("-DNVFP4_ROWPAIR_SMOKE_ONLY=1")
 
-build_gemm = os.getenv("NVFP4_BUILD_GEMM", "1").strip().lower() not in {
-    "0",
-    "false",
-    "off",
-    "no",
-}
-extra_compile_args["cxx"].append(f"-DNVFP4_ENABLE_GEMM={int(build_gemm)}")
-extra_compile_args["nvcc"].append(f"-DNVFP4_ENABLE_GEMM={int(build_gemm)}")
 
 # Enable NVFP4 for Blackwell (FP4 E2M1) architectures.
 # By default we build a fatbin that includes:
@@ -111,10 +103,9 @@ sources = [
     'src/fp4/nvfp4_quant_entry.cu',
     'src/fp4/nvfp4_quant_kernels.cu',
     'src/fp4/nvfp4_residue_pack8.cu',
+    'src/fp4/nvfp4_residue_pack16.cu',
     'src/fp4/official_nvfp4_quant_kernels.cu',
 ]
-if build_gemm:
-    sources.append('src/fp4/nvfp4_scaled_mm_sm120_epilogue_kernels.cu')
 
 cutlass_include_dir = first_existing_path(
     os.getenv("CUTLASS_INCLUDE_DIR"),
@@ -208,9 +199,7 @@ setup(
     name='nvfp4',
     version='0.1.0',
     description='NVIDIA FP4 Quantization Kernels',
-    # cute_fold is a SUBPACKAGE: 'nvfp4' alone does not pull it in, and the
-    # CuTeDSL kernels would be silently missing from an installed wheel.
-    packages=['nvfp4', 'nvfp4.cute_fold'],
+    packages=['nvfp4'],
     ext_modules=ext_modules,
     cmdclass={'build_ext': cpp_extension.BuildExtension},
     python_requires='>=3.10',

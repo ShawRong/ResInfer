@@ -31,6 +31,32 @@ def storage_bits(method: str | None, ratio: float | None) -> float:
     if method == "residue_max":
         if ratio is None:
             raise ValueError("residue candidate is missing residue_ratio")
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        if ratio >= 1.0:
+            return 8.0
         return 4.0 * (1.0 + ratio)
     if method is None:
         return 16.0

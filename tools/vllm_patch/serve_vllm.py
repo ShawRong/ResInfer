@@ -206,11 +206,6 @@ def parse_args() -> argparse.Namespace:
         help="Optional RESIDUE_PATCH_MODE override for patched vLLM workers.",
     )
     parser.add_argument(
-        "--enable_mext_clean_vec_store",
-        action="store_true",
-        help="Set RESIDUE_ENABLE_MEXT_CLEAN_VEC_STORE=1 before launching.",
-    )
-    parser.add_argument(
         "--enable_decode_mext",
         action="store_true",
         help=(
@@ -219,18 +214,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--mext_path",
-        type=str,
-        default=None,
-        help="Set RESIDUE_MEXT_PATH before launching. Supported: auto, tile8, col_swap.",
-    )
-    parser.add_argument(
-        "--mext_autotune_m2_buckets",
-        type=str,
-        default=None,
+        "--share_autotune_cache",
+        action="store_true",
         help=(
-            "Optional comma-separated physical-M buckets for the MExt "
-            "FlashInfer autotune adapter."
+            'Share the FlashInfer autotune cache across models instead of keying the directory by model-config hash. Do not use with concurrently started servers: concurrent cache writes are best-effort.'
         ),
     )
     parser.add_argument(
@@ -349,22 +336,16 @@ def main() -> None:
             os.environ["RESIDUE_PATCH_MODE"] = args.residue_patch_mode
         else:
             os.environ.pop("RESIDUE_PATCH_MODE", None)
-        if args.enable_mext_clean_vec_store:
-            os.environ["RESIDUE_ENABLE_MEXT_CLEAN_VEC_STORE"] = "1"
         if args.enable_decode_mext:
             os.environ["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
-        if args.mext_path is not None:
-            os.environ["RESIDUE_MEXT_PATH"] = args.mext_path
-        if args.mext_autotune_m2_buckets is not None:
-            os.environ["RESIDUE_MEXT_AUTOTUNE_M2_BUCKETS"] = args.mext_autotune_m2_buckets
+        if args.share_autotune_cache:
+            os.environ["RESIDUE_SHARE_AUTOTUNE_CACHE"] = "1"
     else:
         os.environ.pop("RESIDUE_PATCH_VLLM", None)
         os.environ.pop("RESIDUE_VLLM_MODEL_DIR", None)
         os.environ.pop("RESIDUE_PATCH_MODE", None)
-        os.environ.pop("RESIDUE_ENABLE_MEXT_CLEAN_VEC_STORE", None)
         os.environ.pop("RESIDUE_ENABLE_DECODE_MEXT", None)
-        os.environ.pop("RESIDUE_MEXT_PATH", None)
-        os.environ.pop("RESIDUE_MEXT_AUTOTUNE_M2_BUCKETS", None)
+        os.environ.pop("RESIDUE_SHARE_AUTOTUNE_CACHE", None)
 
     command = build_server_command(
         args=args,
@@ -388,15 +369,6 @@ def main() -> None:
     print(
         "Decode MExt:      "
         f"{os.environ.get('RESIDUE_ENABLE_DECODE_MEXT', '(default)')}"
-    )
-    print("MExt tactic:      auto")
-    print(
-        "MExt path:        "
-        f"{os.environ.get('RESIDUE_MEXT_PATH', '(default)')}"
-    )
-    print(
-        "MExt tune buckets:"
-        f" {os.environ.get('RESIDUE_MEXT_AUTOTUNE_M2_BUCKETS', '(default)')}"
     )
     print(f"Linear backend:   {args.linear_backend or 'auto'}")
     print(

@@ -20,6 +20,15 @@ import torch
 
 _KERNEL_CACHE: dict[tuple, tuple] = {}
 
+# The tactic tables speak `store_mode`; _compile_fold_gemm speaks `mode`.
+# Module-level so the warmup can enumerate the same space the call path
+# reaches, instead of keeping a second copy that drifts.
+STORE_MODE_TO_MODE = {
+    "tma": "fold_tma",
+    "tma_mext": "fold_tma_mext",
+    "direct_mext": "fold_mext_direct",
+}
+
 # Valid sm103 tilers: (128|256, 128|256) (flashinfer sm103 candidates).
 DEFAULT_MMA_TILER_MN = (128, 128)
 DEFAULT_CLUSTER_SHAPE_MN = (1, 1)
@@ -52,36 +61,38 @@ def _compile_fold_gemm(
     out_dtype: torch.dtype,
     mode: str = "fold_tma",
     kernel_arch: str = "sm103",
-    acc_stage_override: int | None = None,
     ab_stage_override: int | None = None,
-    use_prefetch: bool = False,
+    strided_weight: bool = False,
 ):
     """Compile a fold-GEMM kernel variant:
 
     - "fold_tma":         N-ext fold, register fold + TMA store
-    - "fold_tma_mext":    M-ext fold (A4), compact-smem alias + TMA store
-    - "fold_mext_direct": M-ext fold (A6), pi alias + 128-bit direct stores
+    - "fold_tma_mext":    M-ext fold, compact-smem alias + TMA store
+    - "fold_mext_direct": M-ext fold, permuted-alias 128-bit direct stores
     - "plain_tma":        stock kernel/epilogue baseline (no fold)
 
-    (The former "fold_direct" tiny-m mode was removed: dominated at every
-    m_tok after the transposed-staging fold_tma optimization -- see
-    fold_vs_plain_latency_results.md.)
     """
     assert mode in ("fold_tma", "plain_tma", "fold_tma_mext",
-                    "fold_mext_direct"), mode
+                    "fold_mext_direct", "kloop_tma"), mode
     assert kernel_arch in ("sm100", "sm103"), kernel_arch
-    # sm100 kernel supports the TMA fold paths (N-ext + M-ext) and plain.
+    # sm100 kernel supports the TMA fold paths (N-ext + M-ext), plain, and
+    # the wrapped-K-loop.
     assert kernel_arch == "sm103" or mode in (
-        "fold_tma", "fold_tma_mext", "plain_tma", "fold_mext_direct")
+        "fold_tma", "fold_tma_mext", "plain_tma", "fold_mext_direct",
+        "kloop_tma")
     # M-ext (fold_on_m) is implemented on the sm100 kernel only for now.
     assert mode not in ("fold_tma_mext", "fold_mext_direct") or kernel_arch == "sm100", (
         "M-ext modes are sm100-only")
-    # Exp2 depth knobs are sm100-only (the sm103 ctor has no such params).
-    assert kernel_arch == "sm100" or (
-        acc_stage_override is None and ab_stage_override is None
-    ), "stage overrides are sm100-only"
+    # kloop_tma: wrapped-K-loop -- act (K-concat, 2K) as A, weight as B with a
+    # wrapped k coordinate, PLAIN epilogue writing C[m_tok, n_w]. sm100-only.
+    assert mode != "kloop_tma" or (
+        kernel_arch == "sm100"
+        and not strided_weight), "kloop_tma: sm100-only, contiguous weight"
+    # The AB depth knob is sm100-only (the sm103 ctor has no such param).
+    assert kernel_arch == "sm100" or ab_stage_override is None, (
+        "ab_stage_override is sm100-only")
     key = (mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
-           acc_stage_override, ab_stage_override, use_prefetch)
+           ab_stage_override, strided_weight)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
 
@@ -99,14 +110,13 @@ def _compile_fold_gemm(
             sf_vec_size=SF_VEC_SIZE,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
-            use_prefetch=use_prefetch,
             enable_pdl=True,
             fold_pairs_tma=(mode in ("fold_tma", "fold_tma_mext",
                                      "fold_mext_direct")),
             fold_on_m=(mode in ("fold_tma_mext", "fold_mext_direct")),
             mext_direct_store=(mode == "fold_mext_direct"),
-            acc_stage_override=acc_stage_override,
             ab_stage_override=ab_stage_override,
+            k_loop=(mode == "kloop_tma"),
         )
     else:
         gemm = kernel_cls(
@@ -117,7 +127,7 @@ def _compile_fold_gemm(
             fold_pairs_tma=(mode == "fold_tma"),
         )
 
-    # A6 (fold_mext_direct) needs PROVABLE 16B alignment of the direct-store
+    # fold_mext_direct needs PROVABLE 16B alignment of the direct-store
     # pointers: annotate the dynamic dims' divisibility (n_w%32 is already a
     # hard pi requirement; m_tok%8 comes with tile8). Runtime asserts below.
     _a6 = mode == "fold_mext_direct"
@@ -131,16 +141,58 @@ def _compile_fold_gemm(
     # constraint ties the output's n_w dim to the weight operand, not the act.
     _a_rows, _b_rows = (
         (sym_n, sym_m)
-        if mode in ("fold_tma_mext", "fold_mext_direct")
+        if mode in ("fold_tma_mext", "fold_mext_direct", "kloop_tma")
         else (sym_m, sym_n)
     )
-    a_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (_a_rows, sym_k), stride_order=(1, 0), assumed_align=32
-    )
-    b_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (_b_rows, sym_k), stride_order=(1, 0), assumed_align=32
-    )
-    if mode in ("fold_tma", "fold_tma_mext", "fold_mext_direct"):
+    # `strided_weight` supports an ext-K residue layer WITHOUT materialising a
+    # base-K copy: the problem's K is k_base, but the weight rows are k_ext
+    # apart because the tensor is a `weight_ext[:, :k_base_packed]` view. This
+    # mirrored what the SM120 C++ path did --
+    #   stride_B = make_int_tuple_from<StrideB>(physical_k_ext, 0)
+    # with the problem shape still at k_base. That kernel
+    # (nvfp4_scaled_mm_sm120_epilogue_kernels.cu) has since been deleted; the
+    # technique is described here rather than cross-referenced so the comment
+    # survives its removal. Recoverable from git history if needed.
+    # The B-side scale needs no special handling: `weight_scale_base` is
+    # already the re-swizzled base-K prefix, and sf_k derives from k_base.
+    #
+    # Which operand carries the weight depends on the orientation: N-ext
+    # ("fold_tma") passes weight as mA, M-ext passes it as mB -- same swap as
+    # _a_rows/_b_rows above. Only that operand gets a dynamic leading dim; the
+    # activation is freshly quantised and always compact.
+    #
+    # A compact tensor keeps its own cache entry (strided_weight=False), so the
+    # validated contiguous path compiles to exactly the same binary as before.
+    _w_is_a = mode not in ("fold_tma_mext", "fold_mext_direct", "kloop_tma")
+
+    def _operand(rows, is_weight):
+        if strided_weight and is_weight:
+            return cute.runtime.make_fake_tensor(
+                cutlass.Uint8, (rows, sym_k), (cute.sym_int(), 1),
+                assumed_align=32,
+            )
+        return cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (rows, sym_k), stride_order=(1, 0), assumed_align=32
+        )
+
+    a_fake = _operand(_a_rows, _w_is_a)
+    b_fake = _operand(_b_rows, not _w_is_a)
+    if mode == "kloop_tma":
+        # A is the K-concat activation at 2K -- its own symbolic K, unrelated
+        # to B's (the weight's) sym_k. The kernel takes trip count from A and
+        # wraps B; runtime shapes enforce the 2x relation.
+        a_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass.Uint8, (_a_rows, cute.sym_int()), stride_order=(1, 0),
+            assumed_align=32,
+        )
+    if mode == "kloop_tma":
+        # Plain epilogue, C = [act_rows(m_tok), n_w] row-major -- no fold,
+        # no transpose: the operand swap already put tokens on GEMM-M.
+        c_fake = cute.runtime.make_fake_compact_tensor(
+            c_cutlass_dtype, (sym_n, sym_m), stride_order=(1, 0),
+            assumed_align=16,
+        )
+    elif mode in ("fold_tma", "fold_tma_mext", "fold_mext_direct"):
         # Physical output: row-major D[m_tok, n_w]. N-ext writes it via a
         # transposed TMA view; M-ext writes it naturally (no transpose) -- either
         # way the physical buffer is [m_tok, n_w].
@@ -226,14 +278,20 @@ def mext_fold_gemm_sm103(
     cluster_shape_mn: tuple[int, int] = DEFAULT_CLUSTER_SHAPE_MN,
     store_mode: str = "tma",
     kernel_arch: str = "sm103",
-    acc_stage_override: int | None = None,
     ab_stage_override: int | None = None,
-    use_prefetch: bool = False,
+    alpha_res: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run the fold GEMM. Returns D[m_tok, n_w] (contiguous).
 
+    alpha_res: optional residue-half global scale (dual-alpha). None keeps the
+    legacy single-alpha path bit-for-bit. When set, the fold computes
+    alpha*base + alpha_res*res in f32 (base rows = even/pair-first submode).
+
     Args:
-        weight_fp4: [n_w, k // 2] uint8 packed FP4, K-major, k_base prefix only.
+        weight_fp4: [n_w, k_base // 2] uint8 packed FP4, K-major. May be a
+            `weight_ext[:, :k_base_packed]` VIEW of an ext-K residue weight;
+            the row stride is read from the tensor, so no base-K copy is
+            needed. Must stay contiguous within a row.
         act_fp4_rowpair: [2 * m_tok, k // 2] uint8 packed FP4, row-pair layout.
         weight_sf: swizzled 128x4 FP8 scale for the k_base prefix
             (quant.vllm_integration layout_utils weight_scale_base).
@@ -246,29 +304,63 @@ def mext_fold_gemm_sm103(
     m_tok = m2 // 2
     k = k_packed * 2
 
+    # ext-K residue: `weight_fp4` may be a `weight_ext[:, :k_base_packed]` view,
+    # so its row stride is k_ext_packed while its width is k_base_packed. The
+    # shape already gives the problem K (= k_base); the stride is what tells the
+    # kernel how far apart the rows sit. Detect it here rather than making the
+    # caller pass k_ext -- a narrowed view carries the fact already, and a
+    # caller-supplied value could disagree with the tensor silently.
+    _w_ld = weight_fp4.stride(0)
+    _strided_w = _w_ld != k_packed
+    if _strided_w:
+        assert weight_fp4.stride(1) == 1, (
+            "weight must stay K-contiguous within a row; got stride "
+            f"{weight_fp4.stride()}")
+        assert _w_ld > k_packed, (
+            f"weight row stride {_w_ld} < width {k_packed}: rows would overlap")
+        # TMA needs the row starts aligned, and the operands are declared
+        # assumed_align=32. A contiguous weight satisfies this via k_packed;
+        # a strided one must satisfy it via the EXT width. Every ext layer in
+        # the exported checkpoints does (k_ext in {2880,3200,3840,12160,14592}
+        # -> packed strides all %32 == 0), but a coarser salient granularity
+        # could break it, so refuse loudly instead of corrupting the read.
+        assert _w_ld % 32 == 0, (
+            f"strided weight row stride {_w_ld} is not 32B-aligned; "
+            "materialise a contiguous base-K prefix for this layer")
+    if act_fp4_rowpair.stride(0) != k_packed or act_fp4_rowpair.stride(1) != 1:
+        # The activation is produced by scaled_fp4_quant_mext_r1 and is always
+        # compact; only the weight operand has a dynamic leading dim compiled in.
+        raise ValueError(
+            f"activation must be compact [{m2}, {k_packed}]; got stride "
+            f"{act_fp4_rowpair.stride()}")
 
-    _mode = {
-        "tma": "fold_tma",
-        "tma_mext": "fold_tma_mext",
-        "direct_mext": "fold_mext_direct",
-    }[store_mode]
+    _mode = STORE_MODE_TO_MODE[store_mode]
+    # Dual-alpha hot path: pass alpha as a PRE-COMBINED (2,) f32 tensor
+    # ([alpha_base, alpha_res]) -- zero per-call allocations. The alpha_res
+    # convenience arg concatenates per call (extra kernel; init-time use only).
+    _dual = alpha_res is not None or alpha.numel() == 2
     compiled = _compile_fold_gemm(
         mma_tiler_mn, cluster_shape_mn, out_dtype,
         mode=_mode, kernel_arch=kernel_arch,
-        acc_stage_override=acc_stage_override,
         ab_stage_override=ab_stage_override,
-        use_prefetch=use_prefetch,
+        strided_weight=_strided_w,
     )
 
-    alpha_t = alpha.reshape(1).to(torch.float32)
+    if alpha_res is not None:
+        alpha_t = torch.cat(
+            [alpha.reshape(1), alpha_res.reshape(1)]).to(torch.float32)
+    elif _dual:
+        alpha_t = alpha.reshape(2).to(torch.float32)
+    else:
+        alpha_t = alpha.reshape(1).to(torch.float32)
     sf_m = _ceil_div(n_w, 128)   # weight scale-factor tiles
     sf_n = _ceil_div(m2, 128)    # activation scale-factor tiles
     sf_k = _ceil_div(k, SF_VEC_SIZE * 4)
 
     if store_mode in ("tma_mext", "direct_mext"):
-        # direct_mext (A6) additionally requires the WEIGHT rows pre-permuted
-        # by pi (see a6_weight_perm_indices); output D is standard order.
-        # A6 dereferences the m2-congruent alias: the peer half of a 2SM mma
+        # direct_mext additionally requires the WEIGHT rows pre-permuted
+        # (see direct_mext_weight_perm_indices); output D is standard order.
+        # The direct store dereferences the m2-congruent alias: the peer half of a 2SM mma
         # tile must exist (2*m_tok >= mma M) or its stores land out of bounds.
         assert store_mode != "direct_mext" or m2 >= mma_tiler_mn[0], (
             f"direct_mext needs 2*m_tok >= mma_tiler M "
@@ -291,25 +383,78 @@ def mext_fold_gemm_sm103(
     if store_mode == "tma":
         # N-ext: kernel writes row-major D[m_tok, n_w] via a transposed TMA view.
         d_t = torch.empty(m_tok, n_w, dtype=out_dtype, device=weight_fp4.device)
-        compiled(
-            weight_fp4, act_fp4_rowpair, d_t,
-            sf_m, sf_n, sf_k,
-            weight_sf.data_ptr(), act_sf.data_ptr(),
-            alpha_t,
-        )
+        if kernel_arch == "sm100":
+            compiled(
+                weight_fp4, act_fp4_rowpair, d_t,
+                sf_m, sf_n, sf_k,
+                weight_sf.data_ptr(), act_sf.data_ptr(),
+                alpha_t,
+            )
+        else:
+            compiled(
+                weight_fp4, act_fp4_rowpair, d_t,
+                sf_m, sf_n, sf_k,
+                weight_sf.data_ptr(), act_sf.data_ptr(),
+                alpha_t,
+            )
         return d_t
 
     raise ValueError(f"unknown store_mode {store_mode!r}")
 
-def a6_weight_perm_indices(n_w: int) -> "torch.Tensor":
-    """Row-permutation for the A6 (direct_mext) weight: kernel position p must
-    hold logical weight row f(p), per 32-row block. Derived from the .16x256b
-    atom dst TV ((4,8),(2,2,4)):((2,32),(1,256,8)) at epi (128,32): position
-    p = va + 2*ta + 8*vc  ->  f(p) = va + 8*ta + 2*vc  (va in 2, ta in 4, vc in 4).
-    Usage: w_kernel = w_logical[a6_weight_perm_indices(n_w)] (permute the bf16
-    weight BEFORE quantization so its SF stays consistent). Output D is
-    standard order; no downstream compensation.
+def kext_kloop_gemm_sm100(
+    weight_fp4: "torch.Tensor",
+    act_fp4_kext: "torch.Tensor",
+    weight_sf: "torch.Tensor",
+    act_sf: "torch.Tensor",
+    alpha: "torch.Tensor",
+    out_dtype=None,
+    mma_tiler_mn: tuple[int, int] = DEFAULT_MMA_TILER_MN,
+    cluster_shape_mn: tuple[int, int] = DEFAULT_CLUSTER_SHAPE_MN,
+) -> "torch.Tensor":
+    """Wrapped-K-loop GEMM on sm100: D[m_tok, n_w] = act[m_tok, 2K] @ [W|W]^T
+    with the weight stored ONCE (its k coordinate wraps in the kernel).
+
+    weight_fp4:   [n_w, k/2] uint8 packed FP4, K-major, contiguous.
+    act_fp4_kext: [m_tok, k] uint8 -- the K-concat quant output
+                  (`scaled_fp4_quant_mext_r1(layout_mode="concat_k")`): 2K
+                  elements per row, base in cols [0, K), residue in [K, 2K).
+    act_sf:       SF bytes in canonical (m_tok, 2K) atom order.
+    weight_sf:    swizzled SF for (n_w, K).
+
+    Compiles ONCE per (tile, dtype): every dim is symbolic, so serving m is
+    a free variable -- no bucket grid needed on this arch.
     """
+    import torch
+
+    out_dtype = out_dtype or torch.bfloat16
+    n_w, k_packed = weight_fp4.shape
+    k = k_packed * 2
+    assert weight_fp4.stride(0) == k_packed and weight_fp4.stride(1) == 1, (
+        "kloop_tma expects a contiguous weight (mext_r1 weights are)")
+    m_tok = act_fp4_kext.shape[0]
+    assert act_fp4_kext.shape[1] == k, (
+        f"activation must be [rows, {k}] bytes (2K elements), got "
+        f"{tuple(act_fp4_kext.shape)}")
+
+    compiled = _compile_fold_gemm(
+        tuple(mma_tiler_mn), tuple(cluster_shape_mn), out_dtype,
+        mode="kloop_tma", kernel_arch="sm100")
+    d_t = torch.empty(m_tok, n_w, dtype=out_dtype, device=weight_fp4.device)
+    alpha_t = alpha.reshape(1).to(torch.float32).contiguous()
+    # wrapper (sf_m, sf_n, sf_k) = A-side rows/128, B-side rows/128, BASE-K
+    # groups (the wrapper doubles the A side under k_loop).
+    compiled(
+        act_fp4_kext, weight_fp4, d_t,
+        _ceil_div(m_tok, 128), _ceil_div(n_w, 128),
+        _ceil_div(k // SF_VEC_SIZE, 4),
+        act_sf.data_ptr(), weight_sf.data_ptr(),
+        alpha_t,
+    )
+    return d_t
+
+
+def direct_mext_weight_perm_indices(n_w: int) -> "torch.Tensor":
+    'Row-permutation for the direct_mext weight: kernel position p must\n\nRow-permutation for the direct_mext weight: kernel position p must\n    hold logical weight row f(p), per 32-row block. Derived from the .16x256b\n    atom dst TV ((4,8),(2,2,4)):((2,32),(1,256,8)) at epi (128,32): position\n    p = va + 2*ta + 8*vc  ->  f(p) = va + 8*ta + 2*vc  (va in 2, ta in 4, vc in 4).\n    Usage: w_kernel = w_logical[direct_mext_weight_perm_indices(n_w)]. Output D is\n    standard order; no downstream compensation.'
     assert n_w % 32 == 0, n_w
     f = torch.empty(32, dtype=torch.long)
     for va in range(2):

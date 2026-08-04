@@ -16,7 +16,13 @@ from modelopt.torch.quantization.conversion import set_quantizer_by_cfg_context
 from modelopt.torch.quantization.model_calib import max_calibrate
 from modelopt.torch.utils.network import bind_forward_method, unpatch_forward_method
 
-__all__ = ["ResidueHelper", "get_salient_indices", "customized_forward", "apply_salient_indices"]
+__all__ = [
+    "ResidueHelper",
+    "get_salient_indices",
+    "get_nvfp4_error_weighted_score",
+    "customized_forward",
+    "apply_salient_indices",
+]
 
 
 class ResidueHelper:
@@ -28,12 +34,17 @@ class ResidueHelper:
         name,
         block_size: int = 8,
         residue_ratio: float = 0.25,
+        salience_metric: str = "activation_max",
     ):
         self.name = name
         self.module = module
         # Residue-specific parameters
         self.block_size = block_size
         self.residue_ratio = residue_ratio
+        self.salience_metric = salience_metric
+
+        if salience_metric not in {"activation_max", "nvfp4_error_weighted"}:
+            raise ValueError(f"Unsupported residue salience metric: {salience_metric!r}")
 
         self.act_scale = 0.0
         self.num_tokens = 0
@@ -92,6 +103,14 @@ def get_salient_indices(act_scale_mean: torch.Tensor, block_size, ratio: float) 
     
     return salient_indices
 
+
+def get_nvfp4_error_weighted_score(
+    accumulated_error_sq: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    """Return ||X-Q(X)||_2 * ||W[:, j]||_2 for every input channel."""
+    weight_col_norm = weight.detach().float().square().sum(dim=0).sqrt()
+    return accumulated_error_sq.float().clamp_min(0).sqrt() * weight_col_norm
+
 def customized_forward(self, input, *args, **kwargs):
     # collect actual output without quantization
     self.weight_quantizer.disable()
@@ -112,7 +131,16 @@ def customized_forward(self, input, *args, **kwargs):
 
         # Salient channel ranking should reflect the raw activation distribution rather than
         # the AWQ-smoothed path.
-        self.residue_max.act_scale += get_act_scale(input)
+        if self.residue_max.salience_metric == "nvfp4_error_weighted":
+            # Use ModelOpt's exact dynamic NVFP4 fake quantizer.  Calling the
+            # protected primitive is intentional: stats collection puts the
+            # public quantizer in calibration/pass-through mode.
+            with self.input_quantizer.allow_residue_linear_fake_quant():
+                quantized_input = self.input_quantizer._fake_quantize(input)
+            flat_error = (input.float() - quantized_input.float()).reshape(-1, input.shape[-1])
+            self.residue_max.act_scale += flat_error.square().sum(dim=0)
+        else:
+            self.residue_max.act_scale += get_act_scale(input)
         self.residue_max.num_cache_steps += 1
         self.residue_max.num_tokens += input.numel() / input.shape[-1]
         if self.residue_max.is_input_quantized and self.residue_max._saved_awq_amax is None:

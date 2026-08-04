@@ -100,8 +100,21 @@ def build_policy_metadata_for_budget(
             out_features = int(shape[0]) if shape is not None else None
             in_features = int(shape[1]) if shape is not None else None
             num_salient = int(len(salient_indices))
+            # ratio 1.0 layers are served by the M-extension path (mext_r1):
+            # the weight is NOT K-extended, so they must not contribute an
+            # extended_in_features / extended_linear_dims entry.
+            #
+            # This restates the invariant "mext_r1 IS ratio 1.0", whose single
+            # definition is quant.modelopt_integration.kernel_metadata.
+            # is_mext_r1_layer -- read that docstring before changing this
+            # line. It is duplicated rather than imported on purpose:
+            # auto_search does not depend on quant/ and one predicate is not
+            # worth the edge. If they ever disagree, that one is right.
+            is_mext_r1 = in_features is not None and num_salient == in_features
             extended_in_features = (
-                int(in_features + num_salient) if in_features is not None else None
+                int(in_features + num_salient)
+                if in_features is not None and not is_mext_r1
+                else None
             )
 
             layer_meta = {
@@ -120,6 +133,8 @@ def build_policy_metadata_for_budget(
                 "frontier_cost": choice.get("frontier_cost"),
                 "storage_bits": choice.get("storage_bits"),
             }
+            if is_mext_r1:
+                layer_meta["runtime_mode"] = "mext_r1"
             if in_features is not None:
                 layer_meta["original_in_features"] = in_features
             if extended_in_features is not None:
@@ -132,6 +147,26 @@ def build_policy_metadata_for_budget(
             policy_meta = dict(layer_meta)
             policy_meta.update({"mode": "residue", "source_mode": "residue"})
             layer_policies[module_name] = policy_meta
+
+    # vLLM merges q/k/v and gate/up into single fused layers and resolves ONE
+    # metadata entry for the merged module, so every member of a merged group
+    # must share the same runtime mode (mext_r1 vs extended_k). A mix would
+    # load one weight layout while serving assumes another.
+    _MERGED_GROUPS = (("q_proj", "k_proj", "v_proj"), ("gate_proj", "up_proj"))
+    grouped: dict[tuple[str, int], dict[str, str]] = {}
+    for module_name, layer_meta in layers.items():
+        parent, _, leaf = module_name.rpartition(".")
+        for gi, group in enumerate(_MERGED_GROUPS):
+            if leaf in group:
+                mode = layer_meta.get("runtime_mode", "extended_k")
+                grouped.setdefault((parent, gi), {})[leaf] = mode
+    for (parent, gi), members in grouped.items():
+        if len(set(members.values())) > 1:
+            raise ValueError(
+                f"Merged-layer runtime-mode mismatch under '{parent}': {members}. "
+                "All members of a vLLM-merged group must share the same mode "
+                "(ratio 1.0 -> mext_r1 must apply to the whole group or none)."
+            )
 
     metadata = {
         "layers": layers,

@@ -20,8 +20,8 @@ never a real fix for worker propagation.
 The canonical, version- and container-layout-independent mechanism is the
 ``vllm.general_plugins`` entry-point group: vLLM loads it in *all* processes,
 before the model is built. That is strictly more robust than sitecustomize/.pth
-(which depend on the interpreter's site layout and may not run in spawned
-workers).
+(which depend on the container's python site layout and did not run in Modal's
+spawned worker).
 
 Enable (opt-in, same env knobs the old scripts used):
     RESIDUE_PATCH_VLLM=1          turn the plugin on
@@ -52,11 +52,22 @@ def apply() -> None:
         # patch_vllm_modelopt via version="auto".
         patch_vllm_modelopt(model_dir=model_dir)
         print(f"[residue:plugin] applied in pid={pid}", flush=True)
-    except Exception as exc:  # loud: a silent skip means kernels never activate
-        import traceback
-
+    except Exception as exc:
+        # RAISE, do not just report. Printing is not loud enough: vLLM would
+        # carry on and serve the model as plain NVFP4, producing numbers that
+        # look completely normal. A residue arm silently becomes its own
+        # control, and the results table shows "residue == plain" -- which
+        # reads as a kernel bug and sends the next person to debug the fold.
+        # That has already cost someone an evening.
+        #
+        # Failing is safe to do here because reaching this point means
+        # RESIDUE_PATCH_VLLM=1, i.e. the caller explicitly asked for residue.
+        # Refusing to start beats a fake success.
         print(
-            f"[residue:plugin] FAILED in pid={pid}: {type(exc).__name__}: {exc}",
+            f"[residue:plugin] FAILED in pid={pid}: {type(exc).__name__}: {exc}\n"
+            f"[residue:plugin] refusing to serve without the residue kernels "
+            f"(RESIDUE_PATCH_VLLM=1 was set). Unset it to run plain NVFP4 "
+            f"deliberately.",
             flush=True,
         )
-        traceback.print_exc()
+        raise

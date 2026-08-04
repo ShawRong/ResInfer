@@ -312,7 +312,10 @@ def _run_modelopt_search(args: argparse.Namespace) -> dict[str, Any]:
     from quant.modelopt_integration import enable_residue_auto_quantize_support
 
     enable_residue_auto_quantize_support()
-    if "residue_max" not in model_quant._AUTO_QUANTIZE_SUPPORTED_ALGORITHMS:
+    # ModelOpt <=0.42 has no patchable allowlist (the enable shim documents
+    # this); only assert on versions that expose one.
+    _supported = getattr(model_quant, "_AUTO_QUANTIZE_SUPPORTED_ALGORITHMS", None)
+    if _supported is not None and "residue_max" not in _supported:
         raise AssertionError("residue_max was not added to auto_quantize allowlist")
 
     dtype = _torch_dtype(args.dtype)

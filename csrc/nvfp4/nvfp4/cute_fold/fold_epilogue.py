@@ -31,6 +31,7 @@ def mext_fold_epilogue(
     tCcC_base: cute.Tensor = None,
     mC_mnl: cute.Tensor = None,
     alpha_value=None,
+    alpha_res_value=None,
 ) -> pipeline.PipelineState:
     """Direct-store epilogue with in-register MExt row-pair folding.
 
@@ -208,6 +209,7 @@ def mext_fold_epilogue_tma(
     acc_pipeline: pipeline.PipelineAsync,
     c_pipeline,
     alpha_value=None,
+    alpha_res_value=None,
 ) -> pipeline.PipelineState:
     """TMA-store fold epilogue.
 

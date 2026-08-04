@@ -24,7 +24,6 @@
 #   NVFP4_CXX                   C++ compiler; otherwise conda g++ or system g++
 #   NVFP4_TORCH_CUDA_ARCH_LIST  12.0
 #   NVFP4_CUDAARCHS             120-real
-#   NVFP4_BUILD_GEMM            1 (set 0 for quant/export-only build)
 
 set -euo pipefail
 
@@ -80,7 +79,6 @@ NVFP4_CXX="${NVFP4_CXX:-$(find_executable \
     "$(find_in_path g++)")}"
 NVFP4_TORCH_CUDA_ARCH_LIST="${NVFP4_TORCH_CUDA_ARCH_LIST:-12.0}"
 NVFP4_CUDAARCHS="${NVFP4_CUDAARCHS:-120-real}"
-NVFP4_BUILD_GEMM="${NVFP4_BUILD_GEMM:-1}"
 
 if [[ -z "$PY" ]]; then
     echo "[build] Could not find a Python interpreter. Set PY=/path/to/python." >&2
@@ -102,7 +100,6 @@ echo "[build] toolchain:  ${NVFP4_TOOLCHAIN_PREFIX:-system PATH}"
 echo "[build] cc:         $NVFP4_CC"
 echo "[build] cxx:        $NVFP4_CXX"
 echo "[build] arch:       sm_$NVFP4_TORCH_CUDA_ARCH_LIST  ($NVFP4_CUDAARCHS)"
-echo "[build] gemm:       $NVFP4_BUILD_GEMM"
 
 for t in "$NVFP4_CUDA_HOME/bin/nvcc" "$NVFP4_CC" "$NVFP4_CXX" "$PY"; do
     if [[ ! -x "$t" ]]; then
@@ -129,7 +126,6 @@ CC="$NVFP4_CC" \
 CXX="$NVFP4_CXX" \
 TORCH_CUDA_ARCH_LIST="$NVFP4_TORCH_CUDA_ARCH_LIST" \
 CUDAARCHS="$NVFP4_CUDAARCHS" \
-NVFP4_BUILD_GEMM="$NVFP4_BUILD_GEMM" \
     "$PY" setup.py build_ext --inplace
 
 echo "[build] built artifacts:"
@@ -143,11 +139,6 @@ echo "[build] verifying import in $PY ..."
 import nvfp4, torch
 print(f'[build] OK — nvfp4 from {nvfp4.__file__}')
 expected = ['scaled_fp4_quant_mext_r1', 'scaled_fp4_quant', 'official_scaled_fp4_quant_pack8']
-if '${NVFP4_BUILD_GEMM}' not in ('0', 'false', 'False', 'off', 'no'):
-    expected.extend([
-        'cutlass_scaled_fp4_mm_ext_b_prefix_mext_fold_tile8_thread_vec_store_clean',
-        'cutlass_scaled_fp4_mm_ext_b_prefix',
-    ])
 missing = [op for op in expected if not hasattr(torch.ops.nvfp4, op)]
 if missing:
     raise SystemExit(f'[build] FAIL — missing torch.ops.nvfp4 ops: {missing}')

@@ -503,66 +503,6 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
   }
 }
 
-template <class Type, bool UE8M0_SF = false>
-__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
-    cvt_fp16_to_fp4_residue_pack8_r1000_no_swap(
-        int32_t numRows, int32_t numTotalCols, int32_t numMainCols,
-        Type const* in, float const* SFScale, uint32_t* out, uint32_t* SFout) {
-  using PackedVecT = PackedVec<Type>;
-  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
-      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
-  static constexpr int RESIDUE_PER_8_ELTS = 8;
-
-  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
-  uint8_t* extraSFStart = reinterpret_cast<uint8_t*>(SFout);
-  int32_t effectiveRows = computeEffectiveRows(numRows);
-
-  int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
-  if (colIdx >= numMainCols / CVT_FP4_ELTS_PER_THREAD) {
-    return;
-  }
-
-  for (int rowIdx = blockIdx.x; rowIdx < effectiveRows; rowIdx += gridDim.x) {
-    bool validRow = rowIdx < numRows;
-    PackedVecT inVec{};
-    if (validRow) {
-      int64_t inOffset =
-          static_cast<int64_t>(rowIdx) *
-              (numMainCols / CVT_FP4_ELTS_PER_THREAD) +
-          colIdx;
-      inVec = reinterpret_cast<PackedVecT const*>(in)[inOffset];
-    }
-
-    auto sfOut =
-        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                           CVT_FP4_NUM_THREADS_PER_SF>(
-            rowIdx, colIdx, numTotalCols, SFout);
-
-    uint32_t* outPos = nullptr;
-    uint32_t* residueDataOut = nullptr;
-    if (validRow) {
-      int64_t outOffset =
-          static_cast<int64_t>(rowIdx) *
-              (numTotalCols / CVT_FP4_ELTS_PER_THREAD) +
-          colIdx;
-      outPos = out + outOffset;
-      residueDataOut =
-          cvt_residue_data_get_offset<uint32_t, RESIDUE_PER_8_ELTS>(
-              rowIdx, colIdx, numMainCols, numTotalCols, out);
-    }
-
-    auto residueSFOut =
-        cvt_residue_sf_get_offset<uint8_t, RESIDUE_PER_8_ELTS>(
-            rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart);
-
-    uint32_t packed = cvt_warp_fp16_to_fp4_mext_r1_fast<Type, UE8M0_SF>(
-        inVec, SFScaleVal, SFScaleVal, sfOut, residueDataOut, residueSFOut);
-    if (outPos) {
-      *outPos = packed;
-    }
-  }
-}
-
 template <typename T>
 void invokeFP4QuantizationPack8R0125NoSwap(
     int m, int n_ext, int n, T const* input, float const* SFScale,
@@ -660,36 +600,6 @@ void invokeFP4QuantizationPack8R050NoSwap(
   }
 }
 
-template <typename T>
-void invokeFP4QuantizationPack8R1000NoSwap(
-    int m, int n_ext, int n, T const* input, float const* SFScale,
-    int64_t* output, int32_t* SFOuput, bool useUE8M0,
-    int multiProcessorCount, cudaStream_t stream) {
-  int numThreads = n / CVT_FP4_ELTS_PER_THREAD;
-  numThreads = std::max(numThreads, 32);
-  int blockSize = std::min(numThreads, 512);
-  blockSize = ((blockSize + 31) / 32) * 32;
-  blockSize = std::min(blockSize, 512);
-  dim3 block(blockSize);
-  int const numBlocksPerSM =
-      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
-  dim3 grid(std::min(computeEffectiveRows(m),
-                     multiProcessorCount * numBlocksPerSM),
-            cuda_utils::ceil_div(numThreads, static_cast<int>(block.x)));
-
-  if (useUE8M0) {
-    cvt_fp16_to_fp4_residue_pack8_r1000_no_swap<T, true>
-        <<<grid, block, 0, stream>>>(
-            m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
-            reinterpret_cast<uint32_t*>(SFOuput));
-  } else {
-    cvt_fp16_to_fp4_residue_pack8_r1000_no_swap<T, false>
-        <<<grid, block, 0, stream>>>(
-            m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
-            reinterpret_cast<uint32_t*>(SFOuput));
-  }
-}
-
 }  // namespace vllm
 
 void scaled_fp4_quant_with_residue_ext_pack8_r0125_no_swap(
@@ -726,44 +636,6 @@ void scaled_fp4_quant_with_residue_ext_pack8_r0125_no_swap(
     vllm::invokeFP4QuantizationPack8R0125NoSwap(
         m, static_cast<int>(n_ext), n, input_ptr, input_sf_ptr, output_ptr,
         sf_out, useUE8M0, channel_indices_ptr, multiProcessorCount, stream);
-  });
-}
-
-void scaled_fp4_quant_with_residue_ext_pack8_r1000_no_swap(
-    torch::Tensor const& output, torch::Tensor const& input,
-    torch::Tensor const& output_sf, torch::Tensor const& input_sf,
-    torch::Tensor const& channel_indices, int64_t n_ext,
-    int64_t residue_per_8) {
-  (void)channel_indices;
-  int32_t m = input.size(0);
-  int32_t n = input.size(1);
-
-  TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
-  TORCH_CHECK(n_ext == static_cast<int64_t>(n) * 2,
-              "pack8 r1000 legacy residue expects n_ext == 2 * input K.");
-  TORCH_CHECK(input.scalar_type() == at::ScalarType::Half ||
-                  input.scalar_type() == at::ScalarType::BFloat16,
-              "Unsupported input data type for pack8 r1000 quantize_to_fp4.");
-  TORCH_CHECK(residue_per_8 == 8,
-              "pack8 r1000 legacy residue only supports residue_per_8 == 8.");
-
-  int multiProcessorCount =
-      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
-
-  auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
-  auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
-  auto output_ptr = static_cast<int64_t*>(output.data_ptr());
-  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
-  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-
-  bool useUE8M0 = false;
-
-  VLLM_DISPATCH_HALF_TYPES(input.scalar_type(), "nvfp4_quant_kernel_pack8_r1000", [&] {
-    using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
-    auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
-    vllm::invokeFP4QuantizationPack8R1000NoSwap(
-        m, static_cast<int>(n_ext), n, input_ptr, input_sf_ptr, output_ptr,
-        sf_out, useUE8M0, multiProcessorCount, stream);
   });
 }
 

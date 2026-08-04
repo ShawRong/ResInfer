@@ -14,6 +14,35 @@ from typing import Any
 import torch
 
 
+def is_mext_r1_layer(num_salient: int, in_features: int) -> bool:
+    """Does this layer's residue live in the M dimension rather than in K?
+
+    True on exactly one condition: EVERY input channel is salient, i.e.
+    residue ratio 1.0. That is the whole rule -- `mext_r1` is not a mode
+    competing with the ratio options, it IS ratio 1.0, stored so the weight
+    is kept once instead of twice:
+
+        extended_k at ratio 1.0:  [x_q | r_q] @ [W | W]^T = x_q@W^T + r_q@W^T
+        mext_r1:                  rows (x_q, r_q) @ W^T, summed in the epilogue
+
+    Both compute the same thing; only mext_r1 avoids duplicating W.
+
+    This predicate is the ONLY place the equivalence is decided. It used to be
+    re-derived at four sites with four different expressions
+    (`salient_indices.numel() == in_features`, `== module.weight.shape[1]`,
+    `== k_base`, `num_salient == int(in_features)`), which is how a reader can
+    meet the rule repeatedly without ever meeting a statement of it.
+
+    Note this is a PROPERTY OF THE LAYER, decided at export. It is not the
+    runtime execution path: a mext_r1 layer can still be served by a non-fold
+    kernel depending on M. Do not infer one from the other -- read
+    `runtime_mode` for the former and the dispatcher's own state for the
+    latter. Conflating them (via the overloaded `num_salient == 0` sentinel)
+    has already produced one silent-wrong-numerics bug.
+    """
+    return int(num_salient) == int(in_features)
+
+
 def _debug(msg: str) -> None:
     if os.getenv("RESIDUE_DEBUG", "0") == "1":
         print(msg)
@@ -81,6 +110,19 @@ def collect_kernel_metadata(
         if salient is not None:
             layer_data["salient_indices"] = salient.cpu().tolist()
             layer_data["num_salient"] = len(layer_data["salient_indices"])
+            # ratio-1.0 layers are never K-extended: they carry
+            # runtime_mode=mext_r1 (set at injection time) and are served by
+            # the M-extension fold path with the weight at original K. All
+            # other residue layers stay on the extended_k contract (which is
+            # also the reader default for legacy checkpoints).
+            runtime_mode = getattr(module, "_residue_runtime_mode", None)
+            if runtime_mode is None and not hasattr(module, "_original_in_features"):
+                in_features = getattr(module, "in_features", None)
+                if in_features is not None and is_mext_r1_layer(
+                    layer_data["num_salient"], in_features
+                ):
+                    runtime_mode = "mext_r1"
+            layer_data["runtime_mode"] = runtime_mode or "extended_k"
 
         # Keep per-layer metadata intentionally minimal. Historical debug
         # fields such as input_amax/weight_amax/original_in_features/

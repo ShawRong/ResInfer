@@ -1,34 +1,41 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-#
+
 # Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
+
+
 # 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-#
+
+
 # 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
+
+
+
 # 3. Neither the name of the copyright holder nor the names of its
 # contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-#
+
+
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+
+
 # DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
+
+
+
+
+
+
+
 # This file is ported from CUTLASS's sm103_dense_blockscaled_gemm_persistent.py
 # with modifications for FlashInfer integration (alpha scaling, PDL support, wrapper method).
 # Original: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/sm103_dense_blockscaled_gemm_persistent.py
+
+
+
+
+
+
+
 
 from typing import Type, Tuple, Union
 from dataclasses import dataclass, field
@@ -138,6 +145,8 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         # stock m2-wide geometry; the C/TMA side uses half-width tiles over
         # the compact D_t[n_w, m_tok] (see fold_epilogue.mext_fold_epilogue_tma).
         self.fold_pairs_tma = fold_pairs_tma and use_tma_store
+        # Dual-alpha: base/res halves carry separate global scales (alpha is a
+        # (2,) tensor; fold sites apply alpha*even + alpha_res*odd in f32).
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -273,6 +282,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             )
         )
 
+        
         
         
         
@@ -666,6 +676,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
         alpha_value = alpha[0].to(cutlass.Float32)
+        alpha_res_value = alpha_value
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1762,6 +1773,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         acc_pipeline,
                         c_pipeline,
                         alpha_value=alpha_value,
+                        alpha_res_value=alpha_res_value,
                     )
                 elif cutlass.const_expr(self.use_tma_store):
                     acc_consumer_state = utils.gemm.sm100.epilogue_tma_store(
@@ -1794,6 +1806,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         tCcC_base=tCcC,
                         mC_mnl=mC_mnl,
                         alpha_value=alpha_value,
+                        alpha_res_value=alpha_res_value,
                     )
 
             if cutlass.const_expr(self.use_tma_store):
@@ -2694,19 +2707,24 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         n = cute.size(mB, mode=[0])
         k = k_packed * 2  # 2 FP4 values per uint8 byte
 
-        # Recast Uint8 → Float4E2M1FN and reshape to (m, k, l) K-major
+        # Recast Uint8 -> Float4E2M1FN and reshape to (m, k, l) K-major.
+        # Row strides come from the INCOMING tensors, not from (m, k): they
+        # match for a compact operand, but an ext-K residue weight arrives as a
+        # `weight_ext[:, :k_base_packed]` view (width k_base, rows k_ext apart)
+        # and make_ordered_layout would rebuild it compact, silently reading the
+        # wrong elements. Strides are in ELEMENTS, so the uint8 -> FP4 recast
+        # (which doubled k) doubles them too.
+        lda = cute.size(mA.layout.stride[0]) * 2
+        ldb = cute.size(mB.layout.stride[0]) * 2
         a_fp4_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
         a_tensor = cute.make_tensor(
             a_fp4_ptr,
-            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+            layout=cute.make_layout((m, k, l), stride=(lda, 1, m * lda)),
         )
         b_fp4_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
         b_tensor = cute.make_tensor(
             b_fp4_ptr,
-            layout=cute.make_ordered_layout(
-                (n, k, l),
-                order=(1, 0, 2),
-            ),
+            layout=cute.make_layout((n, k, l), stride=(ldb, 1, n * ldb)),
         )
         # C: swap_ab is constexpr, determines layout at compile time
         if cutlass.const_expr(fold_pairs):

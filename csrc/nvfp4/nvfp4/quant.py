@@ -8,14 +8,18 @@ import torch
 
 from .extension import ensure_loaded
 
-ensure_loaded()
+# Soft load: a missing extension only warns; the failure is deferred
+# to the first op call (see extension.py).
+ensure_loaded(required=False)
 
+# ratio 1.0 (residue_per_8=8) K-extension was removed: it doubled the weight
+# (K_ext = 2K). Full-rank residue is served by the M-extension path instead
+# (scaled_fp4_quant_mext_r1 + fold GEMM), which keeps the weight at K.
 SUPPORTED_RATIOS = {
     0.0: 0,
     0.125: 1,
     0.25: 2,
     0.5: 4,
-    1.0: 8,
 }
 
 
@@ -236,24 +240,6 @@ def scaled_fp4_quant_pack8_r050_no_swap_with_mask(
     )
 
 
-def scaled_fp4_quant_pack8_r1000_no_swap_with_mask(
-    input_tensor,
-    input_scale,
-    channel_masks,
-    num_salient,
-):
-    """Experimental pack8 no-swap residue quantization specialized for ratio=1.0."""
-    return _scaled_fp4_quant_pack8_no_swap_with_mask(
-        input_tensor,
-        input_scale,
-        channel_masks,
-        num_salient,
-        1.0,
-        8,
-        "scaled_fp4_quant_pack8_r1000_no_swap",
-    )
-
-
 def scaled_fp4_quant_with_mask(
     input_tensor: torch.Tensor,
     input_scale: torch.Tensor,
@@ -309,6 +295,5 @@ __all__ = [
     "scaled_fp4_quant_pack8_r0125_no_swap_with_mask",
     "scaled_fp4_quant_pack8_r025_no_swap_with_mask",
     "scaled_fp4_quant_pack8_r050_no_swap_with_mask",
-    "scaled_fp4_quant_pack8_r1000_no_swap_with_mask",
     "scaled_fp4_quant_with_mask",
 ]

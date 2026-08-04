@@ -97,6 +97,7 @@ def build_residue_cfg(
     quant_scope: str | None = None,
     use_sequential: bool = False,
     external_salient_metadata_path: str | None = None,
+    salience_metric: str = "activation_max",
 ):
     """Build quant_cfg + algorithm dict for ModelOpt conversion.
 
@@ -123,6 +124,7 @@ def build_residue_cfg(
         "block_size": calib_block_size,
         "track_amax": True,
         "distributed_sync": False,
+        "salience_metric": salience_metric,
     }
     if use_sequential:
         algo_cfg["layerwise"] = True
@@ -221,6 +223,7 @@ def build_gptq_cfg(
     perc_damp: float = 0.01,
     block_size: int = 128,
     quant_scope: str | None = None,
+    layerwise: bool = False,
 ):
     """Build config for standalone GPTQ W4A4/NVFP4.
 
@@ -239,5 +242,19 @@ def build_gptq_cfg(
         "perc_damp": perc_damp,
         "block_size": block_size,
     }
+    if layerwise:
+        # Sequential per-decoder-layer calibration: each layer's Hessian is
+        # built from the PREVIOUS layers' already-quantized activations instead
+        # of the original ones. modelopt runs a full model forward per layer, so
+        # this costs roughly num_layers x the non-layerwise calibration.
+        #
+        # Whether it helps HERE is not obvious. The residue is injected AFTER
+        # this stage, so layerwise propagates uncompensated quantization error
+        # -- an input distribution worse than what the served model sees on the
+        # K-ext layers (which compensate at every M). It is arguably a BETTER
+        # match for mext_r1 layers, which carry num_salient=0 and take the
+        # plain-NVFP4 bypass above the fold's M threshold, i.e. run
+        # uncompensated exactly as layerwise assumes. Measure, do not assume.
+        CUSTOM_CFG["algorithm"]["layerwise"] = True
 
     return CUSTOM_CFG

@@ -153,23 +153,40 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
       in_vec = reinterpret_cast<PackedVec8 const*>(in)[inOffset];
     }
 
+    // kConcatK (mode 3): one output row per token, [M, 2K] geometry. Base
+    // lands at (row, col), residue at (row, col + K); both data and SF use
+    // the canonical addressing of the (M, 2K) grid, so the doubled-K operand
+    // is indistinguishable from a stock quantization of a 2K-wide input.
+    int32_t colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+    bool kConcatK = layoutMode == 3;
     int64_t outOffset =
-        baseRow * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+        kConcatK ? (int64_t)rowIdx * (2 * colsPerRow) + colIdx
+                 : (int64_t)baseRow * colsPerRow + colIdx;
     auto& out_pos = out[outOffset];
 
     auto sf_out =
-        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                           CVT_FP4_NUM_THREADS_PER_SF>(
-            baseRow, colIdx, numCols, SFout);
+        kConcatK
+            ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  rowIdx, colIdx, 2 * numCols, SFout)
+            : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  baseRow, colIdx, numCols, SFout);
 
     int64_t residueOutOffset =
-        residueRow * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+        kConcatK
+            ? (int64_t)rowIdx * (2 * colsPerRow) + colsPerRow + colIdx
+            : (int64_t)residueRow * colsPerRow + colIdx;
     uint32_t* residue_data_out = out + residueOutOffset;
 
     auto residue_sf_out =
-        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
-                                           CVT_FP4_NUM_THREADS_PER_SF>(
-            residueRow, colIdx, numCols, SFout);
+        kConcatK
+            ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  rowIdx, colIdx + colsPerRow, 2 * numCols, SFout)
+            : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  residueRow, colIdx, numCols, SFout);
 
     out_pos = cvt_warp_fp16_to_fp4_mext_r1_fast<Type, UE8M0_SF>(
         in_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out, residue_sf_out);
@@ -204,10 +221,11 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     PackedVec8 lo_vec{};
     PackedVec8 hi_vec{};
     if (validRow) {
-      int64_t inOffset =
-          rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx * 2;
-      lo_vec = reinterpret_cast<PackedVec8 const*>(in)[inOffset];
-      hi_vec = reinterpret_cast<PackedVec8 const*>(in)[inOffset + 1];
+      // One 256-bit load covers the thread's entire 16-element SF vector
+      // (ld.global.v8.b32 on sm_100+, two 128-bit loads elsewhere).
+      load_packed_vec16(
+          in + static_cast<int64_t>(rowIdx) * numCols + colIdx * 16,
+          lo_vec, hi_vec);
     }
 
     int64_t outOffset =
@@ -230,8 +248,9 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     u32x2 packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<Type, UE8M0_SF>(
         lo_vec, hi_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out,
         residue_sf_out);
-    out[outOffset] = packed.lo;
-    out[outOffset + 1] = packed.hi;
+    // Single 64-bit store; outOffset is even because numCols % 16 == 0.
+    *reinterpret_cast<uint2*>(out + outOffset) =
+        make_uint2(packed.lo, packed.hi);
   }
 }
 
@@ -253,13 +272,12 @@ void launchKernelByResidue(int residue_per_8, dim3 grid, dim3 block, cudaStream_
       cvt_fp16_to_fp4<T, UE8M0_SF, 4, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
           m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
       break;
-    case 8:  
-      cvt_fp16_to_fp4<T, UE8M0_SF, 8, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
-          m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
-      break;
+    // ratio=1.0 (residue_per_8 == 8) K-extension removed -- full-rank residue
+    // is served by the M-extension path (scaled_fp4_quant_mext_r1). The entry
+    // rejects residue_per_8 == 8 before reaching this dispatch.
     default:
       
-      fprintf(stderr, "Warning: Unsupported residue_per_8 value %d. Supported values: 1 (12.5%%), 2 (25%%), 4 (50%%), 8 (100%%). Defaulting to 1 (12.5%%).\n", residue_per_8);
+      fprintf(stderr, "Warning: Unsupported residue_per_8 value %d. Supported values: 1 (12.5%%), 2 (25%%), 4 (50%%). Defaulting to 1 (12.5%%).\n", residue_per_8);
       cvt_fp16_to_fp4<T, UE8M0_SF, 1, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
           m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
       break;
@@ -322,20 +340,30 @@ enum class MExtR1LayoutMode : int {
   kConcat = 0,
   kRowPair = 1,
   kTile8 = 2,
+  // K-concat: ONE output row per token, [M, 2K] geometry -- base in element
+  // cols [0, K), residue in [K, 2K). Data and SF are both emitted in the
+  // canonical order of the (M, 2K) grid, so a downstream GEMM consumes the
+  // doubled-K activation as a perfectly ordinary operand (the wrapped-K-loop
+  // kernel's input).
+  kConcatK = 3,
 };
 
-inline bool use_pack16_for_mode(int elts_mode) {
+inline bool use_pack16_for_mode(int elts_mode, int cc_major) {
   switch (static_cast<MExtR1EltsMode>(elts_mode)) {
     case MExtR1EltsMode::kElts8:
       return false;
     case MExtR1EltsMode::kElts16:
-      // Disabled for now: decode-sized MExt r1 benchmarks show pack8 is
-      // generally faster than pack16. Keep the pack16 kernel in source for
-      // future experiments, but do not route active dispatch to it.
-      return false;
+      // Explicit opt-in. The pack16 path owns one full 16-element SF vector
+      // per thread (no cross-thread amax shuffles) and on Blackwell loads it
+      // with a single 256-bit ld.global.v8.b32.
+      return true;
     case MExtR1EltsMode::kAuto:
     default:
-      return false;
+      
+      
+      
+      
+      return cc_major == 10;
   }
 }
 
@@ -345,6 +373,8 @@ inline int normalize_mext_r1_layout_mode(int layout_mode) {
       return static_cast<int>(MExtR1LayoutMode::kTile8);
     case MExtR1LayoutMode::kRowPair:
       return static_cast<int>(MExtR1LayoutMode::kRowPair);
+    case MExtR1LayoutMode::kConcatK:
+      return static_cast<int>(MExtR1LayoutMode::kConcatK);
     case MExtR1LayoutMode::kConcat:
     default:
       return static_cast<int>(MExtR1LayoutMode::kConcat);
@@ -358,9 +388,15 @@ void invokeFP4QuantizationMExtR1(int input_m, int output_m, int n,
                                  int32_t* SFOuput, bool useUE8M0,
                                  int elts_mode, int layout_mode,
                                  int numSFScales,
-                                 int multiProcessorCount, cudaStream_t stream) {
-  bool pack16 = use_pack16_for_mode(elts_mode);
+                                 int multiProcessorCount, int ccMajor,
+                                 cudaStream_t stream) {
+  bool pack16 = use_pack16_for_mode(elts_mode, ccMajor);
   int normalized_layout_mode = normalize_mext_r1_layout_mode(layout_mode);
+  // kConcatK is implemented in the pack8 kernel only; pack8 is correct on
+  // every arch (pack16 is a cc10.x throughput default, not a semantic).
+  if (normalized_layout_mode == static_cast<int>(MExtR1LayoutMode::kConcatK)) {
+    pack16 = false;
+  }
   int colGroups = n / (pack16 ? 16 : CVT_FP4_ELTS_PER_THREAD);
   colGroups = std::max(colGroups, 1);
 
@@ -423,13 +459,13 @@ template void invokeFP4Quantization(int m, int n_ext, int n, __nv_bfloat16 const
 template void invokeFP4QuantizationMExtR1(
     int input_m, int output_m, int n, half const* input, float const* SFScale,
     int64_t* output, int32_t* SFOuput, bool useUE8M0, int elts_mode, int layout_mode,
-    int numSFScales, int multiProcessorCount, cudaStream_t stream);
+    int numSFScales, int multiProcessorCount, int ccMajor, cudaStream_t stream);
 
 template void invokeFP4QuantizationMExtR1(
     int input_m, int output_m, int n, __nv_bfloat16 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0,
     int elts_mode, int layout_mode, int numSFScales, int multiProcessorCount,
-    cudaStream_t stream);
+    int ccMajor, cudaStream_t stream);
 
 }  // namespace vllm
 
@@ -508,8 +544,19 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
   int multiProcessorCount =
       get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
 
+  // NOT get_device_attribute(): its static cache keys on the first call's
+  // attribute, so a second attribute would read back the SM count.
+  static const int ccMajor = [] {
+    int device = 0;
+    cudaGetDevice(&device);
+    int v = 0;
+    cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, device);
+    return v;
+  }();
+
   TORCH_CHECK(input_sf.numel() >= 1 && input_sf.numel() <= 2,
-              "input_sf must have 1 or 2 elements.");
+              "input_sf must have 1 (single-alpha) or 2 (dual-alpha: "
+              "[base, residue]) elements.");
   auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
   auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
   auto output_ptr = static_cast<int64_t*>(output.data_ptr());
@@ -524,6 +571,7 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
     vllm::invokeFP4QuantizationMExtR1(
         m, static_cast<int>(output_m), n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0,
         static_cast<int>(elts_mode), static_cast<int>(layout_mode),
-        static_cast<int>(input_sf.numel()), multiProcessorCount, stream);
+        static_cast<int>(input_sf.numel()), multiProcessorCount, ccMajor,
+        stream);
   });
 }

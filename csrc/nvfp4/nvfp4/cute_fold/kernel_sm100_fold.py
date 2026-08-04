@@ -30,6 +30,14 @@
 # with modifications for FlashInfer integration.
 # Original: https://github.com/NVIDIA/TensorRT-LLM
 
+
+
+
+
+
+
+
+
 from typing import Optional, Tuple, Type, Union
 
 import cuda.bindings.driver as cuda
@@ -47,6 +55,7 @@ import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from cutlass.cute.nvgpu.cpasync import CopyDsmemStoreOp
 
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass._mlir.dialects import nvvm as _nvvm_dialect
@@ -91,13 +100,12 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_vec_size: int,
         mma_tiler_mn: Tuple[int, int],
         cluster_shape_mn: Tuple[int, int],
-        use_prefetch: bool = False,
         enable_pdl: bool = True,
         fold_pairs_tma: bool = False,
         fold_on_m: bool = False,
-        acc_stage_override: int | None = None,
         ab_stage_override: int | None = None,
         mext_direct_store: bool = False,
+        k_loop: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -129,70 +137,41 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # the output D[m_tok, n_w] is written WITHOUT the N-ext transpose. Gated:
         # every fold_on_m branch is inert unless this is set (N-ext path untouched).
         self.fold_on_m = fold_on_m
-        
-        
-        
-        
-        self.acc_stage_override = acc_stage_override
+        # AB pipeline depth (None = stock heuristic). The fold needs this knob
+        # for real: _compute_stages spends the smem budget BEFORE
+        # _setup_attributes doubles num_c_stage for half-width C staging, so at
+        # narrow tile_N the auto depth overshoots and the launch dies with
+        # cudaErrorInvalidValue -- one stage back is enough (see the tactic
+        # table's 4-tuples). The matching acc_stage_override was removed
+        # A stage-depth sweep found stock acc depth optimal
+        # (deeper is noise, the epilogue is already hidden) and nothing ever
+        # set it outside that sweep.
         self.ab_stage_override = ab_stage_override
-        # (2,) tensor; the fold applies alpha_b*even + alpha_r*odd (one extra
-        # f32 FMA). Default False keeps the single-alpha expression untouched
-        # (bitwise-identical to the legacy path).
-        # A/B knob: force the strict-serial accumulator scheme at N=256 (single
-        # 256-col buffer, forward epilogue order, release after full drain)
-        # instead of the inherited overlapping-accum (two pseudo-buffers at
-        # stride 256-SF_cols, reversed drain on phase 0, early release).
-        # Exists to MEASURE what overlapping-accum is worth; never a prod path.
-        # A6 (M-ext direct store): fold in registers, then store each thread's
+        # M-ext direct store: fold in registers, then store each thread's
         # folded fragment straight to gmem. Requires the WEIGHT rows pre-permuted
         # by pi (per 32-N block: kernel position p = va+2*ta+8*vc holds logical
-        # row f(p) = va+8*ta+2*vc) so the pi-composed gC alias makes every
+        # row f(p) = va+8*ta+2*vc) so the permuted gC alias makes every
         # thread's 8 folded values land CONTIGUOUS (16B) in standard-order D.
         # Geometry verified by atom introspection: dst_tv of the .16x256b op at
         # epi (128,32) = ((4,8),(2,2,4)):((2,32),(1,256,8)) for both 1SM/2SM.
         assert not mext_direct_store or fold_on_m, (
             "mext_direct_store requires the M-ext fold path")
         self.mext_direct_store = mext_direct_store
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+        # Same-cluster CTAs are co-resident: no owner-last ordering, no spin, no
+        # deadlock (all of which the gmem version needed).
+        # Wrapped-K-loop: A carries the
+        # K-concat activation at 2K, B (the weight) is read twice by wrapping
+        # its k coordinate at the midpoint, the MMA's own K-reduction performs
+        # the base+residue fold, and the PLAIN epilogue stores C[m_tok, n_w].
+        # Weight bytes in memory: 1x.
+        self.k_loop = k_loop
+        # TMA atoms / mcast come from the ORIGINAL cluster: the two split partners
+        # load DIFFERENT K ranges of both operands, so nothing is multicast.
         self.tma_cluster_shape_mn = cluster_shape_mn
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
         # K dimension is deferred in _setup_attributes
         self.mma_tiler = (*mma_tiler_mn, 1)
-        self.use_prefetch = use_prefetch
         self.enable_pdl = enable_pdl
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
@@ -351,13 +330,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.smem_capacity,
             self.occupancy,
         )
-        # Exp2 depth knobs. acc>1 requires the non-overlapping accum scheme,
-        # so N=256 tiles (heuristic picks 1) reject an override. ab clamps
-        # down only -- the heuristic is already smem-greedy-max.
-        if self.acc_stage_override is not None:
-            if self.mma_tiler[1] == 256 and self.acc_stage_override > 1:
-                raise ValueError("acc_stage_override>1 unsupported for N=256 tiles")
-            self.num_acc_stage = self.acc_stage_override
+        # ab clamps down only -- the heuristic is already smem-greedy-max.
         if self.ab_stage_override is not None:
             if self.ab_stage_override > self.num_ab_stage:
                 raise ValueError(
@@ -391,7 +364,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             self.num_ab_stage,
         )
         if self.fold_pairs_tma and self.fold_on_m:
-            # M-ext (A4 coalesced store): compact half-M staging. Register fold
+            # M-ext coalesced store: compact half-M staging. Register fold
             # collapses the token pair on M -> stage the folded base rows compact
             # [epi_m/2, epi_n] (N-contiguous), then one coalesced TMA lands them
             # on row-major D[m_tok, n_w]. Half-M frees smem -> 2x stages.
@@ -422,6 +395,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 self.num_c_stage,
             )
 
+        
+        
+        
+        
         self.overlapping_accum = self.num_acc_stage == 1
         sf_atom_mn = 32
         self.num_sfa_tmem_cols = (
@@ -446,9 +423,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         self.iter_acc_early_release_in_epilogue = (
             self.num_sf_tmem_cols // self.epi_tile_n
         )
-
-        # TODO: [alel] Currently set prefetch dist to num_ab_stage, we may have more options for prefetch dist auto tuning
-        self.prefetch_dist = self.num_ab_stage
 
     @cute.jit
     def __call__(
@@ -521,8 +495,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfa_tensor = cute.make_tensor(sfa_tensor.iterator, sfa_layout)
 
         # ((Atom_N, Rest_N),(Atom_K, Rest_K),RestL)
+        _b_shape_flat = b_tensor.shape
         sfb_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_tensor.shape, self.sf_vec_size
+            _b_shape_flat, self.sf_vec_size
         )
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
 
@@ -649,7 +624,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # N, so tiling must come from the m2-congruent alias view. split-K
         # widens the scheduler's L axis (real L stays 1; the kernel maps the
         # extra coordinate to a K range and clamps tensor slices to l=0).
-        # A6: grid counting only needs the m2-congruent SHAPE; rebuild a flat
+        # Direct store: grid counting only needs the m2-congruent SHAPE; rebuild a flat
         # view so the pi-nested N mode never enters zipped_divide.
         if cutlass.const_expr(self.mext_direct_store):
             _grid_c = cute.make_tensor(
@@ -803,6 +778,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
         alpha_value = alpha[0].to(cutlass.Float32)
+        alpha_res_value = alpha_value
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -829,9 +805,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
-        # For TMA we want the rank within the TMA cluster, where the two split
-        # partners are both rank 0 -- they load the same full tile, differing
-        # only in the K window. Identical to the raw rank whenever the two
+        # cta_rank_in_cluster is the REAL rank (the DSMEM peer logic needs it).
+        # Rank within the TMA cluster (identical to the raw rank when the
+        # two cluster layouts coincide).
         _tma_rank = cta_rank_in_cluster % cute.size(cluster_layout_vmnk)
         _tma_rank_sfb = cta_rank_in_cluster % cute.size(cluster_layout_sfb_vmnk)
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
@@ -883,7 +859,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             cta_layout_vmnk=pipe_cluster_layout_vmnk,
         )
 
-
         # Tensor memory dealloc barrier init
         if use_2cta_instrs:
             if warp_idx == self.tma_warp_id:
@@ -894,6 +869,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
         cute.arch.mbarrier_init_fence()
 
+        # Arm the DSMEM reduction barrier. st.async signals completion in BYTES,
         # so the receiver arms with expect_tx -- AFTER the init fence (unusable
         # before it) and BEFORE the cluster barrier, which is the only free
         # cross-CTA edge and therefore the only thing that can keep a peer's
@@ -1004,7 +980,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
             gC_fold_mnl = None
         k_block_cnt = cutlass.Int32(cute.size(gA_mkl, mode=[3]))
-        # k_split_idx * k_win_cnt (k_split_idx = the hijacked L coordinate).
+        # k_loop: A (the K-concat activation) already carries the 2K trip
+        # count above; B (the weight) wraps at the K midpoint using its own
+        # block count as the modulus. An operand and its SF are tiled by the
+        # same tiler, so one wrapped index cannot desynchronise them.
+        k_base_block_cnt = cutlass.Int32(cute.size(gB_nkl, mode=[3]))
         k_win_cnt = k_block_cnt
 
         #
@@ -1152,6 +1132,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
+                # StreamK-lite: the L coordinate is the K-split index; data L
                 # is always 0. k_lo offsets every K-block index below.
                 k_lo = cutlass.Int32(0)
                 _m_coord = cur_tile_coord[0] // cute.size(
@@ -1181,28 +1162,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # ((atom_v, rest_v), RestK)
                 tBgSFB_slice = tBgSFB[(None, slice_n, None, mma_tile_coord_mnl[2])]
 
-                if cutlass.const_expr(self.use_prefetch):
-                    # Prefetch both A and B (default behavior)
-                    for pf_k_block in cutlass.range(
-                        0, min(self.prefetch_dist, k_win_cnt), unroll=1
-                    ):
-                        cute.prefetch(
-                            tma_atom_a,
-                            tAgA_slice[(None, k_lo + pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_b,
-                            tBgB_slice[(None, k_lo + pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfa,
-                            tAgSFA_slice[(None, k_lo + pf_k_block)],
-                        )
-                        cute.prefetch(
-                            tma_atom_sfb,
-                            tBgSFB_slice[(None, k_lo + pf_k_block)],
-                        )
-
                 # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt
                 ab_producer_state.reset_count()
                 peek_ab_empty_status = cutlass.Boolean(1)
@@ -1220,6 +1179,15 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
 
                     # TMA load A/B/SFA/SFB
+                    # k_loop: B (the weight) and its SF wrap at the K
+                    # midpoint -- one compare+subtract in the DMA warp, off
+                    # the critical path. A single subtract suffices: the
+                    # absolute index never reaches 2x the base count twice.
+                    _kb_idx = k_lo + ab_producer_state.count
+                    if cutlass.const_expr(self.k_loop):
+                        _kb_idx = cutlass.Int32(
+                            _kb_idx if _kb_idx < k_base_block_cnt
+                            else _kb_idx - k_base_block_cnt)
                     cute.copy(
                         tma_atom_a,
                         tAgA_slice[(None, k_lo + ab_producer_state.count)],
@@ -1229,7 +1197,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     cute.copy(
                         tma_atom_b,
-                        tBgB_slice[(None, k_lo + ab_producer_state.count)],
+                        tBgB_slice[(None, _kb_idx)],
                         tBsB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=b_full_mcast_mask,
@@ -1243,35 +1211,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                     cute.copy(
                         tma_atom_sfb,
-                        tBgSFB_slice[(None, k_lo + ab_producer_state.count)],
+                        tBgSFB_slice[(None, _kb_idx)],
                         tBsSFB[(None, ab_producer_state.index)],
                         tma_bar_ptr=ab_pipeline.producer_get_barrier(ab_producer_state),
                         mcast_mask=sfb_full_mcast_mask,
                     )
-
-                    # Prefetch: Rolling prefetch for next tiles
-                    if cutlass.const_expr(self.use_prefetch):
-                        if k_block < k_win_cnt - self.prefetch_dist:
-                            future_k_block = (
-                                k_lo + ab_producer_state.count + self.prefetch_dist
-                            )
-                            # Prefetch both A and B (default behavior)
-                            cute.prefetch(
-                                tma_atom_a,
-                                tAgA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_b,
-                                tBgB_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfa,
-                                tAgSFA_slice[(None, future_k_block)],
-                            )
-                            cute.prefetch(
-                                tma_atom_sfb,
-                                tBgSFB_slice[(None, future_k_block)],
-                            )
 
                     # Peek (try_wait) AB buffer empty for k_block = prefetch_k_block_cnt + k_block + 1
                     ab_producer_state.advance()
@@ -1572,7 +1516,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             if cutlass.const_expr(self.fold_pairs_tma):
                 # ResInfer fold: no r2s tiled-copy machinery. Each thread writes
                 # its folded fragment into compact smem (N-ext: one strided row;
-                # M-ext A4: via the (8,2,nb) m2-alias), then a single coalesced
+                # M-ext: via the (8,2,nb) m2-alias), then a single coalesced
                 # TMA drains the compact epi tile to D[m_tok, n_w]. TMA partition
                 # is over the compact D tiled by the half-width epi_tile_c.
                 # The (base,res) pair is the innermost stride-1 submode of the
@@ -1594,7 +1538,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 # TMA partition over compact D -- IDENTICAL for M-ext and N-ext:
                 # gC_fold_mnl is the compact D tiled by the half CTA tile, sC is
                 # the compact [epi_m/2|epi_n/2] staging. One coalesced TMA drains
-                # each folded epi subtile to D. A6 direct store bypasses TMA
+                # each folded epi subtile to D. the direct store bypasses TMA
                 # entirely (and its partition must not trace over the pi alias).
                 if cutlass.const_expr(self.mext_direct_store):
                     bSG_sC, bSG_gC_partitioned = None, None
@@ -1609,8 +1553,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     )
                 _thr_t2r = tiled_copy_t2r.get_slice(epi_tidx)
                 if cutlass.const_expr(self.mext_direct_store):
-                    # A6: partition output addresses through the pi-composed
-                    # m2-alias (Option-B skeleton). Each thread's folded 8
+                    # Direct store: partition output addresses through the
+                    # permuted m2-alias. Each thread's folded 8
                     # values land contiguous (16B) because the alias N mode
                     # maps partition coordinate p -> pre-permuted-weight
                     # address f(p). 8-mode result mirrors
@@ -1621,7 +1565,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     tTR_gC_part = _thr_t2r.partition_D(_gC_epi)
                     _sC_alias_layout = None
                 elif cutlass.const_expr(self.fold_on_m):
-                    # M-ext (A4): the register fold collapses the pair on M, so
+                    # M-ext: the register fold collapses the pair on M, so
                     # the folded base rows are written into the COMPACT smem via
                     # the (8,2,nb) m2-alias partition (same aliasing as the gmem
                     # c_alias, but into smem) -- then the TMA above lands them
@@ -1674,15 +1618,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 producer_group=c_producer_group,
             )
 
-            # scheduler's tile counter is WRONG -- it is not in lockstep with the
-            # barrier's phase flips, and mbarrier_wait on a mismatched phase returns
-            # IMMEDIATELY (silently no sync at all).
-            _red_phase = cutlass.Int32(0)
-            # Separate counter: the credit barrier flips on its OWN schedule
-            _empty_phase = cutlass.Int32(0)
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
+                # StreamK-lite: L is the K-split index; split 0 = owner
                 # (runs the real epilogue after folding in the followers'
                 # partials), splits >0 = followers (drain partials to the
                 # r2g workspace). Data L for gC is always 0 under split.
@@ -1697,7 +1636,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 #
                 # ((ATOM_V, REST_V), EPI_M, EPI_N)
                 if cutlass.const_expr(self.mext_direct_store):
-                    # A6: slice the pi-alias partition_D output-address tensor
+                    # Direct store: slice the permuted-alias partition_D output-address tensor
                     # to this mma tile (frag modes kept, mma coords fixed), then
                     # group the trailing modes into a per-subtile axis.
                     tTR_gC = tTR_gC_part[
@@ -1752,8 +1691,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                # A4: M-ext now also drives the TMA store, so both fold paths need
-                # bSG_gC grouped into a per-subtile axis. A6 stores direct (no TMA).
+                # M-ext also drives the TMA store, so both fold paths need
+                # bSG_gC grouped into a per-subtile axis. the direct store skips TMA.
                 if cutlass.const_expr(not self.mext_direct_store):
                     bSG_gC = cute.group_modes(bSG_gC, 1, cute.rank(bSG_gC))
 
@@ -1763,18 +1702,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
                 num_prev_subtiles = tile_sched.num_tiles_executed * subtile_cnt
 
-                # the fragment-native fp32 workspace, publish a flag). The
-                # owner is the LAST L plane so every follower work item has a
-                # smaller linear index than every owner item; per-CTA work
-                # sequences increase, so followers always run first and the
-                # owner spin cannot deadlock the persistent schedule.
-                _skl_do_epi = None
 
-                # Run the real epilogue only for the owner (followers drain
-                # below). The guard sits OUTSIDE the loop so the trip count
-                # stays STATIC -- a dynamic bound turns the whole epilogue
-                # into a dynamic scf.for, killing unrolling and static
-                # smem/TMA addressing. Python's `or` short-circuits at trace
+                # The subtile loop bound stays STATIC: a dynamic bound would
+                # turn the epilogue into a dynamic scf.for, killing unrolling
+                # and static smem/TMA addressing.
                 for subtile_idx in cutlass.range(subtile_cnt):
                     real_subtile_idx = subtile_idx
                     if cutlass.const_expr(self.overlapping_accum):
@@ -1815,7 +1746,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         )
                         tTR_rC_half.store(folded_half)
                         if cutlass.const_expr(self.mext_direct_store):
-                            # A6: store the folded fragment STRAIGHT to gmem.
+                            # Direct store: the folded fragment goes STRAIGHT to gmem.
                             # The pi-composed alias makes each thread's 8 values
                             # contiguous; runtime alignment is 16B by
                             # construction (n%32==0, block/ta offsets 16B), but
@@ -1863,7 +1794,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                                         ),
                                     )
                         elif cutlass.const_expr(self.fold_on_m):
-                            # M-ext A4: write the folded base rows into the COMPACT
+                            # M-ext: write the folded base rows into the COMPACT
                             # smem buffer via the (8,2,nb) m2-alias partition (base
                             # sub-mode -> real compact row; res sub-mode is stride-0
                             # and dropped by _PAIR_EVEN). The coalesced TMA below
@@ -1893,10 +1824,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             tRS_rC,
                             tRS_sC[(None, None, None, c_buffer)],
                         )
-                    # A4: both M-ext and N-ext stage the folded epi tile into
+                    # TMA store: both M-ext and N-ext stage the folded epi tile into
                     # compact smem, then a single coalesced TMA drains it to D.
                     # Fence + barrier so the smem store is visible to the TMA.
-                    # A6 wrote gmem directly above: no smem, no fence, no TMA.
+                    # The direct store wrote gmem directly above: no smem, no fence, no TMA.
                     if cutlass.const_expr(not self.mext_direct_store):
                         cute.arch.fence_proxy(
                             "async.shared",
@@ -1924,6 +1855,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                             number_of_threads=epilog_threads,
                         )
 
+                # DSMEM follower: fold in registers, push straight into the
                 # OWNER's smem (peer CTA of this cluster), arrive on the owner's
                 # mbarrier. No gmem, no gpu-scope fence, no spin -- same-cluster
                 # CTAs are co-resident by construction.
@@ -2582,6 +2514,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # 2) MXFP8 as float8 (k = k_raw, no recast)
         m = cute.size(mA, mode=[0])
         k_raw = cute.size(mA, mode=[1])
+        # B's contraction extent comes from B ITSELF. Equal to A's for every
+        # mode except k_loop, where A is the K-concat activation at 2K and B
+        # (the weight) stays at K -- rebuilding B with A's k made every row
+        # read run into the next row (NaN output, caught on the first B200 gate).
+        k_raw_b = cute.size(mB, mode=[1])
         n = cute.size(mB, mode=[0])
 
         if cutlass.const_expr(
@@ -2589,6 +2526,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         ):
             # FP4 packed path: 2 FP4 values per uint8 byte
             k = k_raw * 2
+            k_b = k_raw_b * 2
             a_ptr = cute.recast_ptr(mA.iterator, dtype=cutlass.Float4E2M1FN)
             b_ptr = cute.recast_ptr(mB.iterator, dtype=cutlass.Float4E2M1FN)
         elif cutlass.const_expr(mA.element_type != mB.element_type):
@@ -2600,16 +2538,29 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         else:
             # MXFP8 path: input tensors are already FP8.
             k = k_raw
+            k_b = k_raw_b
             a_ptr = mA.iterator
             b_ptr = mB.iterator
 
+        # Row strides come from the INCOMING tensors, not from (m, k). They are
+        # equal for a compact operand, but an ext-K residue weight arrives as a
+        # `weight_ext[:, :k_base_packed]` view: width k_base, rows k_ext apart.
+        # make_ordered_layout would rebuild a compact layout and silently read
+        # the wrong elements, so build the layout explicitly instead.
+        # (Same shape/stride decoupling the SM120 C++ path uses --
+        #  stride_B = make_int_tuple_from<StrideB>(physical_k_ext, 0).)
+        # The FP4 branch doubled k when recasting uint8 -> Float4E2M1FN, so the
+        # strides must be doubled with it: they are counted in ELEMENTS.
+        _scale = 2 if cutlass.const_expr(
+            mA.element_type == cutlass.Uint8 and mB.element_type == cutlass.Uint8
+        ) else 1
+        lda = cute.size(mA.layout.stride[0]) * _scale
+        ldb = cute.size(mB.layout.stride[0]) * _scale
         a_tensor = cute.make_tensor(
-            a_ptr,
-            layout=cute.make_ordered_layout((m, k, l), order=(1, 0, 2)),
+            a_ptr, layout=cute.make_layout((m, k, l), stride=(lda, 1, m * lda)),
         )
         b_tensor = cute.make_tensor(
-            b_ptr,
-            layout=cute.make_ordered_layout((n, k, l), order=(1, 0, 2)),
+            b_ptr, layout=cute.make_layout((n, k_b, l), stride=(ldb, 1, n * ldb)),
         )
         # Reshape C to (m, n, l) -- swap_ab is constexpr, determines layout at compile time
         c_alias_tensor = None
@@ -2633,7 +2584,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # strides: local->n, baseres->0 (alias), block->8n.
             _nb = m // 16
             if cutlass.const_expr(self.mext_direct_store):
-                # A6: compose pi into the N mode. The .16x256b atom hands thread
+                # Direct store: compose the row permutation into the N mode. The
+                # .16x256b atom hands thread
                 # ta the folded columns {2ta+va+8vc} of each 32-N block; with the
                 # weight rows pre-permuted by f(p)=va+8ta+2vc, mapping partition
                 # coordinate p -> address f(p) (layout (2,4,4):(1,8,2) per block)
@@ -2683,10 +2635,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             )
         # Scale factor tensors: 6D BlockScaledBasicChunk layout from pointers
         # (32, 4, sf_m, 4, sf_k, l) with order (2, 1, 4, 0, 3, 5)
+        # k_loop: A is the K-concat activation at 2K, so its SF grid has twice
+        # the K extent of B's (the weight's). sf_k is passed for the BASE K.
+        if cutlass.const_expr(self.k_loop):
+            _sfa_k = sf_k * 2
+        else:
+            _sfa_k = sf_k
         sfa_tensor = cute.make_tensor(
             a_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, sf_m, 4, sf_k, l),
+                (32, 4, sf_m, 4, _sfa_k, l),
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
