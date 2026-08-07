@@ -8,10 +8,10 @@ import os
 
 import torch
 
-# TUNING buckets only: FlashInfer profiles each bucket once and keys its
-# cache on the bucketed m. They are NOT compile keys on
-# either arch -- the sm120 kernel takes the token count at runtime (one
-# compile per (shape, tile)), same as the sm100 symbolic-shape kernel.
+
+
+
+
 KLOOP_BUCKETS = (128, 256, 512, 1024, 2048)
 # sm120 kloop tiles (3-tuples, per-(shape, tile) compiles -> whitelist).
 KLOOP_TILES = ((128, 128, 128),)
@@ -134,15 +134,7 @@ def precompile_kloop_sm100(out_dtype=torch.bfloat16) -> int:
 
 def precompile_kloop_sm120(n_w: int, k: int,
                            out_dtype=torch.bfloat16) -> int:
-    """Compile the kloop kernels for one mext_r1 shape -- one per tile.
-
-    The token count is a runtime argument, so the old
-    per-bucket compile grid collapsed to len(KLOOP_TILES) compiles and the
-    kernel serves ANY m, including above the top tuning bucket.
-
-    Called at PWAL (register_sm120_fold_shape) so serving never compiles.
-    Returns the number of kernels compiled; best-effort like every warmup.
-    """
+    'Compile the kloop kernels for one mext_r1 shape -- one per tile.'
     from nvfp4.cute_fold_sm120.host import compile_fold_gemm_sm120
 
     # cute.compile needs a live CURRENT context; PWAL always has one, but be
@@ -187,6 +179,10 @@ def _make_runners():
     
     
     
+    
+    
+    
+    # for the numbers that justified it.
     class KloopRunner(TunableRunner):
         def get_valid_tactics(self, inputs, profile):
             tuning = AutoTuner.get().is_tuning_mode
@@ -201,10 +197,10 @@ def _make_runners():
                 # Warmup window: compiling is legal (and lru-cached before
                 # the timed reps), so every candidate competes.
                 return list(range(len(KLOOP_TILES)))
-            # One compiled kernel per (shape, tile) serves EVERY m (the token
-            # count is a runtime argument) -- including m
-            # above the top tuning bucket, which the bucketed compile keys
-            # used to have no kernel for.
+            
+            
+            
+            
             return [i for i, tile in enumerate(KLOOP_TILES)
                     if (n_w, k, tile) in _PRECOMPILED]
 

@@ -105,6 +105,7 @@ sources = [
     'src/fp4/nvfp4_residue_pack8.cu',
     'src/fp4/nvfp4_residue_pack16.cu',
     'src/fp4/official_nvfp4_quant_kernels.cu',
+    'src/attn/nvfp4_quantize_q.cu',
 ]
 
 cutlass_include_dir = first_existing_path(

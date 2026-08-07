@@ -100,19 +100,7 @@ def compile_fold_gemm_sm120(
     a_ld: int | None = None,
     k_loop: bool = False,
 ):
-    """Compile (and cache) ONE fold kernel per (n_w, k, tile) -- the token
-    count is a runtime argument, not part of the key.
-
-    The compiled callable takes (a, b, sfa, sfb, d, alpha ptrs, n_act_rows,
-    d_rows, stream). Previously the activation row count and token
-    count were baked in (one compile per m -- the bucket/padding machinery
-    in the callers existed purely to bound that compile grid).
-
-    a_ld: weight row stride in elements; None (or == k) is the contiguous
-    weight and produces exactly the binary this compiled before.
-    k_loop: wrapped-K variant -- B is the K-concat [m_tok, 2K] activation,
-    A wraps at the K midpoint, epilogue is a plain store.
-    """
+    'Compile (and cache) ONE fold kernel per (n_w, k, tile) -- the token'
     import os as _os
     if _os.environ.get("NVFP4_FOLD_COMPILE_LOG", "0") == "1":
         print(f"[fold-compile] n_w={m} k={k} (dynamic m) "

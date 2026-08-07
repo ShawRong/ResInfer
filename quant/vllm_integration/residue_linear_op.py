@@ -163,6 +163,43 @@ _FOLD_MAX_M = fold_max_m_for(None)
 # block/grid in invokeFP4QuantizationMExtR1.
 _FORCE_FOLD = os.environ.get("RESIDUE_FORCE_DECODE_MEXT", "0") == "1"
 
+# ── prefill-side residue kill switch (EXPERIMENT ONLY) ─────────────────────
+# `RESIDUE_PREFILL_RESIDUE_OFF=1` makes every residue layer compute PLAIN
+# NVFP4 above the M threshold while leaving decode untouched, i.e. the arm
+# "no prefill residue + mext decode". It exists because the attribution
+# control for the per-layer ratio search has never been run: every published
+# comparison was b4.5 (4.5 effective bits) against b8.0 (8.0) or against
+# plain (no residue anywhere), and neither isolates the prefill contribution.
+# With this flag the same checkpoint serves both sides of the A/B, so nothing
+# but the prefill path differs -- no re-export, no weight change.
+#
+# How each layer kind is neutered, and why that way:
+#   K-extension  the extended activation's residue columns are ZEROED. fp4
+#                code 0 is +0.0, so those columns contribute exactly nothing
+#                and the output equals plain NVFP4 over the base columns.
+#                Nothing about the weight layout, the scale layout or the
+#                cutlass padding changes -- which is the point: slicing the
+#                weight to k_base would mean a non-contiguous view and a
+#                re-derived padding, i.e. two new ways to be silently wrong.
+#   mext_r1      no extension exists to zero; the fold is simply not taken and
+#                the layer falls through to the plain cutlass bypass, whose
+#                weight/weight_scale already span the full (== base) K.
+#
+# The threshold defaults to the fold band, so "prefill" means exactly "not the
+# decode band" and decode keeps its residue at every layer.
+_PREFILL_RESIDUE_OFF = (
+    os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF", "0") == "1")
+_PREFILL_RESIDUE_OFF_MIN_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M")
+
+
+def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
+    """Is this invocation a prefill one that the kill switch should neuter?"""
+    if not _PREFILL_RESIDUE_OFF:
+        return False
+    thr = (int(_PREFILL_RESIDUE_OFF_MIN_M)
+           if _PREFILL_RESIDUE_OFF_MIN_M else int(fold_max_m))
+    return int(original_m) > thr
+
 # ── SM100/SM103 (B200/B300) CuTeDSL fold path ──────────────────────────────
 # On Blackwell datacenter GPUs the SM120 C++ fold GEMM does not exist; use the
 # CuTeDSL sm100/sm103 fork (nvfp4.cute_fold). It consumes the row_pair mext_r1
@@ -285,20 +322,20 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         from nvfp4.cute_fold_sm120 import warmup_fold_default
 
         major, minor = torch.cuda.get_device_capability()
-        # Decode band only. The fold-at-prefill route was retired;
-        # pre-compiling the full 51-size list for mext_r1 was not just waste:
-        # 4 shapes x 51 sizes of graphed CuTeDSL kernels is what pushed a
-        # multi-arm sweep into a cudaGraph-replay segfault.
+        
+        
+        
+        
         ms = [m for m in _FOLD_WARMUP_M
               if m <= fold_max_m_for(None)]          # sm120-only path
         warmup_fold_default(
             major, minor,
             [(m, key[0], key[1], torch.bfloat16, key[2]) for m in ms])
-        # key[2] is the row stride in FP4 elements: == k_base for a contiguous
-        # weight (warmup then compiles the a_ld=None variant), > k_base for an
-        # ext-K prefix view. The kernel takes the token count at RUNTIME,
-        # so the ms list only selects tiles -- the compile count
-        # is the number of distinct tiles, not len(ms).
+        
+        
+        
+        
+        
         from nvfp4.cute_fold_sm120.tactics import select_tile
 
         tiles = sorted({select_tile(m, key[0], key[1]) for m in ms})
@@ -414,22 +451,16 @@ def _base_k_weight_view(weight: torch.Tensor, k_base: int) -> torch.Tensor:
 
 
 
+
 _MEXT_PREFILL_PATH = os.environ.get("RESIDUE_MEXT_PREFILL_PATH", "auto")
 
 
 def _mext_prefill_two_gemm() -> bool:
-    """True iff mext_r1 layers above the fold band LEAVE the direct-fold path.
-
-    (Historical name; the destination is the tuned dispatch.) Since the sm100
-    kloop graduated its B200 gate (7/9 vs fold,
-    numerics equal to every digit), auto enters the tuned dispatch on BOTH
-    arches -- on sm10x the tuner's runners[0]/fallback IS the fold, so any
-    cache miss serves exactly the old behavior.
-    """
-    # "fold" was retired as a prefill route (env contract now
-    # rejects it): the tuned dispatch beat or tied it everywhere that
-    # matters, and removing it deleted the per-m-JIT hazard class outright.
-    # The decode band still folds -- that is a different dispatch term.
+    'True iff mext_r1 layers above the fold band LEAVE the direct-fold path.'
+    
+    
+    
+    
     return True
 
 
@@ -518,7 +549,7 @@ def _tune_mext_families_sm10x(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Warmup-only: measure N-ext vs M-ext for this layer's shape and m-bucket.
+    """Warmup-only: measure N-ext vs A4 for this layer's shape and m-bucket.
 
     Cross-family selection cannot live inside run_fold, because by then the
     activation has already been quantised into ONE layout and the families do
@@ -528,6 +559,11 @@ def _tune_mext_families_sm10x(
     Returns the winner's output so the warmup forward still produces a real
     result. Never call inside a cudagraph capture -- it measures (sync + JIT).
 
+    A6 IS a candidate (it arrives via candidate_families()): since
+    pi_via_layout the kernel carries the pi permutation in its own TMA/SF
+    layouts, so A6 takes the same unpermuted weight as every other family --
+    no load-time transform, nothing breaks N-ext on the same layer. Gated
+    bitwise on B200 (gate_a6_pi_via_layout_sm100.py, 3/3 tiles incl. 2SM).
     """
     from nvfp4.cute_fold import tactics as T
     from nvfp4.fold import candidate_families
@@ -561,7 +597,8 @@ def _tune_mext_families_sm10x(
 # CuTeDSL SM120 fold (nvfp4.cute_fold_sm120) -- OPT-IN alternative to the C++
 # SM120 fold op. Same row_pair mext_r1 quant layout as the SM10x fork; the
 # kernel is validated bit-exact against the C++ op (52 fuzz cases + a
-# four-corner loop vs an independent plain-NVFP4 twin). Enable with
+# four-corner loop vs an independent plain-NVFP4 twin, see
+
 # RESIDUE_SM120_CUTEDSL_FOLD=1; default OFF keeps the C++ path byte-identical.
 _SM120_DSL_ENABLED: bool | None = None
 _SM120_DSL_FIRED = [False]
@@ -716,7 +753,11 @@ def nvfp4_linear(
     
     
     
-    use_fold = fold_eligible and (
+    
+    
+    
+    _prefill_off = prefill_residue_disabled(original_m, fold_max_m)
+    use_fold = (not _prefill_off) and fold_eligible and (
         is_mext_r1 or _FORCE_FOLD or original_m <= fold_max_m)
 
     if use_fold:
@@ -749,17 +790,17 @@ def nvfp4_linear(
                 weight_scale_base, alpha, output_dtype,
             )
 
-        # ── mext-r1 quant + fold GEMM ─────────────────────────────────────
-        # The quant layout must be chosen before GEMM autotuning because
-        # row-pair col-swap tactics consume a different physical M layout than
-        # the original tile8 row-wise tactics.  Default autotune currently
-        # searches the path-local row-pair col-swap tactic space 0..15, so it quantizes
-        # row-pair once and then lets FlashInfer's autotuner choose DP/StreamK.
-        # ── SM100/SM103 CuTeDSL fold (B200/B300) ──────────────────────────
-        # Blackwell datacenter GPUs use the CuTeDSL sm100/sm103 fork instead
-        # of the SM120 C++ fold GEMM (which doesn't exist there). Row_pair
-        # quant, raw SF, full contiguous weight — validated end-to-end
-        # (5/5). No m_pad / tile8 needed.
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         if _sm10x_fold_arch() is not None:
             
             
@@ -787,8 +828,8 @@ def nvfp4_linear(
                     output_dtype,
                 )[:original_m]
 
-            # family AND layout together: a layout does not determine a family, so
-            # deriving one from the other can dispatch the wrong tuned tactic.
+            # family AND layout together: "tile8" is shared by A4 and A6, so
+            # deriving one from the other would dispatch A6 as A4.
             family, layout = select_fold_plan(
                 int(major), int(minor), int(output_n),
                 int(weight.shape[1]) * 2, int(original_m))
@@ -851,6 +892,14 @@ def nvfp4_linear(
     # CutlassNvFp4LinearKernel.apply_weights.
     kind = residue_kind_of(num_salient, is_mext_r1)
 
+    if kind == RESIDUE_MEXT_R1 and _prefill_off:
+        # The kill switch is the ONE legitimate way for a mext_r1 layer to
+        # reach this point, and it wants exactly what the guard below exists
+        # to prevent: plain NVFP4. `weight` for a mext_r1 layer is stored once
+        # and k_base spans it, so `weight`/`weight_scale` are already the
+        # full-K pair the cutlass bypass expects -- no view, no re-padding.
+        kind = RESIDUE_NONE
+
     if kind == RESIDUE_MEXT_R1:
         # Unreachable today: use_fold is forced true for mext_r1, so we
         # returned above. Assert it rather than trust that, because the
@@ -902,6 +951,17 @@ def nvfp4_linear(
         int(num_salient),
         use_swapped_residue=use_swap,
     )
+    if _prefill_off:
+        # EXPERIMENT (RESIDUE_PREFILL_RESIDUE_OFF): drop the residue without
+        # touching any layout. The extended activation is [base | residue] with
+        # the residue a contiguous suffix at extended-K positions
+        # [K_base, K_base + num_salient), i.e. packed columns
+        # [K_base // 2, n_ext // 2). fp4 code 0 decodes to +0.0, so zeroing
+        # those bytes makes the extension contribute exactly nothing and the
+        # GEMM returns plain NVFP4 over the base columns -- with the same
+        # weight, the same weight_scale and the same padding as the residue
+        # path, so the two arms differ in nothing else.
+        x_fp4[:, K_base // 2:].zero_()
     x_sf_block = x_sf_block.view(torch.float8_e4m3fn).view(
         num_m_tiles * 128,
         num_k_tiles * 4,

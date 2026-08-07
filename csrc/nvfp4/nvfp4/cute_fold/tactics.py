@@ -37,6 +37,7 @@ from .host import mext_fold_gemm_sm103
 
 
 
+
 _SENTINEL_M = 1 << 30
 ARCH_TACTIC_BY_M: dict[str, list[tuple[int, str, tuple[int, int], tuple[int, int]]]] = {
     "sm100": [
@@ -47,6 +48,7 @@ ARCH_TACTIC_BY_M: dict[str, list[tuple[int, str, tuple[int, int], tuple[int, int
         (_SENTINEL_M, "sm100", (256, 128), (2, 1)),  # m>64: 2SM (safe blanket)
     ],
     "sm103": [
+        
         
         
         
@@ -116,8 +118,8 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
 
     Shape-independent BY CONSTRUCTION, which is why this needs no shapes while
     the sm120 warmup does: this kernel's compile cache key holds only
-    (tiler, cluster, dtype, mode, arch, ab_stage, strided_weight)
-    -- no n_w, no k, no
+    (tiler, cluster, dtype, mode, arch, ab_stage, dual_alpha, pi_via_layout,
+    split_k, splitk_ablate, dsmem_split, strided_weight) -- no n_w, no k, no
     m_tok. So the whole compile space is a small fixed set.
 
     `strided` is the part that used to be missed. `mext_fold_gemm_sm103`
@@ -142,7 +144,7 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
     for _m_max, kernel_arch, tiler, cluster in ARCH_TACTIC_BY_M[arch]:
         specs.append(dict(mma_tiler_mn=tiler, cluster_shape_mn=cluster,
                           mode="fold_tma", kernel_arch=kernel_arch,
-                          ab_stage_override=None))
+                          ab_stage_override=None, pi_via_layout=False))
 
     # FAMILY_TACTICS entries carry a STORE_MODE, which is not the same
     # vocabulary as _compile_fold_gemm's `mode`. Translating with the call
@@ -152,6 +154,7 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
     from .host import STORE_MODE_TO_MODE
 
     for fam in families:
+        pi = _needs_pi_layout(fam)
         for tactic in FAMILY_TACTICS.get(fam, ()):
             store_mode, tiler, cluster, ab = _norm_tactic(tactic)
             mode = STORE_MODE_TO_MODE[store_mode]
@@ -164,7 +167,7 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
                 continue
             specs.append(dict(mma_tiler_mn=tiler, cluster_shape_mn=cluster,
                               mode=mode, kernel_arch=arch,
-                              ab_stage_override=ab))
+                              ab_stage_override=ab, pi_via_layout=pi))
 
     out = []
     for spec in specs:
@@ -175,16 +178,7 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
 
 def warmup_fold_default(major: int, minor: int, *, families=(),
                         strided=(False, True), out_dtype=None) -> int:
-    """Pre-compile the fold kernels this GPU can reach. Returns the count.
-
-    Call at engine init, OUTSIDE cudagraph capture: a JIT inside capture is
-    both slow and, on this path, a sync in a place that cannot take one.
-    A serving path that skips this compiles the fold on first use instead.
-
-    Best-effort per spec: one illegal combination must not cost the rest of
-    the coverage. Failures are printed, never swallowed -- a warmup that
-    silently covers nothing is exactly the state this replaced.
-    """
+    'Pre-compile the fold kernels this GPU can reach. Returns the count.'
     from .host import _compile_fold_gemm
 
     arch = kernel_arch_for_capability(major, minor)
@@ -199,6 +193,7 @@ def warmup_fold_default(major: int, minor: int, *, families=(),
                                dtype, mode=spec["mode"],
                                kernel_arch=spec["kernel_arch"],
                                ab_stage_override=spec["ab_stage_override"],
+                               pi_via_layout=spec["pi_via_layout"],
                                strided_weight=spec["strided_weight"])
             compiled += 1
         except Exception as e:                            # noqa: BLE001
@@ -230,18 +225,51 @@ def warmup_fold_default(major: int, minor: int, *, families=(),
 
 
 
+
 FAMILY_TACTICS: dict[tuple[str, str], list[tuple]] = {
     ("row_pair", "std"): [
-        # Narrow N tiles: GEMM-N is 2*m_tok in this transposed family, so
-        # at decode sizes an N=64 floor computes mostly padding. Rule: the
-        # smallest N tile that still covers 2*m_tok AND still launches --
-        # (128,16) is the exact fit at m_tok=8 but does not fit in shared
-        # memory on sm_100a, so (128,24) is the narrowest usable tile there.
-        # Entries with a 4th element pin a shallower AB pipeline depth: the
-        # stage solve spends the smem budget before the fold doubles its C
-        # staging, so narrow tiles overshoot and fail to launch without it.
-        # These tiles do not win at m_tok>=32: N=64 is fully used there, and
-        # splitting N re-streams the weight tile, the decode bottleneck.
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
         ("tma", (128, 8), (1, 1), 5),
         ("tma", (128, 16), (1, 1), 6),
         ("tma", (128, 16), (1, 1), 5),
@@ -259,6 +287,11 @@ FAMILY_TACTICS: dict[tuple[str, str], list[tuple]] = {
         ("tma_mext", (128, 64), (1, 1)),
         ("tma_mext", (128, 128), (1, 1)),
         ("tma_mext", (256, 128), (2, 1)),
+    ],
+    ("tile8", "pi"): [
+        ("direct_mext", (128, 64), (1, 1)),
+        ("direct_mext", (128, 128), (1, 1)),
+        ("direct_mext", (256, 128), (2, 1)),
     ],
 }
 
@@ -377,7 +410,7 @@ def _rank_tactics(family: tuple[str, str], m_tok: int, kernel_arch: str):
     for raw in FAMILY_TACTICS[family]:
         mode, tiler, cluster, ab = _norm_tactic(raw)
         if mode == "direct_mext" and 2 * m_tok < tiler[0]:
-            continue  # direct-store full-tile constraint (raw STG has no TMA clamp)
+            continue  # A6 full-tile constraint (raw STG has no TMA clamping)
         tile = tiler[axis]
         # Narrow tiles must cover the token extent outright: splitting the
         # token axis re-streams the whole weight tile per extra tile, and the
@@ -397,6 +430,11 @@ def _rank_tactics(family: tuple[str, str], m_tok: int, kernel_arch: str):
     return [t for _, t in scored]
 
 
+def _needs_pi_layout(family) -> bool:
+    'A6 must be launched with pi carried by the LAYOUT.'
+    return family in FAMILY_NEEDS_PI_WEIGHT
+
+
 def _measure_family(
     family, weight_fp4, act_fp4, weight_sf, act_sf, alpha, out_dtype,
     kernel_arch, warmup_iters, measure_iters,
@@ -404,8 +442,8 @@ def _measure_family(
     """Best (tactic, us) for one family on this shape, or (None, None).
 
     Returns rather than raises when nothing launched: with cross-family
-    selection a family having no legal config is a NORMAL outcome, not an
-    error.
+    selection a family having no legal config is a NORMAL outcome (A6 has
+    none below m_tok=64), not an error.
     """
     m_tok = act_fp4.shape[0] // 2
     best, best_us = None, None
@@ -417,7 +455,8 @@ def _measure_family(
                     weight_fp4, act_fp4, weight_sf, act_sf, alpha,
                     out_dtype, mma_tiler_mn=tiler, cluster_shape_mn=cluster,
                     store_mode=mode, kernel_arch=kernel_arch,
-                    ab_stage_override=ab))
+                    ab_stage_override=ab,
+                    pi_via_layout=_needs_pi_layout(family)))
             us = _time_us(fn, warmup=warmup_iters, iters=measure_iters)
             if best_us is None or us < best_us:
                 best, best_us = (mode, tiler, cluster, ab), us
@@ -448,14 +487,18 @@ def run_fold_autotuned(
             kernel_arch, warmup_iters, measure_iters)
         if hit is None:
             raise ValueError(
-                f"no legal tactic for {key}; route tiny-m to the "
-                f"('row_pair','std') N-ext family instead")
+                f"no legal tactic for {key} -- the ('tile8','pi') family has "
+                f"no config at 2*m_tok < 128 (A6 full-tile constraint); route "
+                f"tiny-m to the ('row_pair','std') N-ext family instead")
         _AUTOTUNE_CACHE[key] = hit
     mode, tiler, cluster, ab = _norm_tactic(hit)
     return mext_fold_gemm_sm103(
         weight_fp4, act_fp4, weight_sf, act_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster,
-        store_mode=mode, kernel_arch=kernel_arch, ab_stage_override=ab)
+        store_mode=mode, kernel_arch=kernel_arch, ab_stage_override=ab,
+        pi_via_layout=_needs_pi_layout(family))
+
+
 
 
 
@@ -479,7 +522,16 @@ def run_fold_autotuned(
 FAMILY_ACT_LAYOUT: dict[tuple[str, str], str] = {
     ("row_pair", "std"): "row_pair",
     ("tile8", "std"): "tile8",
+    ("tile8", "pi"): "tile8",
 }
+
+# Families needing the pi weight permutation. pi is a pure axis transpose that
+# COMMUTES with quantise+swizzle (a6_weight_perm_indices has the proof), so
+# this is a LAYOUT requirement, not a second weight buffer and not a load-time
+# commitment -- one physical weight can back both N-ext and A6. The kernel
+# carries the transpose in its TMA/SF layouts (pi_via_layout, gated bitwise on
+# B200 by gate_a6_pi_via_layout_sm100.py), so nothing is materialised per call.
+FAMILY_NEEDS_PI_WEIGHT: frozenset = frozenset({("tile8", "pi")})
 
 _FAMILY_CACHE: dict[tuple, tuple] = {}
 

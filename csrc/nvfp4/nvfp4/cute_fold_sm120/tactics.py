@@ -99,10 +99,10 @@ def warmup_fold_default(major: int, minor: int, shapes) -> None:
     # future engine that warms before loading weights) would hit that, so
     # force the context here rather than depending on call order.
     torch.zeros(1, device="cuda")
-    # The token count is a RUNTIME argument of the compiled
-    # kernel, so m_tok only decides WHICH TILE to compile -- the lru_cache
-    # dedupes the (n_w, k, tile) repeats, and a shape list spanning the whole
-    # decode band costs 2-3 compiles per shape instead of one per size.
+    
+    
+    
+    
     for entry in shapes:
         m_tok, n_w, k, out_dtype = entry[:4]
         k_ext = entry[4] if len(entry) > 4 else k

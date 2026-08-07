@@ -8,8 +8,7 @@ import torch
 
 from .extension import ensure_loaded
 
-# Soft load: a missing extension only warns; the failure is deferred
-# to the first op call (see extension.py).
+# 软加载:缺扩展只警告,真正调用 op 时才致命(见 extension.ensure_loaded)
 ensure_loaded(required=False)
 
 

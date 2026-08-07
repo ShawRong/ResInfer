@@ -9,10 +9,6 @@
 #   - env-export/.venv: ModelOpt calibration/export env, versioned separately
 #     because TRT-LLM has its own torch ABI and ModelOpt dependency constraints.
 
-[build-system]
-requires = ["setuptools>=77", "wheel"]
-build-backend = "setuptools.build_meta"
-
 [project]
 name = "resinfer"
 version = "0.1.0"
@@ -40,7 +36,7 @@ dependencies = [
 
     # ── HF / data stack ──────────────────────────────────────────────────
     # vLLM nightly requires Transformers 5.x.  Some lm-eval imports still
-    # reference removed 4.x VLM auto classes; dev/evaluation/eval_vllm.py
+    # reference removed 4.x VLM auto classes; an internal eval harness
     # installs a small compatibility shim for non-VLM evaluations.
     "transformers>=5.5.3",
     "accelerate>=0.21.0",
@@ -103,30 +99,6 @@ dependencies = [
     "nvidia-cublas-cu12>=12.0",
 ]
 
-[tool.setuptools.packages.find]
-include = [
-    "auto_search",
-    "auto_search.*",
-    "dev",
-    "dev.*",
-    "quant",
-    "quant.*",
-]
-exclude = [
-    "csrc",
-    "csrc.*",
-    "configs",
-    "configs.*",
-    "docs",
-    "docs.*",
-    "env-export",
-    "env-export.*",
-    "patches",
-    "patches.*",
-    "tests",
-    "tests.*",
-]
-
 # Optional PyPI mirror for users in China.  It is explicit so the public
 # default remains PyPI unless a package source opts into this mirror.
 [[tool.uv.index]]
@@ -159,7 +131,6 @@ torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
 nvfp4 = { path = "csrc/nvfp4", editable = true }
-vllm = { url = "https://wheels.vllm.ai/b5a2adec4bae0032c00e974b391e04ce59b98242/vllm-0.23.1rc1.dev260%2Bgb5a2adec4-cp38-abi3-manylinux_2_28_x86_64.whl" }
 nixl = { index = "nvidia" }
 nixl-cu13 = { index = "nvidia" }
 nvidia-cudnn-cu12 = { index = "nvidia" }
@@ -184,3 +155,4 @@ override-dependencies = [
 dev = [
     "pytest>=9.0.1",
 ]
+

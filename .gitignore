@@ -108,3 +108,7 @@ result/
 
 # Local machine config. Tracked configs are OSS-safe defaults.
 /configs/*.local.yaml
+
+# Local GPU-kernel optimization/profiling workspaces.
+/kernel_opt_resattn_decode/
+/ncu_reports/

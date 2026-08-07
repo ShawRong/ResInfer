@@ -1,29 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""The RESIDUE_* environment contract, as one checkable object.
-
-The residue stack is configured entirely through environment variables --
-there is no CLI of its own, and every launcher re-encodes the recipe by
-hand. A violated rule surfaces either as silent wrong behavior or as a
-crash far from the cause. The failure modes this guards against:
-
-  - RESIDUE_VLLM_MODEL_DIR unset on a residue export: no metadata, so
-    create_weights sizes merged params at stock K and weight loading dies
-    much later on a bare loader shape assert;
-  - RESIDUE_PATCH_MODE=mext_r1 on an export: metadata-less layers are
-    silently converted into runtime-mext_r1 layers;
-  - RESIDUE_ENABLE_DECODE_MEXT=0 -- a documented switch -- crashes weight
-    loading with KeyError: 'weight_scale_base' on residue exports.
-
-`enforce()` runs at patch time in every vLLM process: it prints ONE line of
-resolved configuration (so logs always say what actually ran) and refuses
-known-fatal combinations at startup second three instead of failure hour two.
-`RESIDUE_ENV_CHECK=0` downgrades refusals to warnings for deliberate
-experiments; there is no fully-silent mode.
-
-The table in docs/residue-env.md is the human-readable rendering of KNOWN
-below. Keep them in sync.
-"""
+'The RESIDUE_* environment contract, as one checkable object.'
 
 from __future__ import annotations
 
@@ -65,10 +42,22 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_DECODE_MEXT_MAX_M": ("int", None, "fold band M threshold"),
     "RESIDUE_FORCE_DECODE_MEXT": ("one", None,
                                   "fold at every M (PD decode-only servers)"),
+    # EXPERIMENT: the attribution control for the per-layer ratio search.
+    # Serves the SAME checkpoint with the prefill residue removed and decode
+    # untouched. Declared here above all so it lands in the resolved line --
+    # it is a server-side env, which is exactly the class of knob lighteval's
+    # generation cache key cannot see, so two arms that differ only in this
+    # would silently share a cache entry (.claude/rules/lighteval-cache.md).
+    "RESIDUE_PREFILL_RESIDUE_OFF": ("one", None,
+                                    "EXPERIMENT: no residue above the M "
+                                    "threshold (decode keeps its residue)"),
+    "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M": ("int", None,
+                                          "M threshold for the kill switch "
+                                          "(default: the fold band)"),
     "RESIDUE_MEXT_PREFILL_PATH": ("enum",
                                   {"auto", "two_gemm", "k_loop"},
-                                  "mext_r1 prefill route (auto = FlashInfer-"
-                                  "tuned two_gemm/k_loop selection)"),
+                                  'mext_r1 prefill route: auto selects FlashInfer-tuned two_gemm or k_loop; decode routing is independent.'),
+    "RESIDUE_FOLD_MEXT": ("one", None, "enable A4/A6 tile8 families (sm10x)"),
     "RESIDUE_FOLD_SILENCE_DEFAULT": ("one", None,
                                      "silence the static-tactic-table warning"),
     "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
@@ -86,6 +75,15 @@ KNOWN: dict[str, tuple] = {
                                      "across models"),
     "RESIDUE_FOLD_TUNE_DUMP": ("free", None,
                                "write the fold tuner's decisions to this path"),
+    # -- attention (experimental) -------------------------------------------
+    "RESIDUE_ATTN": ("one", None, "register the ResAttn backend"),
+    "RESIDUE_ATTN_CONTEXT_KERNEL": ("one", None,
+                                    "0 disables the paged context kernel"),
+    "RESIDUE_ATTN_PREFILL_EXACT": ("one", None,
+                                   "force the gather_dequant oracle prefill"),
+    # -- MoE -----------------------------------------------------------------
+    "RESIDUE_MOE_MEXT": ("one", None, "MoE mext experiment gate"),
+    "RESIDUE_MOE_OBSERVE": ("one", None, "MoE routing observer"),
     # -- debug ----------------------------------------------------------------
     "RESIDUE_DEBUG": ("one", None, "verbose debug prints"),
     "RESIDUE_DEBUG_MASK": ("one", None, "mask debug prints"),
@@ -149,15 +147,15 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
     has_metadata = False
     if model_dir:
         if not os.path.isdir(model_dir):
-            # A wrong path behaves exactly like an unset one.
+            # Incident: a wrong path behaves exactly like an unset one.
             fatals.append(
                 f"RESIDUE_VLLM_MODEL_DIR={model_dir!r} does not exist")
         else:
             has_metadata = os.path.isfile(
                 os.path.join(model_dir, METADATA_FILENAME))
     else:
-        # Omitting this fails LATE: the loader's shape assert fires long
-        # after startup.
+        
+        
         warnings.append(
             "RESIDUE_VLLM_MODEL_DIR is unset -- if the checkpoint is a "
             "residue export, create_weights will size merged params at stock "
@@ -167,8 +165,9 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
     mode = val("RESIDUE_PATCH_MODE") or val("RESIDUE_VLLM_PATCH_VERSION")
 
     if has_metadata and mode == "mext_r1":
-        # Metadata-less projections (including fused names whose lookup
-        # misses) are silently name-forced to runtime mext_r1.
+        
+        
+        
         warnings.append(
             "RESIDUE_PATCH_MODE=mext_r1 while the export carries "
             f"{METADATA_FILENAME}: any projection WITHOUT a metadata entry is "
@@ -176,16 +175,18 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
             "always want the mode unset (v2).")
 
     if has_metadata and val("RESIDUE_ENABLE_DECODE_MEXT") != "1":
-        # On the vLLM 0.26 stack this crashed weight loading with KeyError
-        # 'weight_scale_base'. A WARNING, not fatal: older vLLM pins served
-        # exports without the flag, so the breakage is stack-dependent and a
-        # hard refusal would break stacks where the path still works. If
-        # loading dies with that KeyError, this line is the answer.
+        
+        
+        
+        
+        
+        
         warnings.append(
             "residue export without RESIDUE_ENABLE_DECODE_MEXT=1: on vLLM "
             "0.26 this crashed weight loading with KeyError "
-            "'weight_scale_base'. If loading fails there, set "
-            "RESIDUE_ENABLE_DECODE_MEXT=1.")
+            "'weight_scale_base' (implementation constraints, Still "
+            "open). If loading fails there, set RESIDUE_ENABLE_DECODE_MEXT=1.")
+
 
     resolved = (
         f"mode={mode or 'v2(default)'} "
@@ -194,8 +195,11 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
         f"decode_mext={'on' if val('RESIDUE_ENABLE_DECODE_MEXT') == '1' else 'off'} "
         f"max_m={val('RESIDUE_DECODE_MEXT_MAX_M') or 'default'} "
         f"prefill_path={val('RESIDUE_MEXT_PREFILL_PATH') or 'auto'} "
+        f"prefill_residue="
+        f"{'OFF' if val('RESIDUE_PREFILL_RESIDUE_OFF') == '1' else 'on'} "
         f"share_autotune={'on' if val('RESIDUE_SHARE_AUTOTUNE_CACHE') == '1' else 'off'} "
-        f"swap={'on' if val('RESIDUE_SWAP') == '1' else 'off'}"
+        f"swap={'on' if val('RESIDUE_SWAP') == '1' else 'off'} "
+        f"attn={'on' if val('RESIDUE_ATTN') == '1' else 'off'}"
     )
     return {"resolved": resolved, "warnings": warnings, "fatals": fatals}
 

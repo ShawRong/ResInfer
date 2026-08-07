@@ -158,18 +158,43 @@ PRODUCTION_FAMILY = ("row_pair", "std")
 
 
 
+
+
+
+
+
+
+
+
 ENABLE_MEXT_FAMILY = os.environ.get("RESIDUE_FOLD_MEXT", "0") == "1"
+
+
+
+
+
+
+
+
+
+
+
+
+#
+# A6 is legal only where 2*m_tok >= tile_M, i.e. m_tok >= 64; _rank_tactics
+# returns nothing below that, so the tuner simply never picks it there.
 
 
 def candidate_families() -> list[tuple[str, str]]:
     """Families the serving path may select among, given the env gate.
 
-    The M-ext family is gated because the still-unproven part is the tile8
-    activation layout's numerics in production, not the store design.
+    Both M-ext families ride the same gate: they share the tile8 activation
+    layout, and the thing still unproven is that layout's numerics in
+    production, not the store design layered on top of it.
     """
     fams = [PRODUCTION_FAMILY]
     if ENABLE_MEXT_FAMILY:
-        fams.append(("tile8", "std"))
+        fams.append(("tile8", "std"))   # A4
+        fams.append(("tile8", "pi"))    # A6
     return fams
 
 
@@ -178,10 +203,12 @@ def select_fold_plan(
 ) -> tuple[tuple[str, str] | None, str]:
     """(family, activation layout) for this shape and m-bucket.
 
-    Both in ONE call on purpose. The layout does not determine the family,
-    and a caller that quantises by layout and then guesses the family can
-    dispatch another family's tuned tactic -- wrong values, no crash.
-    Returning the pair makes that disagreement unrepresentable.
+    Both in ONE call on purpose. The layout does not determine the family --
+    "tile8" is shared by A4 ("tile8","std") and A6 ("tile8","pi"), which have
+    different store modes and only one of which needs pi_via_layout. A caller
+    that quantises by layout and then guesses the family will dispatch A6's
+    tuned tactic as A4: wrong values, no crash. Returning the pair makes that
+    disagreement unrepresentable.
 
     family is None when nothing was tuned for this bucket; the layout is then
     "row_pair" and run_fold falls through to its default path, exactly as an
@@ -285,7 +312,8 @@ def run_fold(
         return mext_fold_gemm_sm103(
             weight_fp4, act_fp4_rowpair, weight_sf, act_sf, alpha, out_dtype,
             mma_tiler_mn=tiler, cluster_shape_mn=cluster, store_mode=mode,
-            kernel_arch=arch, ab_stage_override=ab)
+            kernel_arch=arch, ab_stage_override=ab,
+            pi_via_layout=_t._needs_pi_layout(family))
 
     # Nothing tuned this shape -- static table, and say so. The static table is
     # N-ext only, so this is correct only for the row_pair layout; a caller

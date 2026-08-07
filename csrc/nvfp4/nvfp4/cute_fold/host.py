@@ -62,15 +62,23 @@ def _compile_fold_gemm(
     mode: str = "fold_tma",
     kernel_arch: str = "sm103",
     ab_stage_override: int | None = None,
+    dual_alpha: bool = False,
+    pi_via_layout: bool = False,
+    split_k: int = 1,
+    splitk_ablate: int = 0,
+    dsmem_split: bool = False,
     strided_weight: bool = False,
 ):
     """Compile a fold-GEMM kernel variant:
 
     - "fold_tma":         N-ext fold, register fold + TMA store
-    - "fold_tma_mext":    M-ext fold, compact-smem alias + TMA store
-    - "fold_mext_direct": M-ext fold, permuted-alias 128-bit direct stores
+    - "fold_tma_mext":    M-ext fold (A4), compact-smem alias + TMA store
+    - "fold_mext_direct": M-ext fold (A6), pi alias + 128-bit direct stores
     - "plain_tma":        stock kernel/epilogue baseline (no fold)
 
+    (The former "fold_direct" tiny-m mode was removed: dominated at every
+    m_tok after the transposed-staging fold_tma optimization -- see
+    fold_vs_plain_latency_results.md.)
     """
     assert mode in ("fold_tma", "plain_tma", "fold_tma_mext",
                     "fold_mext_direct", "kloop_tma"), mode
@@ -84,15 +92,25 @@ def _compile_fold_gemm(
     assert mode not in ("fold_tma_mext", "fold_mext_direct") or kernel_arch == "sm100", (
         "M-ext modes are sm100-only")
     # kloop_tma: wrapped-K-loop -- act (K-concat, 2K) as A, weight as B with a
-    # wrapped k coordinate, PLAIN epilogue writing C[m_tok, n_w]. sm100-only.
+    # wrapped k coordinate, PLAIN epilogue writing C[m_tok, n_w]. sm100-only,
+    # single-alpha, no split_k (the wrap and the split both own the k index).
     assert mode != "kloop_tma" or (
-        kernel_arch == "sm100"
-        and not strided_weight), "kloop_tma: sm100-only, contiguous weight"
+        kernel_arch == "sm100" and split_k == 1 and not dual_alpha
+        and not strided_weight), "kloop_tma: sm100, split_k=1, single-alpha"
     # The AB depth knob is sm100-only (the sm103 ctor has no such param).
     assert kernel_arch == "sm100" or ab_stage_override is None, (
         "ab_stage_override is sm100-only")
+    # dual_alpha only makes sense for fold modes (plain has no (base,res) pairs).
+    assert not dual_alpha or mode != "plain_tma", "dual_alpha requires a fold mode"
+    # StreamK-lite: N-ext fold on sm100 only (r2g owner/follower reduction).
+    assert split_k == 1 or (kernel_arch == "sm100" and mode == "fold_tma"), (
+        "split_k>1 requires sm100 fold_tma")
+    # The owner defers alpha to after the K-reduction (bit-exactness); the
+    # dual-alpha fold is a different linear form -- combine later if needed.
+    assert not (split_k > 1 and dual_alpha), "split_k>1 is single-alpha for now"
     key = (mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
-           ab_stage_override, strided_weight)
+           ab_stage_override, dual_alpha, pi_via_layout, split_k,
+           splitk_ablate, dsmem_split, strided_weight)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
 
@@ -115,7 +133,12 @@ def _compile_fold_gemm(
                                      "fold_mext_direct")),
             fold_on_m=(mode in ("fold_tma_mext", "fold_mext_direct")),
             mext_direct_store=(mode == "fold_mext_direct"),
+            pi_via_layout=pi_via_layout,
             ab_stage_override=ab_stage_override,
+            dual_alpha=dual_alpha,
+            split_k=split_k,
+            splitk_ablate=splitk_ablate,
+            dsmem_split=dsmem_split,
             k_loop=(mode == "kloop_tma"),
         )
     else:
@@ -125,9 +148,10 @@ def _compile_fold_gemm(
             cluster_shape_mn=cluster_shape_mn,
             use_tma_store=True,
             fold_pairs_tma=(mode == "fold_tma"),
+            dual_alpha=dual_alpha,
         )
 
-    # fold_mext_direct needs PROVABLE 16B alignment of the direct-store
+    # A6 (fold_mext_direct) needs PROVABLE 16B alignment of the direct-store
     # pointers: annotate the dynamic dims' divisibility (n_w%32 is already a
     # hard pi requirement; m_tok%8 comes with tile8). Runtime asserts below.
     _a6 = mode == "fold_mext_direct"
@@ -209,7 +233,7 @@ def _compile_fold_gemm(
     a_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
     b_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
     alpha_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Float32, (1,), assumed_align=4
+        cutlass.Float32, (2,) if dual_alpha else (1,), assumed_align=4
     )
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
@@ -233,6 +257,8 @@ def _compile_fold_gemm(
             alpha_fake,
             max_active_clusters,
             stream_fake,
+            make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16),
+            make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, 16),
             False,  # swap_ab
             lambda x: x,  # epilogue_op (alpha applied inside the kernel)
             options="--opt-level 2 --enable-tvm-ffi",
@@ -267,6 +293,32 @@ def _ceil_div(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
+# StreamK-lite workspace/flag cache. Allocated once per (shape, tile, split)
+# and reused: allocation must never happen inside a CUDA-graph capture, and
+# the flag protocol is self-cleaning (owner returns each flag to 0), so a
+# zero-initialized buffer stays valid across calls and graph replays.
+_SPLITK_BUF_CACHE: dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _splitk_buffers(n_w, m2, mma_tiler_mn, split_k, device):
+    key = (n_w, m2, mma_tiler_mn, split_k, device)
+    hit = _SPLITK_BUF_CACHE.get(key)
+    if hit is None:
+        tiles_m = _ceil_div(n_w, mma_tiler_mn[0])
+        tiles_n = _ceil_div(m2, mma_tiler_mn[1])
+        # Folded partials: 128 rows x (N/2) fp32 per CTA per tile (the fold
+        # halves the accumulator before it crosses gmem).
+        ws_floats = (
+            tiles_m * tiles_n * (split_k - 1) * 2 * 128 * (mma_tiler_mn[1] // 2)
+        )
+        ws = torch.empty(ws_floats, dtype=torch.float32, device=device)
+        flags = torch.zeros(tiles_m * tiles_n * 2, dtype=torch.int32,
+                            device=device)
+        hit = (ws, flags)
+        _SPLITK_BUF_CACHE[key] = hit
+    return hit
+
+
 def mext_fold_gemm_sm103(
     weight_fp4: torch.Tensor,
     act_fp4_rowpair: torch.Tensor,
@@ -279,7 +331,11 @@ def mext_fold_gemm_sm103(
     store_mode: str = "tma",
     kernel_arch: str = "sm103",
     ab_stage_override: int | None = None,
+    pi_via_layout: bool = False,
     alpha_res: torch.Tensor | None = None,
+    split_k: int = 1,
+    splitk_ablate: int = 0,
+    dsmem_split: bool = False,
 ) -> torch.Tensor:
     """Run the fold GEMM. Returns D[m_tok, n_w] (contiguous).
 
@@ -334,6 +390,24 @@ def mext_fold_gemm_sm103(
             f"activation must be compact [{m2}, {k_packed}]; got stride "
             f"{act_fp4_rowpair.stride()}")
 
+    # dsmem_split is VALIDATED ONLY for a single real M tile. Two things it has
+    # never been exercised on both switch on together at 2*m_tok > tile_m, and
+    # the kernel crashes there (tp1_qkv m=128):
+    #   - real_m > 0 for the first time, so the M-hijack decode
+    #     (real_m = tile_m // 2) is finally load-bearing; with one M tile every
+    #     tile_m maps to real_m = 0 and a wrong decode is INVISIBLE.
+    #   - tiles > CTAs for the first time, so red_buf is REUSED across tiles and
+    #     the credit protocol actually runs.
+    # Refuse loudly rather than fault the GPU. (This is the whole decode band the
+    # split was designed for -- m <= 64 at tile_m = 128 -- so it is not a
+    # practical restriction today, but it IS an unfinished edge.)
+    if dsmem_split and 2 * m_tok > mma_tiler_mn[0]:
+        raise ValueError(
+            f"dsmem_split is only validated for a single M tile "
+            f"(2*m_tok={2 * m_tok} <= tile_m={mma_tiler_mn[0]}). "
+            f"Multi-M-tile and multi-tile-per-CTA are both unvalidated and "
+            f"currently fault -- see streamk_lite_design.md.")
+
     _mode = STORE_MODE_TO_MODE[store_mode]
     # Dual-alpha hot path: pass alpha as a PRE-COMBINED (2,) f32 tensor
     # ([alpha_base, alpha_res]) -- zero per-call allocations. The alpha_res
@@ -343,6 +417,11 @@ def mext_fold_gemm_sm103(
         mma_tiler_mn, cluster_shape_mn, out_dtype,
         mode=_mode, kernel_arch=kernel_arch,
         ab_stage_override=ab_stage_override,
+        pi_via_layout=pi_via_layout,
+        split_k=split_k,
+        splitk_ablate=splitk_ablate,
+        dsmem_split=dsmem_split,
+        dual_alpha=_dual,
         strided_weight=_strided_w,
     )
 
@@ -358,9 +437,9 @@ def mext_fold_gemm_sm103(
     sf_k = _ceil_div(k, SF_VEC_SIZE * 4)
 
     if store_mode in ("tma_mext", "direct_mext"):
-        # direct_mext additionally requires the WEIGHT rows pre-permuted
-        # (see direct_mext_weight_perm_indices); output D is standard order.
-        # The direct store dereferences the m2-congruent alias: the peer half of a 2SM mma
+        # direct_mext (A6) additionally requires the WEIGHT rows pre-permuted
+        # by pi (see a6_weight_perm_indices); output D is standard order.
+        # A6 dereferences the m2-congruent alias: the peer half of a 2SM mma
         # tile must exist (2*m_tok >= mma M) or its stores land out of bounds.
         assert store_mode != "direct_mext" or m2 >= mma_tiler_mn[0], (
             f"direct_mext needs 2*m_tok >= mma_tiler M "
@@ -372,11 +451,12 @@ def mext_fold_gemm_sm103(
         # written naturally (no transpose). Swap operands (mA=act, mB=weight)
         # and SF (sf_m arg = act tiles, sf_n arg = weight tiles).
         d_t = torch.empty(m_tok, n_w, dtype=out_dtype, device=weight_fp4.device)
+        # M-ext modes are sm100-only: wrapper takes the (inert) splitk ptrs.
         compiled(
             act_fp4_rowpair, weight_fp4, d_t,
             sf_n, sf_m, sf_k,
             act_sf.data_ptr(), weight_sf.data_ptr(),
-            alpha_t,
+            alpha_t, 0, 0,
         )
         return d_t
 
@@ -384,11 +464,18 @@ def mext_fold_gemm_sm103(
         # N-ext: kernel writes row-major D[m_tok, n_w] via a transposed TMA view.
         d_t = torch.empty(m_tok, n_w, dtype=out_dtype, device=weight_fp4.device)
         if kernel_arch == "sm100":
+            _ws_ptr, _flags_ptr = 0, 0
+            if split_k > 1 and not dsmem_split:
+                assert k % (split_k * 256) == 0, (k, split_k)
+                _ws, _flags = _splitk_buffers(
+                    n_w, m2, mma_tiler_mn, split_k, weight_fp4.device
+                )
+                _ws_ptr, _flags_ptr = _ws.data_ptr(), _flags.data_ptr()
             compiled(
                 weight_fp4, act_fp4_rowpair, d_t,
                 sf_m, sf_n, sf_k,
                 weight_sf.data_ptr(), act_sf.data_ptr(),
-                alpha_t,
+                alpha_t, _ws_ptr, _flags_ptr,
             )
         else:
             compiled(
@@ -448,13 +535,13 @@ def kext_kloop_gemm_sm100(
         _ceil_div(m_tok, 128), _ceil_div(n_w, 128),
         _ceil_div(k // SF_VEC_SIZE, 4),
         act_sf.data_ptr(), weight_sf.data_ptr(),
-        alpha_t,
+        alpha_t, 0, 0,
     )
     return d_t
 
 
-def direct_mext_weight_perm_indices(n_w: int) -> "torch.Tensor":
-    'Row-permutation for the direct_mext weight: kernel position p must\n\nRow-permutation for the direct_mext weight: kernel position p must\n    hold logical weight row f(p), per 32-row block. Derived from the .16x256b\n    atom dst TV ((4,8),(2,2,4)):((2,32),(1,256,8)) at epi (128,32): position\n    p = va + 2*ta + 8*vc  ->  f(p) = va + 8*ta + 2*vc  (va in 2, ta in 4, vc in 4).\n    Usage: w_kernel = w_logical[direct_mext_weight_perm_indices(n_w)]. Output D is\n    standard order; no downstream compensation.'
+def a6_weight_perm_indices(n_w: int) -> "torch.Tensor":
+    'Row-permutation for the A6 (direct_mext) weight: kernel position p must\n\nRow-permutation for the A6 (direct_mext) weight: kernel position p must\n    hold logical weight row f(p), per 32-row block. Derived from the .16x256b\n    atom dst TV ((4,8),(2,2,4)):((2,32),(1,256,8)) at epi (128,32): position\n    p = va + 2*ta + 8*vc  ->  f(p) = va + 8*ta + 2*vc  (va in 2, ta in 4, vc in 4).\n    Usage: w_kernel = w_logical[a6_weight_perm_indices(n_w)]. Output D is\n    standard order; no downstream compensation.'
     assert n_w % 32 == 0, n_w
     f = torch.empty(32, dtype=torch.long)
     for va in range(2):

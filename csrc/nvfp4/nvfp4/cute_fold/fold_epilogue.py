@@ -30,6 +30,7 @@ def mext_fold_epilogue(
     acc_pipeline: pipeline.PipelineAsync,
     tCcC_base: cute.Tensor = None,
     mC_mnl: cute.Tensor = None,
+    dual_alpha: cutlass.Constexpr = False,
     alpha_value=None,
     alpha_res_value=None,
 ) -> pipeline.PipelineState:
@@ -150,10 +151,18 @@ def mext_fold_epilogue(
         # pay per-element guards. vec_ok is trace-time static.
         half_size = frag_size // 2
         if const_expr(vec_ok):
-            folded_half = epilogue_op(
-                tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
-                + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
-            )
+            if const_expr(dual_alpha):
+                folded_half = epilogue_op(
+                    alpha_value
+                    * tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
+                    + alpha_res_value
+                    * tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
+                )
+            else:
+                folded_half = epilogue_op(
+                    tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
+                    + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
+                )
             tTR_rC_half.store(folded_half.to(gemm_kernel.c_dtype))
             gC_half = tTR_gC_subtile[_PAIR_EVEN]
             if const_expr(use_predication):
@@ -170,7 +179,13 @@ def mext_fold_epilogue(
         else:
             tTR_rFold = cute.make_rmem_tensor(tTR_rAcc.shape, cutlass.Float32)
             for i in range(0, frag_size, 2):
-                pair_sum = tTR_rAcc[i] + tTR_rAcc[i + 1]
+                if const_expr(dual_alpha):
+                    pair_sum = (
+                        alpha_value * tTR_rAcc[i]
+                        + alpha_res_value * tTR_rAcc[i + 1]
+                    )
+                else:
+                    pair_sum = tTR_rAcc[i] + tTR_rAcc[i + 1]
                 tTR_rFold[i] = pair_sum
                 tTR_rFold[i + 1] = pair_sum
             acc_vec = epilogue_op(tTR_rFold.load()).to(gemm_kernel.c_dtype)
@@ -208,6 +223,7 @@ def mext_fold_epilogue_tma(
     acc_consumer_state: pipeline.PipelineState,
     acc_pipeline: pipeline.PipelineAsync,
     c_pipeline,
+    dual_alpha: cutlass.Constexpr = False,
     alpha_value=None,
     alpha_res_value=None,
 ) -> pipeline.PipelineState:
@@ -288,10 +304,16 @@ def mext_fold_epilogue_tma(
                 acc_pipeline.consumer_release(acc_consumer_state)
             acc_consumer_state.advance()
 
-        folded_half = epilogue_op(
-            tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
-            + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
-        )
+        if const_expr(dual_alpha):
+            folded_half = epilogue_op(
+                alpha_value * tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
+                + alpha_res_value * tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
+            )
+        else:
+            folded_half = epilogue_op(
+                tTR_rAcc[_PAIR_EVEN].load().to(cutlass.Float32)
+                + tTR_rAcc[_PAIR_ODD].load().to(cutlass.Float32)
+            )
         tTR_rC_half.store(folded_half.to(gemm_kernel.c_dtype))
 
         # Each thread owns one row of the half-width epi tile (the fragment

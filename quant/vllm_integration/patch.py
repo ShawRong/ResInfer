@@ -68,12 +68,12 @@ def _install_shared_autotune_cache() -> None:
     if os.environ.get("RESIDUE_SHARE_AUTOTUNE_CACHE", "0") != "1":
         return
 
-    # The resolver moved between vLLM generations. Newer trees factor it out
-    # as `warmup.flashinfer_autotune_cache.resolve_flashinfer_autotune_file`;
-    # the pinned dev260 serving stack defines it PRIVATELY inside
-    # kernel_warmup as `_resolve_flashinfer_autotune_file`. Missing the second
-    # made RESIDUE_SHARE_AUTOTUNE_CACHE=1 a silent no-op on the stack real
-    # serving runs on -- caught by the sm100 e2e warmup audit.
+    
+    
+    
+    
+    
+    
     fac = None
     try:
         from vllm.model_executor.warmup import flashinfer_autotune_cache as fac
@@ -226,9 +226,9 @@ def _maybe_dump_fold_tuning() -> None:
               f"{type(e).__name__}: {str(e)[:70]}", flush=True)
 
 
-# (The former _MEXT_R1_PREFILL_BUCKETS injection died with the
-# fold-at-prefill route: mext_r1 prefill now goes through the
-# FlashInfer tuner, whose choose_one tunes every bucket in one forward.)
+
+
+
 
 
 # The fold band's bucket ladder (fold_max_m caps at 128 on sm10x).
@@ -399,7 +399,7 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
     # The env contract, enforced where every launcher converges. Prints one
     # resolved-config line (so logs always say what actually ran) and refuses
     # known-fatal combinations at startup instead of hours later -- each rule
-    # in env_contract.py names the failure it prevents.
+    # in env_contract.py names the real incident it prevents.
     # RESIDUE_ENV_CHECK=0 downgrades refusals to warnings.
     from .env_contract import enforce as _enforce_env_contract
     _enforce_env_contract(model_dir=os.environ.get(RESIDUE_MODEL_DIR_ENV))
@@ -543,8 +543,17 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
         except Exception as _e:  # pragma: no cover - best-effort
             print(f"[residue] persistent-cache patch import failed: {_e}", flush=True)
 
-        # FusedMoEMethodCls is not patched: MoE expert weights stay on stock
-        # NVFP4; the residue path covers attention and dense MLP projections.
+        
+        
+        
+        
+        
+        try:
+            from .residue_moe import patch_moe_observer
+
+            patch_moe_observer()
+        except Exception as _e:  # pragma: no cover - best-effort
+            print(f"[residue] MoE observer install failed: {_e}", flush=True)
 
         _patched = True
         print(

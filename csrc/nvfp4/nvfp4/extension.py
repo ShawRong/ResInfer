@@ -1,9 +1,10 @@
 """C++ extension loader for the local NVFP4 kernels.
 
-The compiled extension backs the fold / quant / GEMM ops. Importing this
-package must not hard-fail when the extension is absent: the module-level
-load is soft, and callers that actually need an op get a clear error from
-``ensure_loaded()``.
+The compiled extension backs the fold / quant / GEMM ops. It is NOT needed by
+``nvfp4.cute_attn`` (paged NVFP4 attention), which is pure CuTeDSL + torch, so
+importing this package must not hard-fail when the extension is absent: the
+module-level load is soft, and callers that actually need an op get a clear
+error from ``ensure_loaded()``.
 """
 
 from __future__ import annotations
@@ -18,7 +19,8 @@ _WARNED = False
 
 _MISSING_MSG = (
     "nvfp4 extension (nvfp4._C) not found or unloadable. Build it with "
-    "`csrc/nvfp4/build.sh` if you need the fold / quant / GEMM ops."
+    "`csrc/nvfp4/build.sh` if you need the fold / quant / GEMM ops. "
+    "nvfp4.cute_attn (paged NVFP4 attention) does not require it."
 )
 
 

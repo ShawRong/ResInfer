@@ -41,16 +41,34 @@ import os
 
 def apply() -> None:
     """Entry point for the ``vllm.general_plugins`` group."""
-    if not os.environ.get("RESIDUE_PATCH_VLLM"):
+    patch_linear = bool(os.environ.get("RESIDUE_PATCH_VLLM"))
+    resattn = os.environ.get("RESIDUE_ATTN") == "1"
+    if not (patch_linear or resattn):
         return
     pid = os.getpid()
     try:
-        from quant.vllm_integration.patch import patch_vllm_modelopt
+        if patch_linear:
+            from quant.vllm_integration.patch import (is_patched,
+                                                      patch_vllm_modelopt)
 
-        model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
-        # patch mode (mext_r1 / v2) is read from RESIDUE_PATCH_MODE inside
-        # patch_vllm_modelopt via version="auto".
-        patch_vllm_modelopt(model_dir=model_dir)
+            model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
+            # patch mode (mext_r1 / v2) is read from RESIDUE_PATCH_MODE inside
+            # patch_vllm_modelopt via version="auto".
+            patch_vllm_modelopt(model_dir=model_dir)
+            # patch_vllm_modelopt returns False BOTH on "already patched" and
+            # on a swallowed ImportError -- so the return value alone cannot
+            # distinguish success from silent failure. Verify the class
+            # attribute instead: if the patch is not actually installed,
+            # vLLM would serve stock NVFP4 with numbers that look normal.
+            if not is_patched():
+                raise RuntimeError(
+                    "patch_vllm_modelopt did not install (see the warning "
+                    "it printed above)")
+        if resattn:
+            from quant.vllm_integration.attn_register import install
+
+            if not install():
+                raise RuntimeError("ResAttn backend registration was refused")
         print(f"[residue:plugin] applied in pid={pid}", flush=True)
     except Exception as exc:
         # RAISE, do not just report. Printing is not loud enough: vLLM would
@@ -60,14 +78,14 @@ def apply() -> None:
         # reads as a kernel bug and sends the next person to debug the fold.
         # That has already cost someone an evening.
         #
-        # Failing is safe to do here because reaching this point means
-        # RESIDUE_PATCH_VLLM=1, i.e. the caller explicitly asked for residue.
-        # Refusing to start beats a fake success.
+        # Failing is safe to do here because the caller explicitly enabled at
+        # least one residue/ResAttn component. Refusing to start beats a fake
+        # success with a partially installed pipeline.
         print(
             f"[residue:plugin] FAILED in pid={pid}: {type(exc).__name__}: {exc}\n"
             f"[residue:plugin] refusing to serve without the residue kernels "
-            f"(RESIDUE_PATCH_VLLM=1 was set). Unset it to run plain NVFP4 "
-            f"deliberately.",
+            f"(a residue/ResAttn gate was set). Unset the gate to run plain "
+            f"vLLM deliberately.",
             flush=True,
         )
         raise

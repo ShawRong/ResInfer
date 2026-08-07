@@ -1,26 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""CuTeDSL NVFP4 col-pair fold GEMM for SM120 (GeForce Blackwell / RTX 5090).
-
-Computes, in one kernel, the residue MExt-R1 fold
-
-    D[t, w] = alpha * A[2t, :] . B[w, :] + alpha * A[2t+1, :] . B[w, :]
-
-where the extended activation rows (2t, 2t+1) are the (base, residue) pair,
-i.e. the row_pair quant layout that `scaled_fp4_quant_mext_r1` already emits
-for the SM100 CuTeDSL fork. Operand assignment is swap-ab (weight on GEMM-M,
-extended activation on GEMM-N), matching the C++ SM120 production kernel; the
-fold is thread-local (the adjacent-N pair lands in consecutive accumulator
-registers) and the folded value is stored straight to the compact output with
-a predicated STG -- no epilogue SMEM, no TMA store.
-
-Verified against the C++ production kernel bit-for-bit: 52 randomized fuzz cases
-plus a four-corner loop against an independent plain-NVFP4 twin.
-
-Derived from the CUTLASS CuTeDSL example
-`blackwell_geforce/.../dense_blockscaled_gemm_persistent_cooperative.py`
-(BSD-3-Clause, NVIDIA CORPORATION).
-"""
+'CuTeDSL NVFP4 col-pair fold GEMM for SM120 (GeForce Blackwell / RTX 5090).\n\nDerived from the CUTLASS CuTeDSL blackwell_geforce dense_blockscaled_gemm_persistent_cooperative.py example (NVIDIA, BSD-3-Clause).'
 
 from typing import Tuple, Type, Optional
 
@@ -61,7 +41,7 @@ class Sm120BlockScaledGemmKernel:
         epi_tile,
         k_loop: bool = False,
     ):
-        # k_loop: wrapped-K variant.
+        
         # B is the K-concat activation [m_tok, 2K]; A (the weight) keeps K and
         # is read twice by wrapping the producer's k coordinate at the
         # midpoint, so the MMA's own K-reduction performs the base+residue

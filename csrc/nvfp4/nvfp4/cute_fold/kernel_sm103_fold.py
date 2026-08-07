@@ -109,6 +109,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         use_tma_store: bool,
         enable_pdl: bool = True,
         fold_pairs_tma: bool = False,
+        dual_alpha: bool = False,
     ):
         """Initializes the configuration for a Blackwell SM103 3xFP4 GEMM kernel.
 
@@ -147,6 +148,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         self.fold_pairs_tma = fold_pairs_tma and use_tma_store
         # Dual-alpha: base/res halves carry separate global scales (alpha is a
         # (2,) tensor; fold sites apply alpha*even + alpha_res*odd in f32).
+        self.dual_alpha = dual_alpha
         self.cta_group = (
             tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         )
@@ -676,7 +678,10 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
         alpha_value = alpha[0].to(cutlass.Float32)
-        alpha_res_value = alpha_value
+        if cutlass.const_expr(self.dual_alpha):
+            alpha_res_value = alpha[1].to(cutlass.Float32)
+        else:
+            alpha_res_value = alpha_value
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -1729,9 +1734,16 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
             # convert back to the output dtype inside the wrapper:
             # cutlass-dsl >= 4.6 rejects implicit f32 -> bf16 narrowing at
             # store time, which the original dtype-promoting lambda hits.
-            alpha_epilogue_op = lambda x: epilogue_op(
-                (alpha_value * x.to(cutlass.Float32)).to(self.c_dtype)
-            )
+            if cutlass.const_expr(self.dual_alpha):
+                # Dual-alpha: the fold sites scale each half BEFORE the sum;
+                # this wrapper only narrows to the output dtype.
+                alpha_epilogue_op = lambda x: epilogue_op(
+                    x.to(cutlass.Float32).to(self.c_dtype)
+                )
+            else:
+                alpha_epilogue_op = lambda x: epilogue_op(
+                    (alpha_value * x.to(cutlass.Float32)).to(self.c_dtype)
+                )
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 cur_tile_coord = work_tile.tile_idx
@@ -1772,6 +1784,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         acc_consumer_state,
                         acc_pipeline,
                         c_pipeline,
+                        dual_alpha=self.dual_alpha,
                         alpha_value=alpha_value,
                         alpha_res_value=alpha_res_value,
                     )
@@ -1805,6 +1818,7 @@ class Sm103BlockScaledPersistentDenseGemmKernel:
                         acc_pipeline,
                         tCcC_base=tCcC,
                         mC_mnl=mC_mnl,
+                        dual_alpha=self.dual_alpha,
                         alpha_value=alpha_value,
                         alpha_res_value=alpha_res_value,
                     )

@@ -1,28 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Tensor-parallel sharding for the residue K-extension.
-
-Only the K-extension (`extended_k`) path needs any of this. `mext_r1` keeps
-its weight at K_base and puts the residue in the activation's M dimension,
-so vLLM's own sharding already applies unchanged; see
-docs/residue_tp_design.md.
-
-The extended weight is laid out as ``[N, K_base | S]``. Under row-parallel
-TP rank ``r`` must hold two *disjoint* column ranges:
-
-    base     [ r*Kb/tp , (r+1)*Kb/tp )
-    salient  Kb + [ r*S/tp , (r+1)*S/tp )
-
-vLLM's default row-parallel loader takes a single contiguous range. Because
-``K_ext/tp == Kb/tp + S/tp`` the shapes still agree, so nothing raises -- it
-just pairs activation columns with the wrong weight columns. That silent
-failure is why this module exists.
-
-Both ranges being contiguous, and the split being balanced, are properties
-of how the export picks salient channels (`algo_helper.get_salient_indices`
-takes top-k inside each 8-channel block and sorts), not assumptions. They
-are asserted here and pinned by tests/test_residue_tp_sharding.py.
-"""
+'Tensor-parallel sharding for the residue K-extension.'
 from __future__ import annotations
 
 from dataclasses import dataclass

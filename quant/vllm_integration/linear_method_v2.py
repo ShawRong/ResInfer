@@ -91,6 +91,31 @@ def _is_kernel_instance(kernel: object, kernel_cls: type | None) -> bool:
     return kernel_cls is not None and isinstance(kernel, kernel_cls)
 
 
+_KERNEL_LOGGED = [False]
+
+
+def _log_selected_kernel_once(method) -> None:
+    """Print which NVFP4 kernel vLLM selected, once, at model-build time.
+
+    This runs at the first create_weights -- BEFORE weight loading -- so an
+    incompatible selection is visible in the first screen of the log instead
+    of surfacing minutes later as a PWAL error.
+    """
+    if _KERNEL_LOGGED[0]:
+        return
+    _KERNEL_LOGGED[0] = True
+    compatible = isinstance(method.kernel, method._CUTLASS_LAYOUT_KERNELS)
+    print(f"[residue] vLLM NVFP4 linear kernel: "
+          f"{type(method.kernel).__name__} "
+          f"(residue-compatible layout: {'yes' if compatible else 'NO'})",
+          flush=True)
+    if not compatible:
+        print("[residue] WARNING: residue features (mext_r1 fold, "
+              "decode-MExt layout) will be disabled or fail on this kernel. "
+              "Pin a compatible one: --linear-backend cutlass "
+              "(or flashinfer_cutlass / flashinfer_cutedsl).", flush=True)
+
+
 _FOLD_REGISTER_WARNED = set()
 
 
@@ -197,15 +222,23 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             return False
         return any(frag in layer_name for frag in self._FOLD_PROJ_NAME_FRAGMENTS)
 
+    # Kernels whose PWAL produces the cutlass NVFP4 weight/scale layout our
+    # residue op consumes. This is a LAYOUT compatibility set, not a backend
+    # preference: vLLM picks the kernel (auto or --linear-backend), we only
+    # verify the weights will be in the dialect our kernels read. CuteDSL is
+    # vLLM 0.26's auto pick on sm100 and uses the identical layout (its PWAL
+    # calls the same swizzle_blockscale + pad_nvfp4_weight_for_cutlass);
+    # missing it made 0.26+sm100 fail at PWAL for mext_r1 layers.
+    _CUTLASS_LAYOUT_KERNELS = tuple(
+        cls for cls in (
+            CutlassNvFp4LinearKernel,
+            FlashInferCutlassNvFp4LinearKernel,
+            FlashInferCuteDslNvFp4LinearKernel,
+        ) if cls is not None
+    )
+
     def _uses_cutlass_nvfp4_kernel(self) -> bool:
-        # Both vLLM's native CUTLASS backend and FlashInfer's CUTLASS runner
-        # use the same NVFP4 weight/scale contract that our opaque residue op
-        # consumes. Treat both as custom-op capable; otherwise selecting the
-        # FlashInfer-CUTLASS backend silently disables decode-MExt layout prep.
-        return isinstance(
-            self.kernel,
-            (CutlassNvFp4LinearKernel, FlashInferCutlassNvFp4LinearKernel),
-        )
+        return isinstance(self.kernel, self._CUTLASS_LAYOUT_KERNELS)
 
     def _has_decode_mext_layout(self, layer: torch.nn.Module) -> bool:
         return (
@@ -245,6 +278,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         registered or applied at runtime.
         """
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
+        _log_selected_kernel_once(self)
         extended_dim = self._get_extended_dim(layer_name)
         if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
             print(
@@ -511,8 +545,10 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         """
         if not self._uses_cutlass_nvfp4_kernel():
             raise RuntimeError(
-                "M-extension R1 currently supports only the cutlass backend. "
-                f"Got kernel={type(self.kernel).__name__!r} for layer {layer_name}."
+                "mext_r1 layers need a cutlass-layout NVFP4 kernel; vLLM "
+                f"selected {type(self.kernel).__name__!r} for layer "
+                f"{layer_name}. Pin one with --linear-backend cutlass "
+                "(or flashinfer_cutlass / flashinfer_cutedsl)."
             )
 
         if self._nvfp4 is None:
