@@ -344,7 +344,7 @@ enum class MExtR1LayoutMode : int {
   // cols [0, K), residue in [K, 2K). Data and SF are both emitted in the
   // canonical order of the (M, 2K) grid, so a downstream GEMM consumes the
   // doubled-K activation as a perfectly ordinary operand (the wrapped-K-loop
-  // kernel's input; see dev/plans/kext-via-wrapped-kloop.md).
+  // kernel's input).
   kConcatK = 3,
 };
 
