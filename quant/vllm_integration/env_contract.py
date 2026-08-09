@@ -95,13 +95,14 @@ KNOWN: dict[str, tuple] = {
                                    "force the gather_dequant oracle prefill"),
     "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
                                "capture ResAttn decode into CUDA graphs "
-                               "(~2x decode, but split-K reduces through "
-                               "atomics and is not run-to-run reproducible)"),
+                               "(1.2-2.2x decode, and makes it reproducible "
+                               "-- the default path reduces through atomics "
+                               "and measurably does not repeat)"),
     "RESIDUE_ATTN_CG_CAPTURE_LEN": ("int", None,
                                     "sequence length the CUDA-graph capture "
                                     "plans against (default max_model_len); "
-                                    "a short value selects the deterministic "
-                                    "no-split kernel"),
+                                    "a short value selects the no-split "
+                                    "kernel, which uses no atomics at all"),
     # -- MoE -----------------------------------------------------------------
     "RESIDUE_MOE_MEXT": ("one", None, "MoE mext experiment gate"),
     "RESIDUE_MOE_OBSERVE": ("one", None, "MoE routing observer"),
