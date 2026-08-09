@@ -10,9 +10,13 @@ import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
+import numpy as np
 import torch
+import triton
+import triton.language as tl
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.v1.utils import CpuGpuBuffer
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 
 from vllm.utils.torch_utils import canonicalize_singleton_dim_strides
@@ -575,14 +579,69 @@ class ResAttnMetadata(AttentionMetadata):
     has_prefill_context: bool
 
 
+@triton.jit
+def _resattn_gather_page_indices(
+    page_indices,        # [total_pages] int32   -- output, compacted
+    block_table,         # [num_reqs, max_blocks] int32
+    block_table_stride,
+    cu_num_pages,        # [num_reqs + 1] int32  -- exclusive prefix sums
+    BLOCK: tl.constexpr,
+):
+    """Compact vLLM's padded block table into a flashinfer-format page list.
+
+    One program per request copies that request's first ``n`` block ids to
+    ``page_indices[cu_num_pages[req] : cu_num_pages[req + 1]]``.
+
+    This exists to avoid ``block_table[bool_mask]``, whose output length is
+    data-dependent: torch must synchronise the device to learn how many
+    elements survive before it can allocate. That sync is per step, and the
+    fresh allocation makes the tensor address move, which is exactly what a
+    captured CUDA graph cannot tolerate. Here the lengths come from the host
+    (numpy cumsum over the CPU seq_lens), so nothing is read back and the
+    destination is a persistent buffer.
+
+    vLLM ships an equivalent kernel (``_copy_page_indices_kernel`` in
+    ``v1/attention/backends/flashinfer.py``); it is private and has moved
+    between releases, so this is a local copy rather than an import.
+    """
+    req = tl.program_id(0)
+    row_ptr = block_table + req * block_table_stride
+    start = tl.load(cu_num_pages + req)
+    end = tl.load(cu_num_pages + req + 1)
+    n = end - start
+    offs = tl.arange(0, BLOCK)
+    for i in tl.range(0, n, BLOCK):
+        ids = tl.load(row_ptr + i + offs, mask=i + offs < n)
+        tl.store(page_indices + start + i + offs, ids, mask=i + offs < n)
+
+
 class ResAttnMetadataBuilder(AttentionMetadataBuilder[ResAttnMetadata]):
     """Builds ResAttnMetadata from CommonAttentionMetadata."""
 
-    # TODO(M4 hardening): decode-only CUDA graphs (UNIFORM_SINGLE_TOKEN_DECODE)
-    # once the kernel wrapper is promoted and the page-table buffers move to
-    # persistent pinned buffers (FlashInferMetadataBuilder pattern). NEVER for
-    # the skeleton -- correctness first.
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.NEVER
+
+    @classmethod
+    def get_cudagraph_support(cls, vllm_config, kv_cache_spec):
+        if os.environ.get("RESIDUE_ATTN_CUDAGRAPH", "0") == "1":
+            return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
+        return cls._cudagraph_support
 
     def __init__(
         self,
@@ -611,6 +670,65 @@ class ResAttnMetadataBuilder(AttentionMetadataBuilder[ResAttnMetadata]):
                 "KV it does not own."
             )
 
+        # Persistent page-table buffers, sized from the engine's own limits.
+        # `build()` writes into these every step instead of allocating, so the
+        # metadata tensors keep one address for the process lifetime. Two
+        # separate reasons want that: a fresh allocation per step costs an
+        # allocator round trip on the critical path, and a captured CUDA graph
+        # records addresses -- a moving tensor silently reads freed memory on
+        # replay.
+        ps = _MMA_PAGE_SIZE
+        max_num_reqs = vllm_config.scheduler_config.max_num_seqs
+        max_model_len = vllm_config.model_config.max_model_len
+        max_pages_per_req = (max_model_len + ps - 1) // ps
+        self._max_num_pages = max_num_reqs * max_pages_per_req
+        # Sequence length the CUDA-graph capture plans against; see
+        # get_cudagraph_support for why it is the maximum rather than
+        # whatever length the capture batch happens to carry.
+        #
+        # Overridable because the choice trades determinism against speed.
+        # max_model_len lands in a split band, and split-K reduces through
+        # atomics whose ordering is not fixed -- two identical runs can then
+        # produce different tokens, which the project's eval-determinism rule
+        # forbids for anything whose number gets compared. Capturing at a
+        # short length instead selects the no-split kernel: deterministic, and
+        # still correct at any sequence length (it just walks the whole KV
+        # rather than splitting it). RESIDUE_ATTN_CG_CAPTURE_LEN picks.
+        self._cg_capture_seq_len = int(
+            os.environ.get("RESIDUE_ATTN_CG_CAPTURE_LEN", "0")
+        ) or max_model_len
+
+        # indptr needs all three views: numpy to run the cumsum on the host,
+        # pinned CPU to stage it, GPU for the kernels.
+        self._kv_indptr_buf = CpuGpuBuffer(
+            max_num_reqs + 1, dtype=torch.int32, device=device
+        )
+        # indices are produced on device by the gather kernel and never read
+        # back, so a GPU-only buffer is enough.
+        self._kv_indices_buf = torch.zeros(
+            self._max_num_pages, dtype=torch.int32, device=device
+        )
+
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: CommonAttentionMetadata
+    ) -> ResAttnMetadata:
+        """Capture against max_model_len, not the capture batch's own length.
+
+        The decode planner reads `max_seq_len` to choose (splits, reduction),
+        and each reduction is a different compiled kernel. Capture records one
+        of them; replay never re-plans. Capturing at whatever length the dummy
+        batch carried would therefore freeze a short-sequence geometry and then
+        serve long sequences with it -- under-provisioned grid, silently.
+
+        Pinning the capture to the engine maximum inverts the error: every
+        replay runs a geometry sized for something at least as long as itself.
+        """
+        md = self.build(
+            common_prefix_len=0, common_attn_metadata=common_attn_metadata
+        )
+        md.max_seq_len = max(md.max_seq_len, self._cg_capture_seq_len)
+        return md
 
     def build(
         self,
@@ -632,32 +750,46 @@ class ResAttnMetadataBuilder(AttentionMetadataBuilder[ResAttnMetadata]):
         seq_lens = cam.seq_lens[:num_reqs]
         block_table = cam.block_table_tensor[:num_reqs]
 
-        # flashinfer-format page table from vLLM's block table (row-major
-        # masked-select keeps per-sequence page order).
-        # TODO(M4 hardening): O(num_reqs * max_blocks) mask each step; move to
-        # persistent pinned buffers + np cumsum like FlashInferMetadataBuilder
-        # (_compute paged_kv buffers) before any perf measurement.
-        num_pages = (seq_lens + (ps - 1)) // ps  # [num_reqs]
-        max_blocks = block_table.shape[1]
-        page_mask = (
-            torch.arange(max_blocks, device=block_table.device).unsqueeze(0)
-            < num_pages.unsqueeze(1)
-        )
-        kv_indices = block_table[page_mask].to(torch.int32)
-        kv_indptr = torch.zeros(
-            num_reqs + 1, dtype=torch.int32, device=block_table.device
-        )
-        kv_indptr[1:] = num_pages.cumsum(0, dtype=torch.int32)
+        # flashinfer-format page table, built without reading the device back
+        # and without allocating: page counts come from vLLM's own CPU copy of
+        # seq_lens, the prefix sum runs in numpy straight into the pinned
+        # indptr buffer, and a Triton gather compacts the block table on
+        # device. `_resattn_gather_page_indices` documents why the previous
+        # `block_table[bool_mask]` form had to go -- its output length was
+        # data-dependent, so it forced a per-step device sync and a fresh
+        # allocation, and the moving address alone rules out CUDA graphs.
+        seq_lens_np = cam.seq_lens_cpu[:num_reqs].numpy()
+        num_pages_np = (seq_lens_np.astype(np.int64) + (ps - 1)) // ps
+        indptr_np = self._kv_indptr_buf.np
+        indptr_np[0] = 0
+        np.cumsum(num_pages_np, dtype=np.int32, out=indptr_np[1 : num_reqs + 1])
+        # Host-side, so the total is known without a device round trip.
+        total_pages = int(indptr_np[num_reqs])
+        if total_pages > self._max_num_pages:
+            raise RuntimeError(
+                f"[residue] ResAttn page table needs {total_pages} pages but "
+                f"the persistent buffer holds {self._max_num_pages}. This "
+                "means max_num_seqs or max_model_len grew after the builder "
+                "was constructed."
+            )
+        kv_indptr = self._kv_indptr_buf.copy_to_gpu(num_reqs + 1)
+        kv_indices = self._kv_indices_buf[:total_pages]
+        if num_reqs > 0 and total_pages > 0:
+            _resattn_gather_page_indices[(num_reqs,)](
+                kv_indices,
+                block_table,
+                block_table.stride(0),
+                kv_indptr,
+                BLOCK=1024,
+            )
 
-        # The same quantities on the host, derived from vLLM's own CPU copies
-        # so nothing is read back off the device. The page counts are recomputed
-        # here rather than copied from `num_pages` for that reason -- it is host
-        # arithmetic on host data, not a transfer.
+        # The same quantities on the host. seq_lens/query_start_loc come from
+        # vLLM's CPU copies; the indptr list is now just a view of the numpy
+        # buffer the cumsum already filled, which removes the per-step Python
+        # loop that used to recompute it.
         seq_lens_list = cam.seq_lens_cpu[:num_reqs].tolist()
         qsl_list = cam.query_start_loc_cpu[: num_reqs + 1].tolist()
-        kv_indptr_list = [0]
-        for _s in seq_lens_list:
-            kv_indptr_list.append(kv_indptr_list[-1] + (_s + ps - 1) // ps)
+        kv_indptr_list = indptr_np[: num_reqs + 1].tolist()
 
         return ResAttnMetadata(
             num_actual_tokens=cam.num_actual_tokens,

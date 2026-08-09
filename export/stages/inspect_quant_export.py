@@ -174,12 +174,119 @@ class InspectQuantExportStage(Stage):
                     f"{mext_r1_layers} mext_r1"
                 )
 
+            # Every check above reads the METADATA -- which is exactly the
+            # artefact that can be right while the export is wrong. A driver
+            # whose chain never widened the weights still writes
+            # runtime_mode=extended_k with a full num_salient, passes all of
+            # the above, records PASS, and hands over a checkpoint that dies
+            # at load with a device-side assert when the loader indexes
+            # columns that were never written. Verifying a claim against the
+            # same claim is not verification; open the tensors.
+            self._assert_extended_widths(export_dir, layers)
+
         ctx.metrics["export_tensor_keys"] = len(keys)
         ctx.metrics["export_suffix_counts"] = actual_counts
         if finite_counts:
             ctx.metrics["finite_export_tensor_counts"] = finite_counts
         print_rank_0(f"Inspect export OK: {export_dir}")
         return ctx
+
+    @staticmethod
+    def _expected_in_features(name: str, cfg: dict) -> int | None:
+        """Logical input width of a projection, from the model config.
+
+        The independent source this check needs. `num_salient` and the stored
+        width alone cannot decide anything: 1280 packed columns is a perfectly
+        legal base width AND a perfectly legal extended one, so a comparison
+        between the two numbers has no fixed point. The config is the only
+        thing here that was not written by the export being audited.
+        """
+        h = cfg.get("hidden_size")
+        if h is None:
+            return None
+        inter = cfg.get("intermediate_size")
+        # Expert projections are sized by the MoE intermediate width, not the
+        # dense one; using the dense value would fail every expert layer.
+        if ".experts." in name or ".mlp.experts" in name:
+            inter = cfg.get("moe_intermediate_size", inter)
+        if name.endswith(("q_proj", "k_proj", "v_proj",
+                          "gate_proj", "up_proj", "qkv_proj", "gate_up_proj")):
+            return h
+        if name.endswith("o_proj"):
+            heads = cfg.get("num_attention_heads")
+            if not heads:
+                return None
+            return heads * cfg.get("head_dim", h // heads)
+        if name.endswith("down_proj"):
+            return inter
+        return None       # unrecognised layer: not this check's business
+
+    @classmethod
+    def _assert_extended_widths(cls, export_dir: Path, layers: dict) -> int:
+        """Every extended_k layer must be as wide as its metadata claims.
+
+        FP4 is nibble-packed, so the stored width is half the logical one:
+
+            packed == (in_features + num_salient) // 2
+
+        A chain that declared the extension but never widened the tensors is
+        short by exactly num_salient // 2, and nothing else in this stage can
+        see it -- every other check reads the metadata, which is the artefact
+        that is right while the weights are wrong.
+
+        mext_r1 layers are skipped deliberately: their residue lives in the
+        activation's M dimension and base width is CORRECT for them. Asserting
+        extension there would reject good exports (a real b80 export has three
+        extended_k layers and the rest mext_r1).
+        """
+        try:
+            from safetensors import safe_open
+        except ImportError as exc:
+            raise ImportError(
+                "safetensors is required to verify extended weight widths"
+            ) from exc
+
+        cfg_path = export_dir / "config.json"
+        if not cfg_path.exists():
+            return 0
+        cfg = json.loads(cfg_path.read_text())
+        cfg = cfg.get("text_config", cfg)
+
+        widths: dict[str, int] = {}
+        for shard in sorted(export_dir.glob("*.safetensors")):
+            with safe_open(shard, framework="pt") as f:
+                for k in f.keys():
+                    if k.endswith(".weight"):
+                        shape = f.get_slice(k).get_shape()
+                        if len(shape) == 2:
+                            widths[k[: -len(".weight")]] = int(shape[1])
+
+        bad, checked = [], 0
+        for name, meta in layers.items():
+            if not isinstance(meta, dict):
+                continue
+            if meta.get("runtime_mode") != "extended_k":
+                continue
+            num_salient = int(meta.get("num_salient", 0))
+            if num_salient <= 0:
+                continue
+            got = widths.get(name)
+            in_features = cls._expected_in_features(name, cfg)
+            if got is None or in_features is None:
+                continue
+            expected = (int(in_features) + num_salient) // 2
+            checked += 1
+            if got != expected:
+                bad.append(f"{name}: num_salient={num_salient} "
+                           f"in_features={in_features} expected packed="
+                           f"{expected} got={got}")
+        if bad:
+            raise AssertionError(
+                f"{export_dir}: {len(bad)} of {checked} extended_k layers are "
+                f"NOT widened -- the metadata declares an extension the "
+                f"weights do not carry, and such a checkpoint dies at load "
+                f"with a device-side assert. First: " + bad[0])
+        return checked
 
     @staticmethod
     def _load_export_keys(export_dir: Path) -> list[str]:

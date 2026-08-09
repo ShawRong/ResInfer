@@ -56,13 +56,16 @@ KNOWN: dict[str, tuple] = {
     # untouched. Declared here above all so it lands in the resolved line --
     # it is a server-side env, which is exactly the class of knob lighteval's
     # generation cache key cannot see, so two arms that differ only in this
-    # would silently share a cache entry (.claude/rules/lighteval-cache.md).
+    
     "RESIDUE_PREFILL_RESIDUE_OFF": ("one", None,
                                     "EXPERIMENT: no residue above the M "
                                     "threshold (decode keeps its residue)"),
     "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M": ("int", None,
-                                          "M threshold for the kill switch "
-                                          "(default: the fold band)"),
+                                          "kill switch: deactivate where "
+                                          "m > t (default: the fold band)"),
+    "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M": ("int", None,
+                                          "kill switch: deactivate where "
+                                          "m <= t -- the 'prefill only' arm"),
     "RESIDUE_MEXT_PREFILL_PATH": ("enum",
                                   {"auto", "two_gemm", "k_loop"},
                                   'mext_r1 prefill route: auto selects FlashInfer-tuned two_gemm or k_loop; decode routing is independent.'),
@@ -90,6 +93,15 @@ KNOWN: dict[str, tuple] = {
                                     "0 disables the paged context kernel"),
     "RESIDUE_ATTN_PREFILL_EXACT": ("one", None,
                                    "force the gather_dequant oracle prefill"),
+    "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
+                               "capture ResAttn decode into CUDA graphs "
+                               "(~2x decode, but split-K reduces through "
+                               "atomics and is not run-to-run reproducible)"),
+    "RESIDUE_ATTN_CG_CAPTURE_LEN": ("int", None,
+                                    "sequence length the CUDA-graph capture "
+                                    "plans against (default max_model_len); "
+                                    "a short value selects the deterministic "
+                                    "no-split kernel"),
     # -- MoE -----------------------------------------------------------------
     "RESIDUE_MOE_MEXT": ("one", None, "MoE mext experiment gate"),
     "RESIDUE_MOE_OBSERVE": ("one", None, "MoE routing observer"),
@@ -170,6 +182,21 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
             "residue export, create_weights will size merged params at stock "
             "K and weight loading dies on `assert param_data.shape == "
             "loaded_weight.shape`. Set it to the export directory.")
+
+    if val("RESIDUE_DECODE_MEXT_MAX_M") == "0":
+        # Reads like "turn the decode-side residue off". It is not: this is a
+        # DISPATCH threshold, so 0 only routes the layer to the other kernel,
+        # and residue_linear_op's own docstring says the two paths are
+        # numerically equivalent. An extended_k layer still applies its
+        # residue through the K-extension, and a mext_r1 layer ignores the
+        # threshold entirely. An arm named "decode mext off" set this way is
+        # not off, and nothing else would have said so.
+        warnings.append(
+            "RESIDUE_DECODE_MEXT_MAX_M=0 changes the KERNEL, not the maths: "
+            "residue is still applied (extended_k through its K-extension, "
+            "mext_r1 unconditionally). To actually deactivate the residue in "
+            "the decode band use RESIDUE_PREFILL_RESIDUE_OFF=1 with "
+            "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M=<fold band>.")
 
     mode = val("RESIDUE_PATCH_MODE") or val("RESIDUE_VLLM_PATCH_VERSION")
 

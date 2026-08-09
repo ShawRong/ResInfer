@@ -171,7 +171,67 @@ def check_names() -> None:
         missing = {k: v for k, v in loads.items() if k not in bound and k not in B}
         for k, ln in sorted(missing.items(), key=lambda kv: kv[1]):
             failures.append(f"names: {f}:{ln} '{k}' is read but never bound")
-    _report("names", f"{len(FILES)} file(s)", n0)
+    extra = _serving_files()
+    for path in extra:
+        tree = ast.parse(path.read_text())
+        bound, loads = _bindings(tree)
+        for k, ln in sorted(
+                ((k, v) for k, v in loads.items()
+                 if k not in bound and k not in B), key=lambda kv: kv[1]):
+            failures.append(f"names: {path.name}:{ln} '{k}' is read but never bound")
+    _report("names", f"{len(FILES) + len(extra)} file(s)", n0)
+
+
+def _serving_files() -> list:
+    """The serving modules, checked by the same rule as the kernels.
+
+    A stale name here fails exactly the way it does in a kernel: inside a
+    best-effort `except Exception` that prints one line and carries on. That is
+    how `mext_prefill_folds` -- deleted with the fold-at-prefill route and left
+    behind at one use site -- disabled the mext_r1 kloop pre-compile for days
+    while serving quietly JIT-compiled inside cudagraph capture instead. One
+    second of AST here would have caught it the day it landed.
+    """
+    root = pathlib.Path(__file__).resolve().parents[1] / "quant"
+    return sorted(root.rglob("*.py")) if root.is_dir() else []
+
+
+def _bindings(tree):
+    """Names bound anywhere in the module, and names read, with first line."""
+    bound, loads = set(), {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Name):
+            if isinstance(n.ctx, (ast.Store, ast.Del)):
+                bound.add(n.id)
+            else:
+                loads.setdefault(n.id, n.lineno)
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bound.add(n.name)
+            a = getattr(n, "args", None)
+            if a:
+                for x in a.args + a.kwonlyargs + a.posonlyargs:
+                    bound.add(x.arg)
+                for x in (a.vararg, a.kwarg):
+                    if x:
+                        bound.add(x.arg)
+        elif isinstance(n, ast.Lambda):
+            for x in n.args.args + n.args.kwonlyargs + n.args.posonlyargs:
+                bound.add(x.arg)
+            for x in (n.args.vararg, n.args.kwarg):
+                if x:
+                    bound.add(x.arg)
+        elif isinstance(n, (ast.Import, ast.ImportFrom)):
+            for al in n.names:
+                bound.add((al.asname or al.name).split(".")[0])
+        elif isinstance(n, ast.ExceptHandler) and n.name:
+            bound.add(n.name)
+        elif isinstance(n, ast.Global):
+            bound.update(n.names)
+        elif isinstance(n, (ast.comprehension,)):
+            for tgt in ast.walk(n.target):
+                if isinstance(tgt, ast.Name):
+                    bound.add(tgt.id)
+    return bound, loads
 
 
 # ------------------------------------------------------------- 5. smem fields

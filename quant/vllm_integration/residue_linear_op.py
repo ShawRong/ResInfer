@@ -185,20 +185,59 @@ _FORCE_FOLD = os.environ.get("RESIDUE_FORCE_DECODE_MEXT", "0") == "1"
 #                the layer falls through to the plain cutlass bypass, whose
 #                weight/weight_scale already span the full (== base) K.
 #
-# The threshold defaults to the fold band, so "prefill" means exactly "not the
-# decode band" and decode keeps its residue at every layer.
+# The band is chosen by two optional bounds; the gate turns the switch on.
+#
+#   neither bound       MIN_M defaults to the fold band -> kills above it, so
+#                       "prefill only" and decode keeps its residue everywhere
+#   ..._MIN_M = t       kill where m >  t
+#   ..._MAX_M = t       kill where m <= t
+#   both                kill where either holds (residue survives only between
+#                       them) -- an intersection nobody has needed yet, but the
+#                       union is what the two rules mean read together
+#
+# _MAX_M completes the 2x2 the attribution study needs. Without it the fourth
+# cell is unreachable:
+#
+#   both          no flags                          residue everywhere
+#   decode-only   OFF=1                             kill above the fold band
+#   plain         OFF=1  MIN_M=0                    kill everywhere
+#   prefill-only  OFF=1  MAX_M=<fold band>          kill in the decode band
+#
+# and without the fourth cell you cannot tell whether both ~= prefill + decode
+# (complementary) or both ~= max(prefill, decode) (redundant) -- i.e. whether
+# two mechanisms are doing work or one.
+#
+# Naming wart, stated rather than hidden: the gate says PREFILL because when it
+# was added only the "above" direction existed. With _MAX_M the same switch
+# kills the DECODE band. Renaming it would break the arms already in flight and
+# the results that cite them, so the name stays and this paragraph explains it.
 _PREFILL_RESIDUE_OFF = (
     os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF", "0") == "1")
 _PREFILL_RESIDUE_OFF_MIN_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M")
+_PREFILL_RESIDUE_OFF_MAX_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MAX_M")
 
 
 def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
-    """Is this invocation a prefill one that the kill switch should neuter?"""
+    """Should the kill switch neuter the residue at this M?
+
+    Same deactivation path in every case -- computed to zero, no load-time
+    change -- which is why this switch works where overloading a dispatch
+    threshold does not.
+    """
     if not _PREFILL_RESIDUE_OFF:
         return False
-    thr = (int(_PREFILL_RESIDUE_OFF_MIN_M)
-           if _PREFILL_RESIDUE_OFF_MIN_M else int(fold_max_m))
-    return int(original_m) > thr
+    m = int(original_m)
+    if _PREFILL_RESIDUE_OFF_MAX_M is not None and m <= int(_PREFILL_RESIDUE_OFF_MAX_M):
+        return True
+    if _PREFILL_RESIDUE_OFF_MIN_M is not None:
+        return m > int(_PREFILL_RESIDUE_OFF_MIN_M)
+    # Neither bound given, or only _MAX_M: the "above" rule falls back to the
+    # fold band ONLY when no bound was named at all. Applying it alongside an
+    # explicit _MAX_M would kill both sides and silently produce the plain arm
+    # under the name "prefill-only".
+    if _PREFILL_RESIDUE_OFF_MAX_M is not None:
+        return False
+    return m > int(fold_max_m)
 
 # ── SM100/SM103 (B200/B300) CuTeDSL fold path ──────────────────────────────
 # On Blackwell datacenter GPUs the SM120 C++ fold GEMM does not exist; use the
@@ -342,10 +381,20 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         print(f"[residue] sm120 fold pre-compiled n_w={key[0]} k={key[1]} "
               f"k_ext={key[2]} mext_r1={key[3]} tiles={tiles} (dynamic m; "
               f"{len(_SM120_FOLD_SHAPES)} shapes so far)", flush=True)
-        if key[3] and not mext_prefill_folds:
+        if key[3]:
             # mext_r1 prefill routes to the tuned two_gemm/k_loop dispatch;
-            # pre-compile the kloop bucket grid HERE so get_valid_tactics can
-            # offer it at serving without ever compiling there.
+            # pre-compile the kloop grid HERE so get_valid_tactics can offer it
+            # at serving without ever compiling there.
+            #
+            # This read `key[3] and not mext_prefill_folds` until now, and that
+            # name has not existed since the fold was retired from prefill
+            # (34784f4 deleted `mext_prefill_folds = key[3] and not
+            # _mext_prefill_two_gemm()` and missed this use). The NameError was
+            # swallowed by the enclosing best-effort handler, printing one line
+            # among the startup warnings -- so the precompile this function
+            # exists to perform has not run since, and every mext_r1 shape has
+            # been JITing inside cudagraph capture instead. Now that prefill
+            # never folds, the condition it guarded is simply always true.
             try:
                 from .mext_prefill_tuner import precompile_kloop_sm120
 
