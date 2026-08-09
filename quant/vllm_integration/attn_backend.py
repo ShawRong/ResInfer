@@ -936,6 +936,31 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
                                  q_scale=q_scale)
         return output
 
+    def _append_trtllm_kv(self, layer, key, value, kv_cache, slot_mapping):
+        """Use vLLM's own production NVFP4 writer for the standard profile."""
+        try:
+            op = torch.ops._C_cache_ops.reshape_and_cache_flash
+        except (AttributeError, RuntimeError) as exc:
+            raise RuntimeError(
+                "[residue] vLLM lacks NVFP4 reshape_and_cache_flash; the "
+                "trtllm cache profile requires vLLM's native NVFP4 writer."
+            ) from exc
+        if not hasattr(layer, "_k_scale") or not hasattr(layer, "_v_scale"):
+            raise RuntimeError(
+                "[residue] attention layer does not expose _k_scale/_v_scale "
+                "required by vLLM's NVFP4 cache writer."
+            )
+        op(
+            key,
+            value,
+            kv_cache[:, 0],
+            kv_cache[:, 1],
+            slot_mapping.flatten(),
+            "nvfp4",
+            layer._k_scale,
+            layer._v_scale,
+        )
+
     # ------------------------------------------------------------ decode path
     def _decode_forward(
         self,
