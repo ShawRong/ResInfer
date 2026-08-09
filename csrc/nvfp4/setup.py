@@ -1,7 +1,7 @@
 import os
 import subprocess
 import torch
-from setuptools import setup
+from setuptools import find_packages, setup
 from torch.utils import cpp_extension
 
 # Get CUDA version
@@ -200,7 +200,16 @@ setup(
     name='nvfp4',
     version='0.1.0',
     description='NVIDIA FP4 Quantization Kernels',
-    packages=['nvfp4'],
+    # NOT ['nvfp4'] -- that ships the top level only and silently drops every
+    # subpackage: cute_attn (ResAttn), cute_fold / cute_fold_sm120 (MExt fold),
+    # experiment. Editable installs hide the bug because the source dir is on
+    # sys.path directly; a real install of the same tree then fails at
+    
+    #
+    # find_packages only sees directories with an __init__.py, so a new kernel
+    # family ships only once it has one. Add the file when you add the family,
+    # or a real install silently omits it exactly the way this bug did.
+    packages=find_packages(include=['nvfp4', 'nvfp4.*']),
     ext_modules=ext_modules,
     cmdclass={'build_ext': cpp_extension.BuildExtension},
     python_requires='>=3.10',
