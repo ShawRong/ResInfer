@@ -16,6 +16,12 @@ checkpoints:
 The default sizes are intentionally tiny so the same entrypoint can be used as
 a wiring/correctness smoke. For quality runs, pass a real calibration dataset
 and increase the sample and step counts.
+
+THIS FILE DOES NOT RUN GPTQ. The weight optimiser here is AWQ-lite, and there
+is no `--weight_opt` to change that. For a GPTQ + residue checkpoint use
+`run_gptq_uniform_residue.py` in this directory. Asking for GPTQ here fails as
+an unrecognised argument rather than as a missing file, which is a slow thing
+to diagnose -- hence this paragraph.
 """
 
 from __future__ import annotations
