@@ -36,7 +36,11 @@ def _maybe_patch_vllm() -> None:
         # But when RESIDUE_PATCH_VLLM is explicitly on, a silent skip means the
         # residue kernels never activate — surface the reason instead of hiding
         # it (this was the e2e "patch didn't reach the worker" root cause).
-        if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
+        # ALWAYS loud (audit F10): the comment above promises "surface the
+        # reason instead of hiding it", but the print was gated behind a
+        # debug flag -- so a real patch failure silently served plain NVFP4.
+        # The plugin path re-raises; sitecustomize at least must print.
+        if True:
             import traceback
 
             print(

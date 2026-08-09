@@ -226,9 +226,11 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
     # residue op consumes. This is a LAYOUT compatibility set, not a backend
     # preference: vLLM picks the kernel (auto or --linear-backend), we only
     # verify the weights will be in the dialect our kernels read. CuteDSL is
-    # vLLM 0.26's auto pick on sm100 and uses the identical layout (its PWAL
-    # calls the same swizzle_blockscale + pad_nvfp4_weight_for_cutlass);
-    # missing it made 0.26+sm100 fail at PWAL for mext_r1 layers.
+    # vLLM 0.26's auto pick on sm100 and its PWAL is byte-identical to
+    # cutlass's (same swizzle_blockscale + pad_nvfp4_weight_for_cutlass;
+    # vllm 0.26 kernels/linear/nvfp4/flashinfer.py:48 says so verbatim).
+    # Leaving it off this list crashed _pwal_mext_r1 at weight loading
+    # and silently skipped decode-MExt prep everywhere else.
     _CUTLASS_LAYOUT_KERNELS = tuple(
         cls for cls in (
             CutlassNvFp4LinearKernel,
@@ -238,6 +240,9 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
     )
 
     def _uses_cutlass_nvfp4_kernel(self) -> bool:
+        # The kernel's differing ACTIVATION quant contract is irrelevant:
+        # every path this gate opens runs OUR prep and OUR op, never the
+        # kernel object's apply.
         return isinstance(self.kernel, self._CUTLASS_LAYOUT_KERNELS)
 
     def _has_decode_mext_layout(self, layer: torch.nn.Module) -> bool:

@@ -126,23 +126,55 @@ def _run_subprocess(cmd: list[str], *, cwd: Path, log_path: Path | None = None) 
     print(f"[smoke] wrote subprocess log: {log_path}", flush=True)
 
 
+def _normalize_budget_key(budget: str) -> str:
+    """Match the emitter's key format (`auto_search.common.fmt_float`)."""
+    try:
+        return f"{float(budget):g}"
+    except (TypeError, ValueError):
+        return str(budget)
+
+
 def _load_policy_path(auto_summary_path: Path, budget: str) -> Path:
+    """Resolve `--budget` to the policy file the search emitted for it.
+
+    Two faults used to compound here into "you asked for one arm and got a
+    different one, with one line of print as the only sign".
+
+    1. KEY MISMATCH. The emitter keys by `fmt_float(value)` = `f"{v:g}"`,
+       which drops a trailing `.0`; this side looked up the raw command-line
+       string. So `--budget 5.0` was emitted under `'5'`, looked up as
+       `'5.0'`, and always missed. `--budget 5` matched, and `4.5` matched
+       only because `f"{4.5:g}"` is already `'4.5'`.
+    2. SILENT FALLBACK to `sorted(effective.items())[0]`. A single-budget run
+       lands back on the intended plan by luck. Emit several -- which is what
+       comparing budgets requires -- and asking for `5.0` hands back `4.5`,
+       because the sort is LEXICOGRAPHIC: `sorted(['4.5','5','8'])[0]` is
+       `'4.5'`. It is not even nearest-budget: `sorted(['4.5','10'])[0]` is
+       `'10'`.
+
+    Now: normalise the key the way the emitter writes it, and if it is still
+    absent, fail with the list of what was emitted. Exporting an arm the
+    caller did not ask for is not a degraded answer, it is a wrong one.
+    """
     data = json.loads(auto_summary_path.read_text())
     outputs = data.get("policy_metadata_outputs", {})
     effective = outputs.get("effective_bits", {})
-    if budget in effective:
-        return Path(effective[budget]["path"])
-
-    if effective:
-        first_budget, payload = next(iter(sorted(effective.items())))
-        print(
-            f"[smoke] requested budget={budget} not emitted; using budget={first_budget}",
-            flush=True,
+    if not effective:
+        raise RuntimeError(
+            f"No policy metadata was emitted. Check frontier feasibility in "
+            f"{auto_summary_path}"
         )
-        return Path(payload["path"])
+
+    for key in (budget, _normalize_budget_key(budget)):
+        if key in effective:
+            return Path(effective[key]["path"])
 
     raise RuntimeError(
-        f"No policy metadata was emitted. Check frontier feasibility in {auto_summary_path}"
+        f"budget={budget!r} was not emitted by the search. Emitted: "
+        f"{sorted(effective)}. Refusing to substitute another budget -- that "
+        f"would export a different arm under the requested name. "
+        f"(Note {budget!r} normalises to {_normalize_budget_key(budget)!r}; "
+        f"the emitter keys with '%g'.)"
     )
 
 

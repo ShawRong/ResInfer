@@ -36,6 +36,15 @@ KNOWN: dict[str, tuple] = {
                                 "applies to"),
     "RESIDUE_MEXT_ATTN_PROJ_NAMES": ("free", None,
                                      "legacy alias of RESIDUE_MEXT_PROJ_NAMES"),
+    "RESIDUE_ENABLE_MOE": ("one", None,
+                           "MoE expert takeover (residue_moe.py hook)"),
+    "RESIDUE_MOE_IMPL": ("enum", {"mext", "cutedsl"},
+                         "MoE experts impl: mext fold chain or the "
+                         "flashinfer-CuTeDSL graft"),
+    "RESIDUE_LINEAR_OFF": ("one", None,
+                           "leave ALL LinearBase layers on stock vLLM "
+                           "(auto kernel); install only the MoE hook -- "
+                           "for MoE-only runs and clean A/B attribution"),
     # -- fold dispatch -----------------------------------------------------
     "RESIDUE_ENABLE_DECODE_MEXT": ("one", None,
                                    "fold layout for extended_k/plain layers"),
