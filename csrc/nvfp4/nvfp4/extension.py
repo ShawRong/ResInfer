@@ -17,6 +17,36 @@ import torch
 _LOADED = False
 _WARNED = False
 
+
+def _warn_if_stale(so_path: str) -> None:
+    'Warn when the built extension is OLDER than the C++ it was built from.'
+    import os
+    from pathlib import Path
+
+    try:
+        src = Path(so_path).resolve().parent.parent / "src"
+        if not src.is_dir():
+            return
+        so_mtime = os.path.getmtime(so_path)
+        newest, newest_f = 0.0, None
+        for f in src.rglob("*"):
+            if f.suffix in (".cu", ".cuh", ".cpp", ".h") :
+                m = os.path.getmtime(f)
+                if m > newest:
+                    newest, newest_f = m, f
+        if newest > so_mtime:
+            warnings.warn(
+                f"nvfp4._C at {so_path} is OLDER than its C++ sources "
+                f"(newest: {newest_f}). The stale binary still exports its "
+                f"old ops, so hasattr fallbacks will NOT catch this -- "
+                f"results can be silently wrong. Rebuild: "
+                f"pip install -e csrc/nvfp4 (or setup.py build_ext --inplace).",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+    except OSError:
+        pass
+
 _MISSING_MSG = (
     "nvfp4 extension (nvfp4._C) not found or unloadable. Build it with "
     "`csrc/nvfp4/build.sh` if you need the fold / quant / GEMM ops. "
@@ -40,6 +70,7 @@ def ensure_loaded(required: bool = True) -> bool:
     if spec is None or spec.origin is None:
         err = ImportError(_MISSING_MSG)
     else:
+        _warn_if_stale(spec.origin)
         try:
             torch.ops.load_library(spec.origin)
             _LOADED = True
