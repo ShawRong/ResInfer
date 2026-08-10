@@ -25,6 +25,22 @@ max_num_seqs: 8
 reference: bf16
 baseline: plain
 
+# Without this the suite prints scores and venue conditioning and NO paired
+# comparison -- the thing the table exists to produce -- and nothing says the
+# comparisons were never declared. Same failure family as a scores table
+# printed without its conditioning gate: an absence that reads as a result.
+#
+# The last pair is the one the paper turns on. `anchor` and `uniform_r0125`
+# cost the SAME 4.4998 bits (parameter-weighted, metadata-less layers at ratio
+# 0), so this is like-for-like: does spending that budget where the solver
+# says beat spreading it evenly?
+#
+# Kept on ONE line deliberately. A folded block scalar (`>-`) parses under
+# PyYAML and not under this kit's no-dependency fallback -- the exact
+# machine-dependent split already closed once in this directory, and the kit's
+# premise is that it installs nothing on the machine it was written for.
+compare: uniform_r0125 vs uniform_r0125_off; uniform_r025 vs uniform_r025_off; anchor vs anchor_off; uniform_r0125 vs plain; anchor vs uniform_r0125
+
 # Runs before any arm and blocks the suite. Two DIFFERENT checkpoints, because
 # a same-checkpoint gate cannot see queue contamination.
 gate:
