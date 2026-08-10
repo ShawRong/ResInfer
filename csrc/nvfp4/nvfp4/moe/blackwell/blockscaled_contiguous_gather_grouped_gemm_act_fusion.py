@@ -1708,6 +1708,13 @@ class BlockScaledContiguousGatherGroupedGemmKernel:
                 # For A matrix: each thread loads 8 token offsets (for 8 LDGSTS.128 operations)
                 # For SFA matrix: each thread loads 1 token offset (for 4 LDGSTS.32 operations)
                 gToken_ml_tile = gToken_ml[(None, tile_info[0])]
+                # Predefine: a name whose FIRST binding sits in the else of a
+                # const_expr if trips TYPE_UNSTABLE_JOIN (None vs Int32) when
+                # the flag is False -- the untaken then-side still reaches the
+                # join analysis. residue=True never sees this, which is why
+                # the graft compiled for months while extended_k (the first
+                # residue=False caller) died at trace time.
+                token_ml_tile_offset = cutlass.Int32(0)
                 if cutlass.const_expr(self.residue):
                     
                     

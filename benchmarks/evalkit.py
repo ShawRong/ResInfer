@@ -213,6 +213,26 @@ def install_env(a):
         a.model = str(pathlib.Path(a.model).resolve())
     if a.bf16:
         a.plain = True
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if not a.plain:
         os.environ["RESIDUE_PATCH_VLLM"] = "1"
         os.environ["RESIDUE_VLLM_MODEL_DIR"] = a.model
@@ -264,17 +284,6 @@ def install_env(a):
         os.environ["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
         os.environ["RESIDUE_FORCE_DECODE_MEXT"] = "0"
         os.environ["RESIDUE_DECODE_MEXT_MAX_M"] = str(getattr(a, "mext_max_m", 64))
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
         # Cubins force modelopt_fp4 onto the trtllm-gen path, which bypasses or
         # breaks the residue patch (two observed failure modes). They belong to
         # non-residue trtllm A/B arms only. Drop them rather than trust the
@@ -317,7 +326,20 @@ def install_env(a):
     
     
     
-    if os.environ.get("RESIDUE_EVALKIT_ALLOW_CACHE", "0") != "1":
+    if os.environ.get("RESIDUE_EVALKIT_ALLOW_CACHE", "0") == "1":
+        
+        
+        
+        
+        
+        
+        
+        print("[kit] " + "!" * 62, flush=True)
+        print("[kit] !! RESIDUE_EVALKIT_ALLOW_CACHE=1 -- torch.compile cache is ON.")
+        print("[kit] !! NUMBERS FROM THIS RUN ARE NOT PUBLISHABLE. An arm's score")
+        print("[kit] !! depends on what ran before it in the queue.")
+        print("[kit] " + "!" * 62, flush=True)
+    else:
         os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
     os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
     # Record the execution contract in the run's own output. Two runs that
@@ -421,7 +443,12 @@ def cmd_analyze(a) -> int:
         print(f"no results under {d}")
         return 1
     tasks = sorted(tasks)
-    order = [x for x in (a.order or "").split(",") if x in arms] or sorted(arms)
+    # Leftovers are APPENDED, not dropped. A stale --order silently hiding an
+    # arm that ran is the same failure as a silently absent one: the table
+    # looks complete. cmd_analyze_ppl already did this correctly.
+    _req = [x.strip() for x in (a.order or "").split(",") if x.strip()]
+    order = ([x for x in _req if x in arms]
+             + [x for x in sorted(arms) if x not in _req]) or sorted(arms)
 
     print(f"\n=== scores ({d}) ===")
     print(f"{'subset':<22}" + "".join(f"{x:>14}" for x in order))
@@ -562,7 +589,7 @@ def cmd_analyze(a) -> int:
         # -- the opposite of what the data said. Mark the gated ones instead;
         # a marked number the reader must discount beats an absent one they
         # cannot see at all.
-        zs, zs_all = [], []
+        zs, zs_all, never = [], [], []
         for t in tasks:
             A, B = arms[x].get(t), arms[y].get(t)
             if not A or not B:
@@ -571,15 +598,33 @@ def cmd_analyze(a) -> int:
             diffs = [A[i]["score"] - B[i]["score"] for i in range(n)]
             m, se = sum(diffs) / n, bootstrap_se(diffs)
             z = m / se if se > 0 else 0.0
-            gated = bool(gate) and gate.get(t, 99) <= 3
+            # Three states, not two. A subset with no gate entry was never
+            # conditioned at all -- typically because the reference or the
+            # floor arm has no data for it -- and the old default of 99 scored
+            # that as "comfortably passed", folding an unmeasured subset into
+            # the headline combined z. Absent is not passed.
+            if not gate:
+                gated = unconditioned = False
+            elif t not in gate:
+                gated = unconditioned = True
+                never.append(t)
+            else:
+                gated, unconditioned = gate[t] <= 3, False
             zs_all.append(z)
             if not gated:
                 zs.append(z)
             print(f"{t:<22}{sum(i['score'] for i in B[:n])/n:>12.4f}"
                   f"{sum(i['score'] for i in A[:n])/n:>12.4f}{m*100:>+10.2f}pp"
                   f"{se*100:>8.2f}{z:>8.1f}"
-                  f"{'  [gated]' if gated else ''}")
+                  f"{'  [never conditioned]' if unconditioned else ('  [gated]' if gated else '')}")
         import math
+        if never:
+            print(f"  {len(never)} subset(s) were NEVER conditioned and are "
+                  f"excluded from both totals: {', '.join(never)}.")
+            print(f"  Their venue was not shown to resolve quantisation damage,"
+                  f" so a difference")
+            print(f"  on them is not evidence either way. Run the reference and"
+                  f" floor arms on them.")
         if zs:
             print(f"{'combined z (conditioned subsets)':<34}"
                   f"{sum(zs)/math.sqrt(len(zs)):>+32.2f}")
@@ -817,6 +862,7 @@ def cmd_task(a) -> int:
             raise SystemExit(f"unknown task {x!r}; known: {sorted(DOWNSTREAM)}")
 
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
+    a._venue = "task"
     ekw = pinned_engine_kwargs(a, a.max_model_len)
     write_provenance(a, a.out, ekw, {"venue": "downstream", "tasks": todo})
     llm = LLM(model=a.model, trust_remote_code=True, dtype="bfloat16",
@@ -890,7 +936,17 @@ def pinned_engine_kwargs(a, max_model_len: int) -> dict:
     
     
     
-    mnbt = getattr(a, "max_num_batched_tokens", None) or max_model_len
+    
+    
+    
+    
+    
+    
+    
+    
+    _short = getattr(a, "cmd", None) == "task" or getattr(a, "_venue", "") == "task"
+    mnbt = (getattr(a, "max_num_batched_tokens", None)
+            or (2048 if _short else max_model_len))
     return dict(
         enforce_eager=bool(getattr(a, "enforce_eager", False)),   # 1
         max_num_batched_tokens=int(mnbt),                         # 2
@@ -1252,12 +1308,37 @@ def cmd_suite(a) -> int:
         g = man.get("gate") or {}
         ma = g.get("model_a") or arms[0]["id"]
         mb = g.get("model_b") or next((x["id"] for x in arms if x["id"] != ma), None)
-        pa = next(x["path"] for x in arms if x["id"] == ma)
+        pa = next((x["path"] for x in arms if x["id"] == ma), None)
         pb = next((x["path"] for x in arms if x["id"] == mb), None) if mb else None
+        # Bare next() raised StopIteration here, which surfaces as an opaque
+        # crash rather than a diagnosis -- and it fires exactly when
+        # --skip-missing has dropped the gate's own checkpoint, i.e. when the
+        # user most needs to be told which arm went missing.
+        if pa is None:
+            print(f"[kit] SUITE ABORT -- gate model_a '{ma}' is not among the "
+                  f"arms that will run.")
+            return 2
+        if pb is None:
+            # Silently falling back to A-A would still print SELFTEST PASS,
+            # and that PASS cannot see queue contamination at all -- the one
+            # thing the gate exists for. Refuse instead of weakening.
+            print(f"[kit] SUITE ABORT -- the gate needs a SECOND checkpoint "
+                  f"(gate.model_b); '{mb}' is absent.")
+            print(f"[kit] Without it this degrades to an A-A repeat, which "
+                  f"cannot see queue contamination and would still print PASS.")
+            return 2
         gargv = ["selftest", "--model", str(root / pa), "--data-dir", a.data_dir,
                  "--out", str(out / "_gate"), "--task", g.get("task", "2wikimqa"),
                  "--limit", str(g.get("limit", 100)),
-                 "--gpu-mem-util", str(a.gpu_mem_util)]
+                 "--gpu-mem-util", str(a.gpu_mem_util),
+                 # The gate must certify the configuration the TABLE runs. With
+                 # the manifest's engine knobs left off, it certified evalkit's
+                 # defaults instead -- a different compile range, hence a
+                 # different execution path, hence a PASS about something else.
+                 "--max-model-len", str(man.get("max_model_len", 32768)),
+                 "--max-num-seqs", str(man.get("max_num_seqs", 8))]
+        if man.get("max_num_batched_tokens"):
+            gargv += ["--max-num-batched-tokens", str(man["max_num_batched_tokens"])]
         if pb:
             gargv += ["--model-b", str(root / pb)]
         if a.repo:
