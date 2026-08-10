@@ -1,6 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'Free local smoke: prove the `vllm.general_plugins` plugin (mechanism b)'
+"""Free local smoke: prove the `vllm.general_plugins` plugin (mechanism b)
+delivers the residue patch into vLLM's spawned V1 EngineCore *subprocess*.
+
+We deliberately do NOT patch in the main process — the plugin
+(`residue_vllm_plugin`, installed as an entry point) is the only thing that can
+install the patch in the worker. With default multiprocessing on
+(`VLLM_ENABLE_V1_MULTIPROCESSING` unset ⇒ 1), EngineCore runs in a subprocess;
+if `[residue:plugin] applied in pid=<X>` prints with a `(EngineCore pid=<X>)`
+prefix (X ≠ main pid), the plugin fired inside the worker — exactly the
+propagation that sitecustomize/.pth failed to achieve on Modal.
+
+A small bf16 model is enough: we only need the patch to reach the worker, not to
+exercise the NVFP4 fold kernel (that is the B200/30B run). Point at any complete
+local checkpoint:
+
+    RESIDUE_TEST_MODEL=/path/to/model \
+      .venv/bin/python tools/vllm_patch/verify_plugin_in_worker.py
+
+Prereq: `pip install tools/vllm_patch/residue_vllm_plugin` so the entry point
+is discoverable, and the repo root on PYTHONPATH so the worker can import
+`quant`. (The docstring once pointed at this file's pre-move home in an
+internal, unshipped directory; the release sanitizer then stripped that
+path and left a bare package name that is not on PyPI.)
+"""
 import os
 
 os.environ["RESIDUE_PATCH_VLLM"] = "1"

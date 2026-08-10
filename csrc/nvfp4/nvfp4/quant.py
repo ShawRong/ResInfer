@@ -95,6 +95,10 @@ def _run_scaled_fp4_quant(
     residue_per_8: int,
     use_swapped_residue: bool,
 ) -> None:
+    # Fatal-at-call half of the soft-load contract (see line 11 / task-116):
+    # without this, a soft-failed extension surfaces as a nameless
+    # AttributeError at first dispatch inside the engine process.
+    ensure_loaded()
     try:
         torch.ops.nvfp4.scaled_fp4_quant(
             output,
@@ -173,6 +177,7 @@ def _scaled_fp4_quant_pack8_no_swap_with_mask(
         )
 
     output, output_scale = _alloc_residue_quant_outputs(input_tensor, n_ext)
+    ensure_loaded()
     getattr(torch.ops.nvfp4, op_name)(
         output,
         input_tensor,
@@ -339,6 +344,7 @@ def official_scaled_fp4_quant(input_tensor: torch.Tensor, input_scale: torch.Ten
         dtype=torch.uint8,
         device=input_tensor.device,
     )
+    ensure_loaded()
     torch.ops.nvfp4.official_scaled_fp4_quant_pack8(
         output,
         input_tensor,

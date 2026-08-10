@@ -958,6 +958,32 @@ def cmd_selftest(a) -> int:
         print("[kit] WARNING: no --model-b, so B is the same checkpoint as A. "
               "The gate still tests queue position, but a different checkpoint "
               "is the stronger perturbation. Pass one.", flush=True)
+    # B must be the same ARCHITECTURE as A, and that is not a detail -- it is
+    # the difference between a gate and a formality. The cache is keyed on the
+    # shape of the compute graph, so two checkpoints of different shape get
+    # different keys, never collide, and the gate passes trivially while
+    # proving nothing. Different WEIGHTS, same SHAPE is the pair that shares a
+    # cache entry, and sharing one is the whole phenomenon being tested.
+    #
+    # Checked rather than documented, because a gate that can pass for the
+    # wrong reason is worse than no gate: it produces a PASS line that reads
+    # exactly like a real one.
+    def _shape(p):
+        try:
+            c = json.load(open(pathlib.Path(p) / "config.json"))
+        except Exception:
+            return None
+        return tuple(c.get(k) for k in ("hidden_size", "num_hidden_layers",
+                                        "num_attention_heads", "intermediate_size"))
+    sa, sb = _shape(a.model), _shape(model_b)
+    if sa and sb and sa != sb:
+        print("[kit] WARNING: --model and --model-b have DIFFERENT shapes")
+        print(f"[kit]   A {sa}")
+        print(f"[kit]   B {sb}")
+        print("[kit] They will not share a torch.compile cache entry, so this "
+              "gate cannot see queue contamination and a PASS below means "
+              "nothing. Use two checkpoints of the same architecture with "
+              "different weights.", flush=True)
     pool = pathlib.Path(tempfile.mkdtemp(prefix="evalkit_selftest_pool_"))
 
     def one(arm, model, phase):

@@ -41,7 +41,11 @@ def _include_dir() -> Path:
     env = os.getenv("NVFP4_CSRC_INCLUDE")
     if env:
         return Path(env)
-    return _HERE.parents[2] / "src"
+    # _HERE = csrc/nvfp4/nvfp4/moe -> parents[1] = csrc/nvfp4, whose src/
+    # holds the headers. parents[2] was a leftover from this module's old
+    # one-level-deeper home under experiment/moe_fold_grouped/ and resolved
+    # to a nonexistent csrc/src (review B1.5).
+    return _HERE.parents[1] / "src"
 
 
 def load(verbose: bool = False):

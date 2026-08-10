@@ -39,8 +39,10 @@ def _warn_if_stale(so_path: str) -> None:
                 f"nvfp4._C at {so_path} is OLDER than its C++ sources "
                 f"(newest: {newest_f}). The stale binary still exports its "
                 f"old ops, so hasattr fallbacks will NOT catch this -- "
-                f"results can be silently wrong. Rebuild: "
-                f"pip install -e csrc/nvfp4 (or setup.py build_ext --inplace).",
+                f"results can be silently wrong. Rebuild with "
+                f"csrc/nvfp4/build.sh (a bare `pip install -e csrc/nvfp4` "
+                f"fails under default PEP-517 isolation: setup.py needs "
+                f"torch at build time).",
                 RuntimeWarning,
                 stacklevel=3,
             )

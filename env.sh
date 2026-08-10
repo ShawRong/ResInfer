@@ -54,11 +54,16 @@ unset _RESINFER_GCC11 _RESINFER_GXX11 _RESINFER_GCC _RESINFER_GXX
 
 
 
+
+
+
+
+
+
 if [ -n "${CUDA_HOME:-}" ] && [ -d "$CUDA_HOME/include" ]; then
     export CPATH="$CUDA_HOME/include:${CPATH:-}"
-fi
-# NVIDIA conda packages use targets/x86_64-linux/{include,lib} layout
-if [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/targets/x86_64-linux/include" ]; then
+elif [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/targets/x86_64-linux/include" ]; then
+    # NVIDIA conda packages use targets/x86_64-linux/{include,lib} layout
     export CPATH="$CONDA_PREFIX/targets/x86_64-linux/include:${CPATH:-}"
     export LIBRARY_PATH="$CONDA_PREFIX/targets/x86_64-linux/lib/stubs:${LIBRARY_PATH:-}"
 fi

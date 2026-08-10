@@ -1,0 +1,157 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+name: speed_dense
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+kernel:
+  models: [qwen3_4b, qwen3_8b, qwen3_32b]
+  projections: [qkv, o, gate_up, down]
+  families: [mext, kext]
+
+  # 1.0 is absent on purpose: every channel salient means K-extension would
+  # duplicate the whole weight, and that case IS the mext family.
+  ratios: [0.125, 0.25, 0.5]
+
+  m_grid: [1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128,
+           160, 192, 256, 320, 384, 448, 512]
+
+  
+  
+  
+  m_max_by_arch:
+    sm100: 512
+    sm103: 512
+    sm120: 128
+
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  repeats: 5
+  process_reps: 3
+
+  # Tune the BASELINE at each M before timing it. FlashInfer's advantage IS a
+  # per-shape search; timing it cold measures it handicapped and flatters
+  # everything compared against it. The mirror of not letting our own fold run
+  # on its static fallback tactic table -- both sides warmed, both recorded.
+  autotune_baseline: true
+
+# =============================================================== e2e level
+e2e:
+  workload:
+    input_len: 1024
+    output_len: 256
+    ignore_eos: true          # fixes the token count so arms do equal work
+    request_rate: inf         # saturation; concurrency is the load knob
+    dataset: random
+
+  concurrencies: [1, 4, 16, 64]
+
+  rounds: 8
+  # Round k starts at arm k. Without rotation, anything that drifts over an
+  # evening -- GPU temperature, page cache, a neighbour waking up -- is
+  # collinear with arm order and lands on whichever arm runs last.
+  rotate_arms: true
+
+  # A COLD FlashInfer autotune is ~2.6 h per arm (benchmarks/prewarm_autotune_
+  # cache.py). Prewarm first; this ceiling covers the case where that was
+  # skipped. 2400 s was measurably not enough.
+  ready_timeout_s: 5400
+
+
+
+
+
+arms:
+  - id: bf16
+    path: base_bf16
+    role: ceiling
+  - id: plain
+    path: plain_nvfp4
+    role: floor
+  - id: b425                  # [0.037] near-zero control: SHOULD look like plain
+    path: b425
+    bits: 4.25
+  - id: b55                   # [0.269] most kext layers of any arm
+    path: b55
+    bits: 5.50
+  - id: b70                   # [0.778]
+    path: b70
+    bits: 7.00
+  # [1.000] every layer mext_r1: zero K-extension, so the weight is stored
+  # once at base width and its memory footprint should MATCH the plain arm
+  # despite carrying the largest budget here. Its cost mechanism is doubled
+  # token rows -- the fold below the arch's band, the wrapped K-loop above it.
+  - id: b80
+    path: b80
+    bits: 8.00
+
+# Conditions under which a row is not a measurement. Recorded per row so the
+# judgement is made during analysis rather than lost at collection time.
+hygiene:
+  # No other compute process on the measurement GPU. A neighbour's bursts land
+  # on whichever arm happens to be running, so the contamination is
+  # arm-correlated and undetectable afterwards.
+  require_exclusive_gpu: true
+
+  
+  
+  void_row_on_jit: true
+
+  # Locking clocks needs privileges a reproducer may not have, so clocks are
+  # recorded per round instead and thermal drift becomes a column.
+  lock_clocks: false
+
+  env:
+    
+    
+    
+    
+    
+    
+    VLLM_DISABLE_COMPILE_CACHE: "1"
+    # The tensor tap is a real op that compiles into the graph; a run with it
+    # on is measuring a different program.
+    RESIDUE_TENSOR_DUMP: "<unset>"
+
+  # NOT pinned, deliberately: max_num_batched_tokens. eval-determinism.md
+  # scopes that pin to SCORING runs; for throughput it is a real tuning knob
+  # and freezing it at the eval value understates every arm for no gain.

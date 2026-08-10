@@ -160,16 +160,12 @@ cutlass_tools_include_dir = first_existing_path(
         'include',
     ),
 )
-if cutlass_include_dir is None:
-    raise RuntimeError(
-        "Could not locate a CUTLASS include directory for nvfp4 GEMM build. "
-        "Install flashinfer with bundled CUTLASS data or set CUTLASS_INCLUDE_DIR."
-    )
-if cutlass_tools_include_dir is None:
-    raise RuntimeError(
-        "Could not locate a CUTLASS tools/util include directory for nvfp4 GEMM build. "
-        "Install flashinfer with bundled CUTLASS data or set CUTLASS_TOOLS_INCLUDE_DIR."
-    )
+
+
+
+
+
+
 
 # Get PyTorch library path for RPATH
 torch_lib_path = os.path.join(os.path.dirname(torch.__file__), 'lib')
@@ -188,8 +184,8 @@ ext_modules = [
         sources=sources,
         include_dirs=[
             os.path.join(os.path.dirname(__file__), 'src'),
-            cutlass_include_dir,
-            cutlass_tools_include_dir,
+            *[d for d in (cutlass_include_dir, cutlass_tools_include_dir)
+              if d is not None],
         ],
         extra_compile_args=extra_compile_args,
         extra_link_args=extra_link_args,
@@ -210,6 +206,14 @@ setup(
     
     
     packages=find_packages(include=['nvfp4', 'nvfp4.*']),
+    
+    
+    
+    
+    
+    
+    package_data={'nvfp4': ['**/*.cu', '**/*.cuh']},
+    include_package_data=False,
     ext_modules=ext_modules,
     cmdclass={'build_ext': cpp_extension.BuildExtension},
     python_requires='>=3.10',

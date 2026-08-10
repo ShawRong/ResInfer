@@ -16,7 +16,17 @@ import time
 
 import torch
 
-from _common import fi_autotuned, timed_detail
+try:                          # `python -m benchmarks.bench_residue_nvfp4`
+    from benchmarks import manifest as spec_mod
+    from benchmarks._common import fi_autotuned, timed_detail
+except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
+    # Both invocations must work: the README advertises the module form, and
+    # a bare `from _common import ...` resolves only in the second, where the
+    # script's own directory lands on sys.path[0]. Under `-m` the package
+    # parent is on sys.path instead, so the bare name is not found at all --
+    # ModuleNotFoundError before anything runs.
+    import manifest as spec_mod
+    from _common import fi_autotuned, timed_detail
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
@@ -297,8 +307,18 @@ def run(args) -> None:
 
     major, minor = torch.cuda.get_device_capability(device)
     sm = f"sm{major}{minor}"
-    m_max = args.m_max or DEFAULT_M_MAX.get(sm, 128)
-    m_grid = [m for m in M_GRID if m <= m_max]
+    m_max = (args.m_max
+             or spec_mod.m_max_for(getattr(args, "manifest_doc", {}) or {}, sm)
+             or DEFAULT_M_MAX.get(sm))
+    if m_max is None:
+        raise SystemExit(
+            f"no M ceiling for {sm}: the spec does not list it and there is no "
+            f"built-in default. Pass --m-max explicitly, or add {sm} to the "
+            f"spec's kernel.m_max_by_arch -- an unsized architecture must not "
+            f"silently inherit another one's ceiling.")
+    grid = ((getattr(args, "manifest_doc", {}) or {}).get("kernel", {})
+            .get("m_grid") or M_GRID)
+    m_grid = [m for m in grid if m <= m_max]
 
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     out = pathlib.Path(args.out)
@@ -313,6 +333,8 @@ def run(args) -> None:
     prov = provenance(args.gpu, run_id)
     prov["stock_kernel_class"] = stock_name
     prov["m_grid"] = m_grid
+    prov.update(spec_mod.stamp(getattr(args, "manifest_doc", {}) or {}))
+    prov["manifest_overrides"] = getattr(args, "manifest_overrides", [])
     prov["ratios"] = list(args.ratios)
     emit(prov)
     print(f"[bench] {sm}  stock={stock_name}  M<= {m_max}  "
@@ -348,17 +370,33 @@ def run(args) -> None:
                 base_layer.input_global_scale_inv = x_gs
                 stock_fn = lambda *_: stock_kernel.apply_weights(  # noqa: E731
                     base_layer, x)
-                # Give the baseline its tuned tactic before timing it.
-                # FlashInfer's whole advantage is a per-shape search, so a cold
-                # cache does not measure FlashInfer -- it measures FlashInfer
-                # handicapped, and every residue number would inherit the
-                # flattery. This is the mirror of not letting our own fold run
-                # on the static fallback table: both sides get warmed, and both
-                # facts are recorded.
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                
+                untuned = timed_detail(stock_fn, (x, base_layer.weight),
+                                       repeats=max(2, args.repeats // 2))
                 if args.autotune:
                     fi_autotuned(stock_fn, (x, base_layer.weight), m_bucket=m)
                 stock = timed_detail(stock_fn, (x, base_layer.weight),
                                      repeats=args.repeats)
+                tune_gain = (untuned["us"] / stock["us"]) if stock["us"] else None
                 y_stock = stock_kernel.apply_weights(base_layer, x)
                 emit({"kind": "measure", "run_id": run_id, "family": "stock",
                       "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
@@ -366,6 +404,13 @@ def run(args) -> None:
                       # Context, not a gate: ~0.94 for every arm including
                       # this one, because it is NVFP4's quantisation error
                       # rather than anything about the kernel.
+                      "stock_untuned_us": untuned["us"],
+                      # >1 means tuning helped, so it demonstrably ran. ~1.0
+                      # with --autotune on is the alarm: either the shape was
+                      # already tuned, or the tuner silently did nothing and
+                      # every ratio in this row flatters the residue path.
+                      "autotune_gain": tune_gain,
+                      "autotune_requested": bool(args.autotune),
                       "cos_vs_bf16": cosine(ref, y_stock),
                       "rel_mae_vs_bf16": rel_mae(ref, y_stock),
  **stock})
@@ -480,6 +525,11 @@ def _compiled_delta(before: dict, after: dict) -> int:
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--manifest", default=None,
+                   help="benchmark spec YAML (default: the one shipped in "
+                        "benchmarks/specs/). Values it sets become the "
+                        "defaults; an explicit flag still wins, and the "
+                        "override is recorded in provenance.")
     p.add_argument("--gpu", type=int, default=0)
     p.add_argument("--models", default="qwen3_4b,qwen3_8b,qwen3_32b",
                    help=f"comma-separated: {', '.join(SHAPES)}")
@@ -505,6 +555,20 @@ def main() -> None:
     p.set_defaults(autotune=True)
     p.add_argument("--out", default="residue_kernel_bench.jsonl")
     a = p.parse_args()
+
+    # Spec supplies defaults; an explicit flag still wins. Which values came
+    # from where is recorded, so a run that deviated from its spec says so
+    # rather than looking like a spec-conformant run.
+    a.manifest_doc = spec_mod.load(a.manifest)
+    a.manifest_overrides = []
+    k = a.manifest_doc.get("kernel", {})
+    for flag, key, conv in (("models", "models", lambda v: ",".join(v)),
+                            ("ratios", "ratios", lambda v: ",".join(map(str, v))),
+                            ("repeats", "repeats", int)):
+        if key in k and f"--{flag.replace('_', '-')}" not in sys.argv:
+            setattr(a, flag, conv(k[key]))
+        elif key in k:
+            a.manifest_overrides.append(flag)
     a.models = [m.strip() for m in a.models.split(",") if m.strip()]
     a.ratios = [float(r) for r in a.ratios.split(",") if r.strip()]
     for r in a.ratios:

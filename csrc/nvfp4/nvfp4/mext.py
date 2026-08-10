@@ -143,6 +143,13 @@ def scaled_fp4_quant_mext_r1(
         device=input_tensor.device,
     )
 
+    # The module-level load above is SOFT (required=False): a missing or
+    # ABI-broken extension imports fine and dies here, at first dispatch,
+    # with an AttributeError on the op namespace that names neither the
+    # cause nor the fix -- exactly the failure task-116 hit inside a vLLM
+    # engine process. This call delivers the fatal-at-call half of that
+    # contract: no-op once loaded, actionable ImportError when not.
+    ensure_loaded()
     # output_m is intentionally not passed: the C++ op derives it from
     # input_tensor.size(0). Passing it as an int op-arg made torch.compile
     # specialize it to a constant while output stayed symbolic in M.

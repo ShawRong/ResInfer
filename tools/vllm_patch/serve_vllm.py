@@ -201,7 +201,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--residue_patch_mode",
         type=str,
-        choices=("legacy", "mext_r1"),
+        choices=("v2", "mext_r1"),
         default=None,
         help="Optional RESIDUE_PATCH_MODE override for patched vLLM workers.",
     )
@@ -334,8 +334,15 @@ def main() -> None:
         os.environ["RESIDUE_VLLM_MODEL_DIR"] = model_path
         if args.residue_patch_mode is not None:
             os.environ["RESIDUE_PATCH_MODE"] = args.residue_patch_mode
-        else:
-            os.environ.pop("RESIDUE_PATCH_MODE", None)
+        elif os.environ.get("RESIDUE_PATCH_MODE"):
+            # This used to silently POP the inherited value -- a user who
+            # exported RESIDUE_PATCH_MODE and omitted the flag got default
+            # behavior with no hint their setting was discarded (B1.4).
+            print(
+                "[serve_vllm] inheriting RESIDUE_PATCH_MODE="
+                f"{os.environ['RESIDUE_PATCH_MODE']!r} from the environment",
+                flush=True,
+            )
         if args.enable_decode_mext:
             os.environ["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
         if args.share_autotune_cache:

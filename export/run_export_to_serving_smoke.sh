@@ -126,7 +126,6 @@ export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
   --quantization residue_nvfp4 \
   --residue_patch_mode mext_r1 \
   --enable_decode_mext \
-  --enable_mext_clean_vec_store \
   --max_model_len "$MAX_MODEL_LEN" \
   --max_num_batched_tokens "$MAX_NUM_BATCHED_TOKENS" \
   --host "$HOST" \

@@ -28,8 +28,6 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_PATCH_MODE": ("enum", {"v2", "mext_r1"},
                            "patch flavor; mext_r1 also name-forces "
                            "metadata-less projections to runtime mext_r1"),
-    "RESIDUE_VLLM_PATCH_VERSION": ("enum", {"v2", "mext_r1"},
-                                   "legacy alias of RESIDUE_PATCH_MODE"),
     "RESIDUE_SWAP": ("one", None, "swapped-residue layout; must match export"),
     "RESIDUE_MEXT_PROJ_NAMES": ("free", None,
                                 "csv name fragments the mext_r1 name-forcing "
@@ -226,7 +224,7 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
             "the decode band use RESIDUE_PREFILL_RESIDUE_OFF=1 with "
             "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M=<fold band>.")
 
-    mode = val("RESIDUE_PATCH_MODE") or val("RESIDUE_VLLM_PATCH_VERSION")
+    mode = val("RESIDUE_PATCH_MODE")
 
     if has_metadata and mode == "mext_r1":
         

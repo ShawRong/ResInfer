@@ -41,25 +41,37 @@ def _choose_linear_method_cls(version: str = "auto"):
     is always V2.
     """
     if version == "auto":
-        patch_mode = os.environ.get(RESIDUE_PATCH_MODE_ENV, "legacy")
+        patch_mode = os.environ.get(RESIDUE_PATCH_MODE_ENV, "v2")
         patch_mode = patch_mode.strip().lower().replace("-", "_")
-        if patch_mode in {"mext_r1", "mext"}:
-            version = "mext_r1"
-        elif patch_mode in {"", "legacy", "default"}:
-            version = os.environ.get("RESIDUE_VLLM_PATCH_VERSION", "v2")
+        if patch_mode in {"", "v2", "mext_r1"}:
+            version = patch_mode or "v2"
         else:
+            
+            
+            
+            
+            
+            
+            
+            
             raise ValueError(
-                f"Unknown {RESIDUE_PATCH_MODE_ENV}={patch_mode!r}. "
-                "Expected one of: legacy, mext_r1."
+                f"Unknown {RESIDUE_PATCH_MODE_ENV}={patch_mode!r}. Valid: "
+                "'v2' (default -- metadata-driven; metadata-less layers "
+                "stay plain) or 'mext_r1' (additionally name-force "
+                "metadata-less projections onto the runtime M-extension "
+                "path)."
             )
 
-    if version not in {"mext_r1", "mext", "auto", "legacy", "default", "v2"}:
-        raise ValueError(f"Unknown residue vLLM patch version: {version}")
+    if version not in {"v2", "mext_r1"}:
+        raise ValueError(
+            f"Unknown residue vLLM patch version: {version!r}. "
+            "Valid: 'v2', 'mext_r1'."
+        )
 
     from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel  # noqa: F401
     from .linear_method_v2 import ResidueNvFp4LinearMethodV2
 
-    tag = "mext_r1" if version in {"mext_r1", "mext"} else "v2"
+    tag = "mext_r1" if version == "mext_r1" else "v2"
     return ResidueNvFp4LinearMethodV2, tag
 
 
