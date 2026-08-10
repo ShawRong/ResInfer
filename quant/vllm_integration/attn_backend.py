@@ -917,10 +917,23 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         self._pool: NvFp4PagedKVPool | None = None
         self._pool_key: tuple | None = None
 
-        
-        
-        
-        self._decode_reduction_workspace: tuple[torch.Tensor, ...] | None = None
+        # Split-K partials for the `kernel` / `gmem_fused` reductions. Keeping
+        # them on the implementation makes the pointer stable across layers and
+        # steps and avoids allocator work in the attention hot path.
+        #
+        # Keyed by (reduction, splits, batch), and a dict rather than one slot
+        # ON PURPOSE. vLLM captures a full graph PER decode batch size (the
+        # default list is [1,2,4] + range(8,256,8) + ...), and a captured graph
+        # records the addresses it saw. A single slot would hand batch 1 its
+        # buffer, then drop that reference when batch 8 is captured -- leaving
+        # graph 1 replaying into memory whose lifetime nothing guarantees, in
+        # a pool later captures allocate from. Every captured configuration
+        # must therefore keep its own tensor alive for as long as the impl.
+        # Unreachable today only because the planner never selects `kernel`;
+        # it becomes live the moment that default changes.
+        self._decode_reduction_workspaces: dict[
+            tuple[str, int, int], tuple[torch.Tensor, ...]
+        ] = {}
 
         # Claim the context workspace NOW, while impls are being constructed --
         # that is before determine_available_memory() sizes the KV cache, so
@@ -951,22 +964,14 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         effective_heads = self.num_kv_heads * host._padded_group_size(
             self.num_heads, self.num_kv_heads
         )
-        wanted = [
-            (splits, batch, 1, effective_heads, self.head_size),
-            (splits, batch, 1, effective_heads),
-            (splits, batch, 1, effective_heads),
-        ]
-        if reduction == "gmem_fused":
-            wanted.append((batch * effective_heads,))
-        elif reduction != "kernel":
+        if reduction not in ("kernel", "gmem_fused"):
             raise ValueError(f"unsupported persistent reduction: {reduction}")
-        workspace = self._decode_reduction_workspace
-        if (
-            workspace is None
-            or len(workspace) != len(wanted)
-            or any(tuple(t.shape) != shape for t, shape in zip(workspace, wanted))
-            or any(t.device != device for t in workspace)
-        ):
+        # (reduction, splits, batch) plus the impl-fixed head/dim above are the
+        # complete shape determinants, so a key hit is a shape match; the host
+        # entry validates the tensors it receives anyway.
+        key = (reduction, splits, batch, str(device))
+        workspace = self._decode_reduction_workspaces.get(key)
+        if workspace is None:
             allocator = (
                 host.allocate_qmul4_gmem_reduction_workspace
                 if reduction == "gmem_fused"
@@ -975,7 +980,7 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             workspace = allocator(
                 splits, batch, effective_heads, self.head_size, device
             )
-            self._decode_reduction_workspace = workspace
+            self._decode_reduction_workspaces[key] = workspace
         return workspace
 
     # -------------------------------------------------------------- forward

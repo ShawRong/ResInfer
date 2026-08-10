@@ -13,6 +13,38 @@ from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutedsl_moe import 
 import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 
 
+def deterministic_moe_reduce(
+    pair_out: torch.Tensor,
+    p2e: torch.Tensor,
+    topk_weights: torch.Tensor,
+    num_tokens: int,
+    topk: int,
+) -> torch.Tensor:
+    """Fixed-order router-weighted reduction for the deterministic path.
+
+    `pair_out[j]` holds the base+residue sum of pair-slot j (two commutative
+    atomic adds into a zeroed row -- bitwise order-invariant). `p2e[j]` is
+    the token-space id `token*topk + choice` for slot j, or an out-of-range
+    value for padding slots. A stable argsort turns the slot order into flat
+    (token, choice) order, so the topk reduction below runs in the SAME
+    order every step -- no atomics anywhere on this path.
+
+    Pure torch on purpose: unit-testable on CPU, and its determinism is a
+    property of the ops (sort + fixed-shape sum), not of scheduling.
+    """
+    ids = p2e.long()
+    valid = (ids >= 0) & (ids < num_tokens * topk)
+    ids_v = ids[valid]
+    rows_v = pair_out[valid]
+    order = torch.argsort(ids_v, stable=True)
+    # every (token, choice) is routed exactly once, so the sorted ids are
+    # exactly arange(num_tokens * topk) -- anything else means the tables
+    # and the routing disagree, and the result would be silently wrong
+    rows_sorted = rows_v[order].view(num_tokens, topk, -1)
+    w = topk_weights.float().reshape(num_tokens, topk, 1)
+    return (rows_sorted.float() * w).sum(dim=1)
+
+
 class ResidueCuteDSLExperts(FlashInferCuteDSLExperts):
     """MExt-R1 base+residue on the grafted CuTeDSL MoE kernels."""
 
@@ -132,10 +164,35 @@ class ResidueCuteDSLExperts(FlashInferCuteDSLExperts):
            cluster_shape_mn=(1, 1), vectorized_f32=True,
            c_dtype="float4_e2m1fn", residue=True)
 
-        # 6. Grafted finalize GEMM2 (residue=True reads the token-space
-        # table at row//2): both rows of a pair share (token, choice), so
-        # its atomic adds merge base+residue; router weight folded in the
-        # meta warp. Output must be pre-zeroed (accumulation target).
+        # 6. Finalize. Two paths:
+        #    fused (default): g2's atomic scatter-add merges base+residue
+        #      and applies router weights in the meta warp -- fastest, but
+        #      NOT run-to-run deterministic (add order follows CTA
+        #      scheduling; stock cutedsl shares this).
+        #    deterministic (RESIDUE_MOE_DETERMINISTIC_FINALIZE=1, eval
+        #      runs): same g2 kernel fed an IDENTITY token table, so each
+        #      pair's two adds land in a private zeroed row (two
+        #      commutative adds -> bitwise order-invariant), then the
+        #      router-weighted topk reduction runs in fixed order in torch
+        #      (deterministic_moe_reduce). Costs one (n_pairs, K) buffer
+        #      and a sort -- an eval knob, not a production default.
+        import os as _os
+        if _os.environ.get("RESIDUE_MOE_DETERMINISTIC_FINALIZE", "0") == "1":
+            n_pairs = p2e.numel()
+            pair_out = torch.zeros((n_pairs, K), dtype=output.dtype,
+                                   device=hidden_states.device)
+            ident = torch.arange(n_pairs, dtype=torch.int32,
+                                 device=hidden_states.device)
+            unit_w = torch.ones(n_pairs, dtype=torch.float32,
+                                device=hidden_states.device)
+            g2(g1_out, w2, g1_sfc, self.w2_scale, self.g2_alphas,
+               tiles, n_tiles, mn_lim, ident, unit_w,
+               out=pair_out, mma_tiler_mn=(128, 128),
+               cluster_shape_mn=(1, 1), residue=True)
+            output.copy_(deterministic_moe_reduce(
+                pair_out, p2e, topk_weights, M, self.topk).to(output.dtype))
+            return
+
         output.zero_()
         g2(g1_out, w2, g1_sfc, self.w2_scale, self.g2_alphas,
            tiles, n_tiles, mn_lim, p2e, topk_weights.float(),

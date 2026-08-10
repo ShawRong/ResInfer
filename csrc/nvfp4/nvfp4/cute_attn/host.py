@@ -127,7 +127,19 @@ def _auto_splits_qmul4(
     splits = min(wave_splits, useful_splits, 16)
     if splits not in (1, 2, 4, 8, 16):
         splits = 1 << (splits.bit_length() - 1)
-    return (1, "none") if splits == 1 else (splits, "atomic")
+    if splits == 1:
+        return 1, "none"
+    return splits, _split_reduction(splits)
+
+
+def _split_reduction(splits: int) -> str:
+    'Which reduction merges the split-K partials. `RESIDUE_ATTN_REDUCTION`.'
+    mode = os.environ.get("RESIDUE_ATTN_REDUCTION", "legacy")
+    if mode == "deterministic":
+        return "kernel"
+    if mode == "auto":
+        return "atomic" if splits in (2, 4, 8) else "kernel"
+    return "atomic"
 
 
 def plan_qmul4_decode(

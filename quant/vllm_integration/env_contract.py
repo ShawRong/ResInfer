@@ -44,6 +44,14 @@ KNOWN: dict[str, tuple] = {
                          "it puts the slot count in the fold compile key, so "
                          "it JIT-compiles per capture size; selecting it "
                          "prints a warning"),
+    "RESIDUE_MOE_DETERMINISTIC_FINALIZE": (
+        "one", None,
+        "MoE finalize that repeats bit-for-bit: each base+residue pair "
+        "atomically adds into its own zero row (two addends, and float "
+        "addition IS commutative -- it is associativity that costs "
+        "reproducibility), then torch sorts by token id and sums a fixed "
+        "shape. For eval arms whose numbers get compared; costs an "
+        "(n_pairs, K) buffer and a sort, so it is off by default"),
     "RESIDUE_LINEAR_OFF": ("one", None,
                            "leave ALL LinearBase layers on stock vLLM "
                            "(auto kernel); install only the MoE hook -- "
