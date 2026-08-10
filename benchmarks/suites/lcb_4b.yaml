@@ -1,0 +1,57 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+name: lcb_4b
+venue: lcb
+
+task: "lighteval|lcb:codegeneration_release_v6|0"
+n_prompts: 1055
+metric: pass@1:16
+temperature: 0.6          # Qwen3 defaults; identical across every arm
+top_p: 0.95
+top_k: 20
+max_new_tokens: 32768
+max_model_len: 40960
+seed: 42
+# Run-scoped, always. A cache hit REPLAYS an older run's generations: both
+# stages start, zero tokens generate, and the case "finishes" in minutes with
+# nothing in the json to say so. The key sees only an HTTP endpoint, so arms
+# differing purely in server-side RESIDUE_* env collide.
+cache_dir: per-run
+
+reference: bf16
+baseline: plain
+
+arms:
+  - id: bf16
+    path: base_bf16
+    kind: fp16
+  - id: plain
+    path: uniform_r0125
+    kind: residue
+    mext: "off"
+  - id: uniform_r0125
+    path: uniform_r0125
+    kind: residue
+    mext: "on"
+  - id: uniform_r025
+    path: uniform_r025
+    kind: residue
+    mext: "on"
+  - id: anchor
+    path: anchor
+    kind: residue
+    mext: "on"

@@ -62,6 +62,54 @@ def _debug(msg: str) -> None:
 _MOE_WRITABLE_IMPLS = {"off": 0.0, "mext_r1": 1.0}
 
 
+def moe_expert_group_key(name: str) -> tuple[str, str] | None:
+    """"<prefix>.experts.<idx>.<proj>" -> (prefix, proj), else None.
+
+    Matches the HF MoE convention (Qwen3-MoE, Mixtral, ...): every expert
+    of one layer lives under `<block>.experts.<int>.` and the projection
+    name after the index identifies the role (gate/up/down). Shared by the
+    pooled-salience calibration (algo.py) and the metadata writer below so
+    both sides group experts by the same rule.
+    """
+    if name.startswith("experts."):
+        prefix, rest = "", name[len("experts."):]
+    elif ".experts." in name:
+        prefix, rest = name.split(".experts.", 1)
+    else:
+        return None
+    idx, _, proj = rest.partition(".")
+    if not idx.isdigit() or not proj:
+        return None
+    return (prefix, proj)
+
+
+def derive_moe_salience_rule(
+    salient_by_name: dict[str, list[int]],
+) -> str | None:
+    """Read the salience rule off the artifact: pooled | per_expert | None.
+
+    Derived, never trusted from process state: identical indices within
+    every (block, projection) expert group is the pooled calibration's
+    signature, and it is the property consumers actually care about --
+    whether two exports' expert salient sets follow the same rule. Works
+    identically on a live calibrated model and on a restored checkpoint,
+    and cannot disagree with the emitted per-layer indices. None when the
+    metadata carries no expert salient indices (dense model, or salience
+    skipped for experts).
+    """
+    groups: dict[tuple[str, str], list[list[int]]] = {}
+    for name, indices in salient_by_name.items():
+        key = moe_expert_group_key(name)
+        if key is not None:
+            groups.setdefault(key, []).append(indices)
+    if not groups:
+        return None
+    for members in groups.values():
+        if any(m != members[0] for m in members[1:]):
+            return "per_expert"
+    return "pooled"
+
+
 def find_moe_blocks(model) -> dict[str, Any]:
     """MoE blocks = modules carrying both a router and an expert bank.
 
@@ -212,6 +260,18 @@ def collect_kernel_metadata(
 
         if layer_data:
             metadata["layers"][name] = layer_data
+
+    salience_rule = derive_moe_salience_rule({
+        name: data["salient_indices"]
+        for name, data in metadata["layers"].items()
+        if "salient_indices" in data
+    })
+    if salience_rule is not None:
+        
+        
+        
+        
+        metadata["global"]["salience_rule"] = salience_rule
 
     return metadata
 

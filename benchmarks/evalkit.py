@@ -432,6 +432,63 @@ def cmd_analyze(a) -> int:
             line += f"{sum(i['score'] for i in r)/len(r):>14.4f}" if r else f"{'-':>14}"
         print(line)
 
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    if any(i.get("n_prompt") is not None for x in order for i in arms[x].get(tasks[0], [])):
+        print(f"\n=== prompt length (median tokens) ===")
+        print(f"{'subset':<22}" + "".join(f"{x:>14}" for x in order))
+        for t in tasks:
+            line = f"{t:<22}"
+            for x in order:
+                r = arms[x].get(t)
+                if not r or r[0].get("n_prompt") is None:
+                    line += f"{'-':>14}"
+                    continue
+                line += f"{sorted(i['n_prompt'] for i in r)[len(r) // 2]:>14,}"
+            print(line)
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    if any(i.get("n_gen") is not None for x in order for i in arms[x].get(tasks[0], [])):
+        print(f"\n=== generation length (median tokens; x/ref) ===")
+        print(f"{'subset':<22}" + "".join(f"{x:>14}" for x in order))
+        for t in tasks:
+            line = f"{t:<22}"
+            rr = arms.get(a.reference, {}).get(t)
+            ref_med = (sorted(i["n_gen"] for i in rr)[len(rr) // 2]
+                       if rr and rr[0].get("n_gen") is not None else None)
+            for x in order:
+                r = arms[x].get(t)
+                if not r or r[0].get("n_gen") is None:
+                    line += f"{'-':>14}"
+                    continue
+                med = sorted(i["n_gen"] for i in r)[len(r) // 2]
+                line += (f"{med:>8,}{'':>6}" if not ref_med
+                         else f"{med:>8,}{med / ref_med:>6.2f}")
+            print(line)
+        if all(m <= 64 for m in (sorted(i["n_gen"] for i in arms[x][t])[len(arms[x][t]) // 2]
+                                 for x in order for t in tasks if arms[x].get(t))):
+            print("  Note: every median is <=64 tokens, so this venue caps "
+                  "generation and the column carries no information about how "
+                  "much an arm reasons. Read it on a decode venue (LCB, AIME).")
+
     ref, base = a.reference, a.baseline
     gate = {}
     if ref not in arms or base not in arms:
@@ -731,7 +788,12 @@ def _mc_scores(llm, tok, items, sp_cls):
                 continue
             s += v.logprob if hasattr(v, "logprob") else float(v)
             n += 1
-        tot.append((s, max(n, 1)))
+        
+        
+        
+        
+        
+        tot.append((s, max(n, 1), len(ids)))
     return spans, tot
 
 
@@ -786,6 +848,8 @@ def cmd_task(a) -> int:
                 pick_n = max(range(len(norm)), key=lambda k: norm[k])
                 use = pick_n if name in NORM_TASKS else pick
                 rows.append({"score": 1.0 if use == it["gold"] else 0.0,
+                             "n_prompt": max(tot[i][2] for i in idx),
+                             "n_gen": 0,
                              "acc": 1.0 if pick == it["gold"] else 0.0,
                              "acc_norm": 1.0 if pick_n == it["gold"] else 0.0,
                              "gold": it["gold"], "pick": use})
@@ -1011,6 +1075,72 @@ def cmd_envcheck(a) -> int:
     return 0
 
 
+# ------------------------------------------------------- venue dispatch
+# A manifest declares `venue:`, and the suite drives the matching subcommand.
+# Without this the runner covered LongBench only, so "run the official
+# evaluation" meant one of four venues plus a memory of how to invoke the rest
+# -- which is the same hand-assembly the suite exists to abolish, just moved up
+# one level. Every venue a manifest can name is one fewer thing that has to be
+# remembered correctly at 2am.
+def _argv_longbench(man, root, arm, out, a):
+    argv = ["run", "--model", str(root / arm["path"]), "--arm", arm["id"],
+            "--data-dir", a.data_dir, "--out", str(out),
+            "--max-model-len", str(man.get("max_model_len", 32768)),
+            "--max-num-seqs", str(man.get("max_num_seqs", 8)),
+            "--gpu-mem-util", str(a.gpu_mem_util),
+            "--tasks", man.get("tasks", DEFAULT_TASKS)]
+    if man.get("max_num_batched_tokens"):
+        argv += ["--max-num-batched-tokens", str(man["max_num_batched_tokens"])]
+    if man.get("limit"):
+        argv += ["--limit", str(man["limit"])]
+    return argv
+
+
+def _argv_ppl(man, root, arm, out, a):
+    return ["ppl", "--model", str(root / arm["path"]), "--arm", arm["id"],
+            "--out", str(out), "--data-dir", a.data_dir,
+            "--corpus", man.get("corpus", "wikitext2"),
+            "--seq-len", str(man.get("seq_len", 2048)),
+            "--n-windows", str(man.get("n_windows", 128)),
+            "--max-num-seqs", str(man.get("max_num_seqs", 8)),
+            "--gpu-mem-util", str(a.gpu_mem_util)]
+
+
+def _argv_task(man, root, arm, out, a):
+    argv = ["task", "--model", str(root / arm["path"]), "--arm", arm["id"],
+            "--out", str(out),
+            "--tasks", man.get("tasks", "gsm8k,arc_challenge,hellaswag,piqa,winogrande"),
+            "--max-model-len", str(man.get("max_model_len", 4096)),
+            "--max-num-seqs", str(man.get("max_num_seqs", 8)),
+            "--gpu-mem-util", str(a.gpu_mem_util)]
+    if man.get("limit"):
+        argv += ["--limit", str(man["limit"])]
+    return argv
+
+
+def _argv_external(name):
+    def f(man, root, arm, out, a):
+        raise NotImplementedError(
+            f"venue '{name}' is not driven by this kit. It needs a served model "
+            f"and lighteval, which live in envs/lighteval/. The manifest is "
+            f"still the spec -- see benchmarks/README.md -- but the driver is "
+            f"a separate program and is not built yet.")
+    return f
+
+
+VENUES = {
+    "longbench": _argv_longbench,
+    "ppl": _argv_ppl,
+    "task": _argv_task,
+    # Declarable so the arm list, decode settings and budget ladder live in one
+    # reviewable file from the start rather than being invented alongside the
+    # driver. Naming them here and refusing loudly beats omitting them, which
+    # would read as "these venues do not exist".
+    "lcb": _argv_external("lcb"),
+    "aime": _argv_external("aime"),
+}
+
+
 # ----------------------------------------------------------------- suite
 def cmd_suite(a) -> int:
     """Run the whole official table as ONE command, in one sitting.
@@ -1071,8 +1201,20 @@ def cmd_suite(a) -> int:
         return subprocess.run([sys.executable, os.path.abspath(__file__), *argv],
                               env=env or dict(os.environ)).returncode
 
-    print(f"[kit] suite '{man.get('name', a.manifest)}'  {len(arms)} arm(s)  "
-          f"-> {out}", flush=True)
+    venue = man.get("venue", "longbench")
+    if venue not in VENUES:
+        print(f"[kit] SUITE ABORT -- unknown venue '{venue}'. "
+              f"Known: {', '.join(sorted(VENUES))}")
+        return 2
+    try:
+        VENUES[venue](man, root, arms[0], out, a)
+    except NotImplementedError as e:
+        # Fail here, before env-check and before the gate: this is a property
+        # of the manifest, and it costs nothing to discover.
+        print(f"[kit] SUITE ABORT -- {e}")
+        return 2
+    print(f"[kit] suite '{man.get('name', a.manifest)}'  venue={venue}  "
+          f"{len(arms)} arm(s)  -> {out}", flush=True)
     if kit("env-check") != 0:
         print("[kit] SUITE ABORT -- environment unusable")
         return 2
@@ -1104,16 +1246,7 @@ def cmd_suite(a) -> int:
     t0 = time.time()
     failed = []
     for i, arm in enumerate(arms, 1):
-        argv = ["run", "--model", str(root / arm["path"]), "--arm", arm["id"],
-                "--data-dir", a.data_dir, "--out", str(out),
-                "--max-model-len", str(man.get("max_model_len", 32768)),
-                "--max-num-seqs", str(man.get("max_num_seqs", 8)),
-                "--gpu-mem-util", str(a.gpu_mem_util),
-                "--tasks", man.get("tasks", DEFAULT_TASKS)]
-        if man.get("max_num_batched_tokens"):
-            argv += ["--max-num-batched-tokens", str(man["max_num_batched_tokens"])]
-        if man.get("limit"):
-            argv += ["--limit", str(man["limit"])]
+        argv = VENUES[venue](man, root, arm, out, a)
         argv += list(arm.get("flags") or [])
         if a.repo:
             argv += ["--repo", a.repo]

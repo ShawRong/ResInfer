@@ -1,0 +1,97 @@
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+name: aime_4b
+venue: aime
+
+# Upstream, no shim. Swap to the avg8 shim ONLY with a measurement to justify it.
+tasks: "lighteval|aime24_avg|0,lighteval|aime25_avg|0"
+metric: avg@n:n=64
+n_problems: 60
+
+# Add g-pass@16 when the driver can carry two task sets. The reason is not a
+# second number: avg@n measures mean capability, g-pass@k at thresholds
+# 0.0..1.0 measures CONSISTENCY across samples -- and the question this venue
+# exists for, in the words of the original run script, is whether
+# "quantization destabilises the trace" as distinct from "quantization costs
+# accuracy". Only the second metric family can separate those, and the project
+# has been probing trace stability with a mean-only metric.
+stability_tasks: "lighteval|aime24_gpassk|0,lighteval|aime25_gpassk|0"
+
+temperature: 0.6          # Qwen3 defaults; identical across every arm
+top_p: 0.95
+top_k: 20
+max_new_tokens: 32768
+max_model_len: 40960
+seed: 42
+# Run-scoped, always. A cache hit REPLAYS an older run's generations: the
+# server starts, zero tokens generate, the case "finishes" in minutes, and
+# nothing in the json says so. The key sees only an HTTP endpoint, so arms
+# differing purely in server-side RESIDUE_* env collide.
+cache_dir: per-run
+
+# NOTE: `selftest` does not apply here. It asserts bit-identity, which is
+# reachable only under greedy decoding; this samples at temperature and has a
+# real sampling floor (see the table above). Do not carry the greedy
+# zero-drift result to this venue, and do not carry this venue's floor to a
+# greedy one.
+
+reference: bf16
+baseline: plain
+
+arms:
+  - id: bf16
+    path: base_bf16
+    kind: fp16
+  - id: plain
+    path: uniform_r0125
+    kind: residue
+    mext: "off"
+  - id: uniform_r0125
+    path: uniform_r0125
+    kind: residue
+    mext: "on"
+  - id: anchor
+    path: anchor
+    kind: residue
+    mext: "on"
