@@ -243,8 +243,18 @@ def save_kernel_metadata(
     block_size: int = 8,
     save_channel_masks: bool = True,
     moe_layer_impls: dict[str, str] | None = None,
+    calibration: dict | None = None,
 ) -> dict[str, Path]:
-    """Save vLLM residue kernel metadata and optional bool channel masks."""
+    """Save vLLM residue kernel metadata and optional bool channel masks.
+
+    `calibration` records what the quantizers were calibrated ON (dataset,
+    num_samples, seq_len, seed, ...). Two checkpoints that differ in nothing
+    but this are different models, and without the record the difference is
+    invisible: a results table comparing them cannot separate the algorithm
+    from the calibration, which already forced one conclusion to be
+    downgraded. Absent stays absent -- the pod inventory prints NOT RECORDED
+    for those rather than letting the gap read as fine.
+    """
     export_dir = Path(export_dir)
     export_dir.mkdir(parents=True, exist_ok=True)
     saved_files: dict[str, Path] = {}
@@ -252,6 +262,8 @@ def save_kernel_metadata(
     metadata = collect_kernel_metadata(
         model, residue_ratio, block_size=block_size,
         moe_layer_impls=moe_layer_impls)
+    if calibration:
+        metadata["calibration"] = calibration
     metadata_path = export_dir / "residue_kernel_metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     saved_files["metadata_json"] = metadata_path

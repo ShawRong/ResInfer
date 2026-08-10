@@ -149,6 +149,15 @@ class DumpCleanHFStage(Stage):
             "apply_awq_scale_fusion": bool(apply_awq_scale_fusion),
             **stats,
         }
+        # Same record and reason as residue_kernel_metadata.json's: a dump
+        # whose upstream ran calibration is calibration-dependent even when
+        # the weights look plain (AWQ scale fusion bakes it in). The pod
+        # inventory reads this key; absent prints NOT RECORDED there.
+        from .export_hf import _calibration_record
+
+        calibration = _calibration_record(ctx.get_meta("dataset_provenance"))
+        if calibration:
+            summary["calibration"] = calibration
         summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
 
         if verbose:

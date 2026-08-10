@@ -9,6 +9,14 @@ import os
 import torch
 
 _RESIDUE_TENSOR_DUMP = os.getenv("RESIDUE_TENSOR_DUMP")
+
+
+
+
+
+
+
+_TAP_MAX_M = int(os.getenv("RESIDUE_TENSOR_DUMP_MAX_M", "400"))
 _residue_tap_counter = [0]
 
 
@@ -30,7 +38,7 @@ if _RESIDUE_TENSOR_DUMP:
     @torch.library.custom_op("residue_dbg::tap", mutates_args=())
     def _residue_tap(x: torch.Tensor) -> torch.Tensor:
         # Skip warmup dummy runs so paired dumps line up on real prompts.
-        if x.dim() >= 2 and x.shape[0] <= 400:
+        if x.dim() >= 2 and x.shape[0] <= _TAP_MAX_M:
             _residue_tap_record(x)
         return x.clone()
 

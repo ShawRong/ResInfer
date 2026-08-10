@@ -19,6 +19,24 @@ from modelopt.torch.utils.logging import print_rank_0
 from .base import Stage, StageContext
 
 
+def _calibration_record(provenance) -> dict | None:
+    """DatasetProvenance -> the dict the pod inventory reads, or None.
+
+    Key names match what the inventory probe prints (dataset / num_samples /
+    seq_len / seed); the rest ride along for full reproducibility. None in,
+    None out: the ModelOpt-dataloader path records no provenance, and writing
+    a half-empty record would make 'unknown' look like 'known'.
+    """
+    if provenance is None:
+        return None
+    import dataclasses
+
+    d = (dataclasses.asdict(provenance)
+         if dataclasses.is_dataclass(provenance) else dict(provenance))
+    d["dataset"] = d.pop("dataset_ref", None)
+    return d
+
+
 class ExportHFStage(Stage):
     """
     Export model to HuggingFace format.
@@ -104,6 +122,7 @@ class ExportHFStage(Stage):
             residue_ratio,
             int(params.get("calib_block_size", params.get("block_size", 8))),
             verbose,
+            calibration=_calibration_record(ctx.get_meta("dataset_provenance")),
         )
 
         # Update context
@@ -123,6 +142,7 @@ class ExportHFStage(Stage):
         residue_ratio: float = None,
         kernel_metadata_block_size: int = 8,
         verbose: bool = False,
+        calibration: dict | None = None,
     ) -> Path:
         """Export model with HF save_pretrained and optional kernel metadata."""
         if model is None:
@@ -242,6 +262,7 @@ class ExportHFStage(Stage):
                         residue_ratio=residue_ratio,
                         block_size=kernel_metadata_block_size,
                         save_channel_masks=True,
+                        calibration=calibration,
                     )
 
                     if verbose:

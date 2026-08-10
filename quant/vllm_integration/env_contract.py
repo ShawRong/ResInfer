@@ -129,6 +129,12 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_DEBUG_TP": ("one", None, "TP debug prints"),
     "RESIDUE_DEBUG_CREATE_WEIGHTS": ("one", None, "create_weights prints"),
     "RESIDUE_TENSOR_DUMP": ("free", None, "dump linear tensors to this dir"),
+    "RESIDUE_TENSOR_DUMP_MAX_M": (
+        "int", None,
+        "tap rows above this are skipped (default 400, to skip warmup "
+        "dummies). Raise for real-length prompts: at the default a dump of "
+        "a long prompt records nothing from prefill, and 'all identical' "
+        "then means 'not measured', not 'no divergence'"),
     "RESIDUE_STACK_DUMP_SIGNAL": ("one", None,
                                   "arm SIGUSR1 all-thread stack dumps"),
     "RESIDUE_ENV_CHECK": ("enum", {"0", "1"},
