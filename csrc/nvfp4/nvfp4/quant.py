@@ -264,6 +264,67 @@ def scaled_fp4_quant_with_mask(
     return output.view(m, n_ext // 2), output_scale
 
 
+# Per-(rows, cols, device) gather indices for the swizzled->linear SF
+# permutation. A fixed shape has a fixed permutation, so precompute once and
+# pay one capture-safe `gather` per call.
+_SF_UNSWIZZLE_IDX_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _sf_unswizzle_indices(rows: int, cols: int, device) -> torch.Tensor:
+    """Gather indices: swizzled 128x4-atom SF bytes -> row-major (rows, cols/16).
+
+    Same permutation the MoE graft uses (moe_cutedsl_graft/residue_glue.py);
+    inlined here so the core quant module does not import experiment code.
+    """
+    key = (rows, cols, str(device))
+    idx = _SF_UNSWIZZLE_IDX_CACHE.get(key)
+    if idx is None:
+        m_i = torch.arange(rows, device=device).view(-1, 1)
+        ks = torch.arange(cols // 16, device=device).view(1, -1)
+        n_kt = (cols + 63) // 64
+        idx = ((m_i // 128) * (n_kt * 512) + (ks // 4) * 512
+               + (m_i % 32) * 16 + ((m_i % 128) // 32) * 4
+               + (ks % 4)).reshape(-1)
+        _SF_UNSWIZZLE_IDX_CACHE[key] = idx
+    return idx
+
+
+def scaled_fp4_quant_with_mask_linear_sf(
+    input_tensor: torch.Tensor,
+    input_scale: torch.Tensor,
+    channel_masks: torch.Tensor,
+    num_salient: int,
+    use_swapped_residue: bool = False,
+):
+    """Masked K-ext quantization emitting LINEAR (row-major) scale factors.
+
+    The CuTeDSL grouped GEMMs consume a plain (rows, n_ext/16) row-major SFA,
+    not the cutlass 128x4 swizzle the base kernel writes -- this is W3 of
+    PLAN_moe_per_layer_ratio.md (extended_k expert activations). v1 is a
+    post-quant gather (SF bytes are KB-scale; the gather is noise next to
+    the grouped GEMM); a kernel-level linear_sf flag like swiglu_quant's is
+    the follow-up optimization if it ever shows up in a profile.
+
+    Returns (codes (m, n_ext//2) uint8, sf (m, n_ext//16) uint8-viewable).
+    """
+    m, k = input_tensor.shape
+    n_ext = k + num_salient
+    if n_ext % 16 != 0:
+        raise ValueError(
+            f"n_ext={n_ext} must be a multiple of 16 for a row-major SF "
+            "view (K and ratio must keep 16 | K(1+r)).")
+    codes, sf_swizzled = scaled_fp4_quant_with_mask(
+        input_tensor,
+        input_scale,
+        channel_masks,
+        num_salient,
+        use_swapped_residue=use_swapped_residue,
+    )
+    idx = _sf_unswizzle_indices(m, n_ext, input_tensor.device)
+    sf_linear = sf_swizzled.reshape(-1)[idx].view(m, n_ext // 16)
+    return codes, sf_linear
+
+
 def official_scaled_fp4_quant(input_tensor: torch.Tensor, input_scale: torch.Tensor):
     """Standalone vLLM-style swizzled-scale NVFP4 quantization helper."""
     m, k = input_tensor.shape

@@ -12,12 +12,14 @@ from .linear_utils import load_residue_metadata_json
 
 MOE_IMPL_OFF = "off"
 MOE_IMPL_MEXT_R1 = "mext_r1"
-MOE_IMPL_EXTENDED_K = "extended_k"  # schema-reserved; no serving path yet
+MOE_IMPL_EXTENDED_K = "extended_k"
 
 _KNOWN_IMPLS = {MOE_IMPL_OFF, MOE_IMPL_MEXT_R1, MOE_IMPL_EXTENDED_K}
 
-# impl -> the ratio it IS (kernel_metadata.is_mext_r1_layer: mext_r1 is not
-# a mode competing with the ratios, it IS ratio 1.0).
+
+
+
+
 _IMPL_RATIO = {MOE_IMPL_OFF: 0.0, MOE_IMPL_MEXT_R1: 1.0}
 
 
@@ -25,6 +27,9 @@ _IMPL_RATIO = {MOE_IMPL_OFF: 0.0, MOE_IMPL_MEXT_R1: 1.0}
 class MoELayerPolicy:
     impl: str
     ratio: float
+    #: extended_k only: the ONE salient set every expert of the layer shares
+    #: (P3), for the w13/hidden-side GEMM input. None for off/mext_r1.
+    w13_salient_indices: tuple[int, ...] | None = None
 
 
 #: No-metadata default == today's behavior (all layers on, full residue).
@@ -108,13 +113,24 @@ def resolve_moe_layer_policy(
         raise ValueError(
             f"MoE policy {key!r} has unknown impl {impl!r}; "
             f"known: {sorted(_KNOWN_IMPLS)}.")
+
     if impl == MOE_IMPL_EXTENDED_K:
-        raise NotImplementedError(
-            f"MoE policy {key!r} demands impl=extended_k, which this server "
-            "cannot serve yet (PLAN_moe_per_layer_ratio.md W1-W3). Refusing "
-            "to fall back — serving stock while the export was built for "
-            "K-extension is the silent mismatch this contract exists to "
-            "prevent.")
+        # Parsed and returned; whether the runtime can SERVE it is decided
+        # at the dispatch site (residue_moe.py), which refuses loudly when
+        # the extended-K experts path is unavailable — never silently
+        # serving stock against a K-extended export.
+        indices = entry.get("w13_salient_indices")
+        if not indices:
+            raise ValueError(
+                f"MoE policy {key!r}: impl=extended_k requires a non-empty "
+                "w13_salient_indices (the layer-shared salient set).")
+        ratio = entry.get("ratio")
+        if ratio is None or not (0.0 < float(ratio) < 1.0):
+            raise ValueError(
+                f"MoE policy {key!r}: extended_k needs 0 < ratio < 1 "
+                f"(got {ratio}); ratio 1.0 IS mext_r1, 0.0 IS off.")
+        return MoELayerPolicy(impl, float(ratio),
+                              tuple(int(i) for i in indices))
 
     ratio = entry.get("ratio")
     expected = _IMPL_RATIO[impl]

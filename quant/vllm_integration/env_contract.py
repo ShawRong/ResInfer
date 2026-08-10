@@ -39,8 +39,11 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_ENABLE_MOE": ("one", None,
                            "MoE expert takeover (residue_moe.py hook)"),
     "RESIDUE_MOE_IMPL": ("enum", {"mext", "cutedsl"},
-                         "MoE experts impl: mext fold chain or the "
-                         "flashinfer-CuTeDSL graft"),
+                         "MoE experts impl; default cutedsl (the "
+                         "flashinfer-CuTeDSL graft). mext is DEPRECATED -- "
+                         "it puts the slot count in the fold compile key, so "
+                         "it JIT-compiles per capture size; selecting it "
+                         "prints a warning"),
     "RESIDUE_LINEAR_OFF": ("one", None,
                            "leave ALL LinearBase layers on stock vLLM "
                            "(auto kernel); install only the MoE hook -- "
@@ -95,9 +98,11 @@ KNOWN: dict[str, tuple] = {
                                    "force the gather_dequant oracle prefill"),
     "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
                                "capture ResAttn decode into CUDA graphs "
-                               "(1.2-2.2x decode, and makes it reproducible "
-                               "-- the default path reduces through atomics "
-                               "and measurably does not repeat)"),
+                               "(1.70-2.08x decode on sm100). PERFORMANCE "
+                               "only: ResAttn decode does not repeat bitwise "
+                               "in either mode -- split-K reduces through "
+                               "atomics and a graph fixes the launch "
+                               "sequence, not CTA scheduling"),
     "RESIDUE_ATTN_CG_CAPTURE_LEN": ("int", None,
                                     "sequence length the CUDA-graph capture "
                                     "plans against (default max_model_len); "

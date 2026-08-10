@@ -626,16 +626,35 @@ def patch_vllm_modelopt_mext_r1(model_dir: str | None = None) -> bool:
 
 
 def is_patched() -> bool:
-    """Check if patch is active.
+    """Check if the patch's DECLARED configuration is actually installed.
 
-    NOTE: This checks the actual class attribute, not the module-level _patched variable.
-    This is important because in spawn multiprocessing, _patched resets to False in
-    worker processes, but the class attribute check tells us the actual state.
+    NOTE: This checks actual class attributes, not the module-level _patched
+    variable. This is important because in spawn multiprocessing, _patched
+    resets to False in worker processes, but the class attribute check tells
+    us the actual state.
+
+    What "installed" means depends on the configuration:
+      * RESIDUE_LINEAR_OFF=1 -- the linear side is DELIBERATELY stock, so
+        checking LinearMethodCls would report failure on a correct install
+        (found the hard way: the polhalf e2e's plugin refused to serve while
+        everything it asked for was in place). There the installed state is
+        the MoE hook (when RESIDUE_ENABLE_MOE=1) and nothing else.
+      * otherwise -- the linear method class is the residue method.
     """
     try:
         from vllm.model_executor.layers.quantization.modelopt import (
             ModelOptNvFp4Config,
         )
+
+        if os.environ.get("RESIDUE_LINEAR_OFF", "0") == "1":
+            if os.environ.get("RESIDUE_ENABLE_MOE", "0") == "1":
+                moe_cls = getattr(
+                    ModelOptNvFp4Config, "FusedMoEMethodCls", None)
+                return getattr(moe_cls, "__name__", "") == (
+                    "ModelOptNvFp4FusedMoEResidue")
+            # LINEAR_OFF with no MoE hook requested: an intentional no-op
+            # install (env contract warns about it); nothing to verify.
+            return True
 
         from .linear_method_v2 import ResidueNvFp4LinearMethodV2
 

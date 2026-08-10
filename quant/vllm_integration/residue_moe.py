@@ -59,6 +59,35 @@ def moe_method_enabled() -> bool:
     return os.environ.get("RESIDUE_ENABLE_MOE", "0") == "1"
 
 
+def resize_w13_for_extended_k(layer, num_experts: int, w13_rows: int,
+                              k_ext: int, weight_loader) -> None:
+    """Re-register w13 weight+scale at the K-extended width.
+
+    The stock create_weights sizes every param from the model's hidden
+    size; an extended_k checkpoint carries w13 tensors at K_ext = K +
+    num_salient, and the loader hard-asserts param.shape == loaded.shape.
+    Only w13 changes: w2 uses hidden as its OUTPUT dim and stays base-K.
+    Mirrors the dense method's input_size override, at the FusedMoE seam.
+    """
+    import torch
+    from vllm.model_executor.parameter import ModelWeightParameter
+
+    w13 = layer.w13_weight
+    scale = layer.w13_weight_scale
+    group = w13.shape[-1] * 2 // scale.shape[-1]  # fp4 packing x2 / group
+    for name, cols, dtype in (
+            ("w13_weight", k_ext // 2, w13.dtype),
+            ("w13_weight_scale", k_ext // group, scale.dtype)):
+        param = ModelWeightParameter(
+            data=torch.empty(num_experts, w13_rows, cols, dtype=dtype,
+                             device=getattr(layer, name).data.device),
+            input_dim=1,
+            output_dim=2,
+            weight_loader=weight_loader,
+        )
+        layer.register_parameter(name, param)
+
+
 def make_residue_moe_method_cls(base_cls: type) -> type:
     """Subclass vLLM's NVFP4 MoE method; experts go to ResidueNvFp4Experts.
 
@@ -116,7 +145,21 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
                 print("[residue:moe] W4A16 checkpoint -- stock experts",
                       flush=True)
                 return
-            impl = os.environ.get("RESIDUE_MOE_IMPL", "mext")
+            
+            
+            
+            
+            
+            
+            
+            
+            impl = os.environ.get("RESIDUE_MOE_IMPL", "cutedsl")
+            if impl == "mext":
+                print("[residue:moe] WARNING: RESIDUE_MOE_IMPL=mext selects "
+                      "the SUPERSEDED fold-chain experts (JIT per capture "
+                      "size, no warmup). Production is cutedsl; mext is "
+                      "kept only for comparison and will be removed.",
+                      flush=True)
             if impl == "cutedsl":
                 # The grafted flashinfer-CuTeDSL path. Weights must go
                 # through the STOCK FLASHINFER_CUTEDSL prep (interleave +
@@ -154,12 +197,80 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
                 print(f"[residue:moe] stock experts kept: {reason}",
                       flush=True)
 
+        def create_weights(self, layer, num_experts, hidden_size,
+                           intermediate_size_per_partition, params_dtype,
+                           **extra_weight_attrs) -> None:
+            super().create_weights(layer, num_experts, hidden_size,
+                                   intermediate_size_per_partition,
+                                   params_dtype, **extra_weight_attrs)
+            # extended_k layers carry PHYSICALLY K-extended w13 tensors;
+            # resize the params now or weight loading dies on the shape
+            # assert. Resolution must succeed here -- sizing cannot be
+            # deferred -- so a policy that exists but cannot be resolved
+            # for this layer is a loud failure by design.
+            if self._residue_impl is None or self._moe_policy_section is None:
+                return
+            from .residue_moe_policy import (
+                MOE_IMPL_EXTENDED_K,
+                resolve_moe_layer_policy,
+            )
+            policy = resolve_moe_layer_policy(
+                self._moe_policy_section, getattr(layer, "layer_name", ""))
+            if policy.impl != MOE_IMPL_EXTENDED_K:
+                return
+            num_salient = len(policy.w13_salient_indices)
+            expected = policy.ratio * hidden_size
+            if abs(num_salient - expected) > 0.5:
+                raise ValueError(
+                    f"[residue:moe] {layer.layer_name}: extended_k salient "
+                    f"count {num_salient} does not match ratio "
+                    f"{policy.ratio} x K {hidden_size}.")
+            w13_rows = layer.w13_weight.shape[1]
+            resize_w13_for_extended_k(
+                layer, num_experts, w13_rows, hidden_size + num_salient,
+                extra_weight_attrs.get("weight_loader"))
+            print(f"[residue:moe] {layer.layer_name}: extended_k r="
+                  f"{policy.ratio:g} -- w13 sized at K_ext="
+                  f"{hidden_size + num_salient}", flush=True)
+
+        def _attach_extk_state(self, layer, layer_name, policy) -> None:
+            """Stash the layer-shared salient mask on the experts instance.
+
+            apply() cannot read metadata (it only sees tensors), so the
+            mask travels via instance attributes, set right after the stock
+            pwal built the kernel. Failing to locate the experts object is
+            fatal: serving extended_k weights without the mask would
+            quantise at base K and feed a K_ext GEMM garbage.
+            """
+            import torch
+
+            from nvfp4.quant import indices_to_channel_masks
+
+            experts = getattr(getattr(self, "moe_kernel", None),
+                              "fused_experts", None)
+            if experts is None:
+                raise RuntimeError(
+                    f"[residue:moe] {layer_name}: cannot locate "
+                    "fused_experts on the built kernel to attach the "
+                    "extended_k salient mask.")
+            k_base = int(self.moe.hidden_dim)
+            idx = torch.tensor(policy.w13_salient_indices,
+                               dtype=torch.long,
+                               device=layer.w13_weight.device)
+            experts._extk_channel_masks = indices_to_channel_masks(
+                idx, k_base)
+            experts._extk_num_salient = int(idx.numel())
+            print(f"[residue:moe] {layer_name}: experts_cls -> "
+                  f"ExtendedKCuteDSLExperts (K_ext={k_base + idx.numel()}, "
+                  f"r={policy.ratio:g})", flush=True)
+
         def process_weights_after_loading(self, layer) -> None:
             # Per-layer policy verdict. Only consulted when this instance
             # would serve residue at all -- a config-level fallback to stock
             # (unsupported arch/EP/...) already IS off for every layer.
             if self._residue_impl is not None:
                 from .residue_moe_policy import (
+                    MOE_IMPL_EXTENDED_K,
                     MOE_IMPL_OFF,
                     resolve_moe_layer_policy,
                 )
@@ -176,6 +287,30 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
                     self._residue_impl = None
                     self.experts_cls = self._stock_experts_cls
                     self.nvfp4_backend = self._stock_nvfp4_backend
+                elif policy.impl == MOE_IMPL_EXTENDED_K:
+                    # A K-extended checkpoint has NO stock fallback (its
+                    # w13 shape is wrong for every stock path), so an
+                    # unavailable extk runtime must refuse, not degrade.
+                    from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (  # noqa: E501
+                        NvFp4MoeBackend,
+                    )
+
+                    from .residue_cutedsl_experts import (
+                        ExtendedKCuteDSLExperts,
+                    )
+
+                    if not ExtendedKCuteDSLExperts._supports_current_device():
+                        raise RuntimeError(
+                            f"[residue:moe] {layer_name}: policy demands "
+                            "extended_k but this runtime cannot serve it "
+                            "(needs sm100 family + the W3 quantiser).")
+                    self._residue_moe_active = False  # stock weight prep
+                    self._residue_impl = "extended_k"
+                    self.experts_cls = ExtendedKCuteDSLExperts
+                    self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL
+                    ret = super().process_weights_after_loading(layer)
+                    self._attach_extk_state(layer, layer_name, policy)
+                    return ret
             if not self._residue_moe_active:
                 # stock experts OR the cutedsl graft (which wants the stock
                 # weight prep for its forced FLASHINFER_CUTEDSL backend).
