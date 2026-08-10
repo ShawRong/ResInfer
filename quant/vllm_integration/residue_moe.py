@@ -89,7 +89,7 @@ def resize_w13_for_extended_k(layer, num_experts: int, w13_rows: int,
 
 
 def make_residue_moe_method_cls(base_cls: type) -> type:
-    """Subclass vLLM's NVFP4 MoE method; experts go to ResidueNvFp4Experts.
+    """Subclass vLLM's NVFP4 MoE method; experts go to ResidueCuteDSLExperts.
 
     Built at patch time from whatever `FusedMoEMethodCls` currently is, so no
     vLLM version is pinned. Three touch points, everything else inherited:
@@ -112,8 +112,6 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
         kNvfp4Static,
     )
 
-    from .residue_moe_experts import ResidueNvFp4Experts
-
     # The class name MUST contain the substring "ModelOpt": vLLM's
     # RoutedExperts.weight_loader dispatches its ModelOpt-specific loading
     # path on `"ModelOpt" in type(quant_method).__name__` (routed_experts.py,
@@ -125,12 +123,11 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
     class ModelOptNvFp4FusedMoEResidue(base_cls):  # type: ignore[misc,valid-type]
         __doc__ = (
             "vLLM's NVFP4 FusedMoE method with the expert compute routed "
-            "through ResidueNvFp4Experts (MExt-R1 fold chain)."
+            "through ResidueCuteDSLExperts (MExt-R1 on the CuTeDSL graft)."
         )
 
         def __init__(self, quant_config, moe_config) -> None:
             super().__init__(quant_config, moe_config)
-            self._residue_moe_active = False
             self._residue_impl = None
             # Per-layer policy (metadata "moe" section). The method instance
             # is per-layer (ModelOptQuantConfigBase.get_quant_method builds a
@@ -154,48 +151,33 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
             
             
             impl = os.environ.get("RESIDUE_MOE_IMPL", "cutedsl")
-            if impl == "mext":
-                print("[residue:moe] WARNING: RESIDUE_MOE_IMPL=mext selects "
-                      "the SUPERSEDED fold-chain experts (JIT per capture "
-                      "size, no warmup). Production is cutedsl; mext is "
-                      "kept only for comparison and will be removed.",
-                      flush=True)
-            if impl == "cutedsl":
-                # The grafted flashinfer-CuTeDSL path. Weights must go
-                # through the STOCK FLASHINFER_CUTEDSL prep (interleave +
-                # MMA-layout SF + alpha vectors), so pwal is NOT overridden
-                # here -- only the experts class and backend are swapped.
-                from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (  # noqa: E501
-                    NvFp4MoeBackend,
-                )
+            if impl != "cutedsl":
+                raise ValueError(
+                    f"[residue:moe] RESIDUE_MOE_IMPL={impl!r} is not "
+                    "supported. "
+                    "Unset it or set 'cutedsl'.")
+            # The grafted flashinfer-CuTeDSL path. Weights must go
+            # through the STOCK FLASHINFER_CUTEDSL prep (interleave +
+            # MMA-layout SF + alpha vectors), so pwal is NOT overridden
+            # here -- only the experts class and backend are swapped.
+            from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (  # noqa: E501
+                NvFp4MoeBackend,
+            )
 
-                from .residue_cutedsl_experts import ResidueCuteDSLExperts
+            from .residue_cutedsl_experts import ResidueCuteDSLExperts
 
-                supported, reason = ResidueCuteDSLExperts.is_supported_config(
-                    ResidueCuteDSLExperts, self.moe, kNvfp4Static,
-                    kNvfp4Dynamic, mk.FusedMoEActivationFormat.Standard)
-                if supported:
-                    self.experts_cls = ResidueCuteDSLExperts
-                    self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL
-                    self._residue_impl = "cutedsl"
-                    print("[residue:moe] experts_cls -> "
-                          "ResidueCuteDSLExperts (graft)", flush=True)
-                else:
-                    print(f"[residue:moe] cutedsl graft unsupported: "
-                          f"{reason}; stock experts kept", flush=True)
-                return
-            supported, reason = ResidueNvFp4Experts.is_supported_config(
-                ResidueNvFp4Experts, self.moe, kNvfp4Static, kNvfp4Dynamic,
-                mk.FusedMoEActivationFormat.Standard)
-            self._residue_moe_active = bool(supported)
+            supported, reason = ResidueCuteDSLExperts.is_supported_config(
+                ResidueCuteDSLExperts, self.moe, kNvfp4Static,
+                kNvfp4Dynamic, mk.FusedMoEActivationFormat.Standard)
             if supported:
-                self.experts_cls = ResidueNvFp4Experts
-                self._residue_impl = "mext"
-                print("[residue:moe] experts_cls -> ResidueNvFp4Experts",
-                      flush=True)
+                self.experts_cls = ResidueCuteDSLExperts
+                self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL
+                self._residue_impl = "cutedsl"
+                print("[residue:moe] experts_cls -> "
+                      "ResidueCuteDSLExperts (graft)", flush=True)
             else:
-                print(f"[residue:moe] stock experts kept: {reason}",
-                      flush=True)
+                print(f"[residue:moe] cutedsl graft unsupported: "
+                      f"{reason}; stock experts kept", flush=True)
 
         def create_weights(self, layer, num_experts, hidden_size,
                            intermediate_size_per_partition, params_dtype,
@@ -283,7 +265,6 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
                     # Undo __init__'s takeover for THIS layer's instance:
                     # the stock pwal below then builds the stock kernel from
                     # the restored experts_cls/backend.
-                    self._residue_moe_active = False
                     self._residue_impl = None
                     self.experts_cls = self._stock_experts_cls
                     self.nvfp4_backend = self._stock_nvfp4_backend
@@ -304,38 +285,17 @@ def make_residue_moe_method_cls(base_cls: type) -> type:
                             f"[residue:moe] {layer_name}: policy demands "
                             "extended_k but this runtime cannot serve it "
                             "(needs sm100 family + the W3 quantiser).")
-                    self._residue_moe_active = False  # stock weight prep
                     self._residue_impl = "extended_k"
                     self.experts_cls = ExtendedKCuteDSLExperts
                     self.nvfp4_backend = NvFp4MoeBackend.FLASHINFER_CUTEDSL
                     ret = super().process_weights_after_loading(layer)
                     self._attach_extk_state(layer, layer_name, policy)
                     return ret
-            if not self._residue_moe_active:
-                # stock experts OR the cutedsl graft (which wants the stock
-                # weight prep for its forced FLASHINFER_CUTEDSL backend).
-                return super().process_weights_after_loading(layer)
-            from vllm.model_executor.layers.fused_moe.oracle.nvfp4 import (
-                make_nvfp4_moe_kernel,
-            )
-
-            # Deliberately NO convert_to_nvfp4_moe_kernel_format here: every
-            # branch repacks for a stock backend and EMULATION replaces
-            # input_scale with its inverse -- poison for the residue algebra,
-            # which wants the scales exactly as loaded. The quant config is
-            # built from the raw tensors; nothing on the residue path reads
-            # its scale fields (prepare defers quantisation to the experts).
-            self.moe_quant_config = self.get_fused_moe_quant_config(layer)
-            assert self.moe_quant_config is not None
-            self.moe_kernel = make_nvfp4_moe_kernel(
-                moe_quant_config=self.moe_quant_config,
-                moe_config=self.moe,
-                experts_cls=self.experts_cls,
-                backend=self.nvfp4_backend,
-                routing_tables=layer._expert_routing_tables(),
-                layer=layer,
-            )
-            self.moe_kernel.fused_experts.process_weights_after_loading(layer)
+            # stock experts OR the cutedsl graft: both want the stock
+            # weight prep (the graft's forced FLASHINFER_CUTEDSL backend
+            # included). The raw-layout kernel construction that used to
+            # follow served only the deleted fold-chain impl.
+            return super().process_weights_after_loading(layer)
 
     return ModelOptNvFp4FusedMoEResidue
 

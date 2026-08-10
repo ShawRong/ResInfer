@@ -566,9 +566,9 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
 
         # LinearMethodCls only covers LinearBase. `RoutedExperts` layers go
         # to FusedMoEMethodCls. RESIDUE_ENABLE_MOE=1 installs the REAL
-        # residue expert method (ResidueNvFp4Experts on the fold chain);
-        # RESIDUE_MOE_OBSERVE=1 the numerics-neutral coverage observer.
-        # Method wins when both are set.
+        # residue expert method (ResidueCuteDSLExperts on the CuTeDSL
+        # graft); RESIDUE_MOE_OBSERVE=1 the numerics-neutral coverage
+        # observer. Method wins when both are set.
         try:
             from .residue_moe import patch_moe_method, patch_moe_observer
 

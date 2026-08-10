@@ -152,7 +152,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         split_k: int = 1,
         splitk_ablate: int = 0,
         dsmem_split: bool = False,
-        expert_gather: bool = False,
         k_loop: bool = False,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
@@ -280,22 +279,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             "subtile drain means the owner's real_subtile_idx and the follower's "
             "_skl_st no longer denote the same subtile.")
         self.dsmem_split = dsmem_split
-        # Expert gather: take the WEIGHT's l coordinate from a lookup table
-        # instead of from the scheduler's own L enumeration, so l enumerates
-        # only the experts that were routed tokens. Same mechanism flashinfer's
-        # grouped MoE GEMM uses -- there tile_idx_to_expert_idx lands in
-        # mma_tile_coord_mnl[2] and slices tBgB/tBgSFB, and B stays an ordinary
-        # (n, k, num_experts) tensor with an ordinary l-stride. Nothing about
-        # the weight's layout or its TMA changes; only where the index is read.
-        #
-        # A, SFA and C keep the scheduler's l, so the activation and the output
-        # must be COMPACT (one slot per active expert, in the table's order).
-        # That costs nothing here: the activation is produced by our own
-        # quantiser and the output feeds the next stage.
-        #
-        # Only meaningful for the M-ext orientation (mA = activation,
-        # mB = weight). host.py enforces that; the kernel cannot tell.
-        self.expert_gather = expert_gather
         
         # K-concat activation at 2K, B (the weight) is read twice by wrapping
         # its k coordinate at the midpoint, the MMA's own K-reduction performs
@@ -602,7 +585,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         splitk_flags_ptr: cute.Pointer = None,
         epilogue_op: cutlass.Constexpr = lambda x: x,
         c_alias_tensor: cute.Tensor = None,
-        expert_ids: cute.Tensor = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -951,10 +933,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             # Non-fold mode passes a harmless stand-in (read only under
             # const_expr(self.fold_pairs_tma)).
             c_alias_tensor if self.fold_pairs_tma else tma_tensor_c,
-            # Same stand-in convention as c_alias_tensor above: the DSL cannot
-            # marshal None, and this is read only under
-            # const_expr(self.expert_gather).
-            expert_ids if expert_ids is not None else alpha,
             splitk_ws_ptr,
             splitk_flags_ptr,
         ).launch(
@@ -997,7 +975,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         epilogue_op: cutlass.Constexpr,
         alpha: cute.Tensor,
         mC_fold_alias: cute.Tensor,
-        mExpertIds: cute.Tensor,
         splitk_ws_ptr: cute.Pointer,
         splitk_flags_ptr: cute.Pointer,
     ):
@@ -1414,17 +1391,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                     _l_coord = cur_tile_coord[2]
                 mma_tile_coord_mnl = (_m_coord, cur_tile_coord[1], _l_coord)
 
-                # Expert gather: the WEIGHT's l comes from the lookup table,
-                # everything else keeps the scheduler's l. So the scheduler
-                # enumerates l = 0..num_active-1 over a COMPACT activation and
-                # output, while B and SFB reach the real expert's slice.
-                # Experts with no tokens are simply absent from the table and
-                # their weights are never touched -- which is the whole point,
-                # since the weight stream is what this GEMM is bound by.
-                if cutlass.const_expr(self.expert_gather):
-                    _l_weight = mExpertIds[_l_coord]
-                else:
-                    _l_weight = mma_tile_coord_mnl[2]
+                _l_weight = mma_tile_coord_mnl[2]
 
                 #
                 # Slice to per mma tile index
@@ -3227,12 +3194,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sf_n: cutlass.Int64,
         sf_k: cutlass.Int64,
         l: cutlass.Constexpr,
-        # The WEIGHT's l extent. Equal to l for a plain batched GEMM; with
-        # expert_gather it is the model's FULL expert count, because the
-        # lookup table indexes into all of them while A/C hold only the active
-        # ones. Baking it at l made the gathered call read outside B's declared
-        # extent -- right shape, right magnitudes, wrong weights.
-        l_weight: cutlass.Constexpr,
         a_sf_ptr: cute.Pointer,
         b_sf_ptr: cute.Pointer,
         alpha_tensor: cute.Tensor,
@@ -3240,10 +3201,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         current_stream,
         splitk_ws_ptr: cute.Pointer,
         splitk_flags_ptr: cute.Pointer,
-        # int32 (l,), one real expert index per scheduler l. Always a real
-        # tensor -- the host passes a 1-element dummy when expert_gather is
-        # off, and the kernel reads it only under const_expr(expert_gather).
-        expert_ids_tensor: cute.Tensor = None,
         swap_ab: cutlass.Constexpr = False,
         epilogue_op: cutlass.Constexpr = lambda x: x,
     ):
@@ -3344,13 +3301,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             b_tensor = cute.make_tensor(
                 b_ptr,
                 cute.make_layout(
-                    ((2, 4, 4, n // 32), k_b, l_weight),
+                    ((2, 4, 4, n // 32), k_b, l),
                     stride=((ldb, 8 * ldb, 2 * ldb, 32 * ldb), 1, n * ldb),
                 ),
             )
         else:
             b_tensor = cute.make_tensor(
-                b_ptr, layout=cute.make_layout((n, k_b, l_weight), stride=(ldb, 1, n * ldb)),
+                b_ptr, layout=cute.make_layout((n, k_b, l), stride=(ldb, 1, n * ldb)),
             )
         # Reshape C to (m, n, l) -- swap_ab is constexpr, determines layout at compile time
         c_alias_tensor = None
@@ -3440,7 +3397,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         sfb_tensor = cute.make_tensor(
             b_sf_ptr,
             layout=cute.make_ordered_layout(
-                (32, 4, sf_n, 4, sf_k, l_weight),
+                (32, 4, sf_n, 4, sf_k, l),
                 order=(2, 1, 4, 0, 3, 5),
             ),
         )
@@ -3459,7 +3416,6 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                 splitk_flags_ptr,
                 epilogue_op,
                 c_alias_tensor,
-                expert_ids_tensor,
             )
         else:
             self(

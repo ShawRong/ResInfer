@@ -15,7 +15,6 @@ Compile/call marshaling mirrors flashinfer's _cute_dsl_gemm_fp4_runner
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 
@@ -56,15 +55,6 @@ def _cutlass_modules():
     }
 
 
-# Opt out of the expert_ids range check (a device->host sync). Set it once a
-# caller's routing is trusted and the sync shows up in a decode profile.
-_SKIP_EXPERT_ID_CHECK = os.environ.get("NVFP4_FOLD_SKIP_EXPERT_ID_CHECK") == "1"
-
-
-@functools.lru_cache(maxsize=None)
-def _dummy_expert_ids(batch: int, device) -> "torch.Tensor":
-    """Never-read stand-in for the baked expert_ids argument. See its use."""
-    return torch.zeros(batch, dtype=torch.int32, device=device)
 
 
 def _compile_fold_gemm(
@@ -80,9 +70,6 @@ def _compile_fold_gemm(
     splitk_ablate: int = 0,
     dsmem_split: bool = False,
     strided_weight: bool = False,
-    batch: int = 1,
-    expert_gather: bool = False,
-    weight_batch: int | None = None,
 ):
     """Compile a fold-GEMM kernel variant:
 
@@ -123,14 +110,9 @@ def _compile_fold_gemm(
     # The owner defers alpha to after the K-reduction (bit-exactness); the
     # dual-alpha fold is a different linear form -- combine later if needed.
     assert not (split_k > 1 and dual_alpha), "split_k>1 is single-alpha for now"
-    # `batch` is the kernel's l extent. It MUST be in the key: l is a
-    # Constexpr baked at compile time, so a cached l=1 kernel handed batched
-    # tensors would read only the first expert and silently return garbage for
-    # the rest.
     key = (mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
            ab_stage_override, dual_alpha, pi_via_layout, split_k,
-           splitk_ablate, dsmem_split, strided_weight, batch, expert_gather,
-           weight_batch)
+           splitk_ablate, dsmem_split, strided_weight)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
 
@@ -159,7 +141,6 @@ def _compile_fold_gemm(
             split_k=split_k,
             splitk_ablate=splitk_ablate,
             dsmem_split=dsmem_split,
-            expert_gather=expert_gather,
             k_loop=(mode == "kloop_tma"),
         )
     else:
@@ -272,8 +253,7 @@ def _compile_fold_gemm(
             1,
             1,
             1,
-            batch,  # l (constexpr batch); 1 = dense, E = one expert per l
-            batch if weight_batch is None else weight_batch,  # l_weight
+            1,  # l
             a_sf_ptr,
             b_sf_ptr,
             alpha_fake,
@@ -281,11 +261,6 @@ def _compile_fold_gemm(
             stream_fake,
             make_ptr(cutlass.Float32, 16, cute.AddressSpace.gmem, 16),
             make_ptr(cutlass.Int32, 16, cute.AddressSpace.gmem, 16),
-            # expert_ids: int32 (l,). Baked at the compile-time l so the shape
-            # is static; the runtime tensor must match. A dummy of the same
-            # length is passed when expert_gather is off.
-            cute.runtime.make_fake_compact_tensor(
-                cutlass.Int32, (batch,), assumed_align=4),
             False,  # swap_ab
             lambda x: x,  # epilogue_op (alpha applied inside the kernel)
             options="--opt-level 2 --enable-tvm-ffi",
@@ -301,7 +276,7 @@ def _compile_fold_gemm(
             1,
             1,
             1,
-            batch,  # l (constexpr batch); 1 = dense, E = one expert per l
+            1,  # l
             a_sf_ptr,
             b_sf_ptr,
             alpha_fake,
@@ -363,23 +338,8 @@ def mext_fold_gemm_sm103(
     split_k: int = 1,
     splitk_ablate: int = 0,
     dsmem_split: bool = False,
-    batch: int = 1,
-    expert_ids: torch.Tensor | None = None,
-    num_experts: int | None = None,
 ) -> torch.Tensor:
-    """Run the fold GEMM. Returns D[m_tok, n_w], or D[batch, m_tok, n_w].
-
-    batch (= the kernel's l extent) is what makes this usable for MoE: one
-    expert per l, each with its own weight. The kernel already supported it --
-    every layout it builds carries l as the outermost mode ((m,k,l) for A,
-    (n,k,l) for B with per-l weight stride n*ldb, (m,n,l) for C, and
-    (32,4,sf,4,sf_k,l) for both scale factors) and the persistent tile
-    scheduler already enumerates L. Only the host baked l=1.
-
-    All l share one problem shape, so this is a BATCHED grouped GEMM, not a
-    ragged one: every expert must contribute the same m_tok. For MoE that means
-    the E x max_tokens x K padded format, which is what vLLM's
-    BatchedPrepareAndFinalize produces.
+    """Run the fold GEMM. Returns D[m_tok, n_w].
 
     alpha_res: optional residue-half global scale (dual-alpha). None keeps the
     legacy single-alpha path bit-for-bit. When set, the fold computes
@@ -396,17 +356,6 @@ def mext_fold_gemm_sm103(
         act_sf: swizzled 128x4 FP8 scale from scaled_fp4_quant_mext_r1.
         alpha: float32 scalar tensor (global dequant scale product).
     """
-    # SHAPES DESCRIBE ONE EXPERT, even when batch > 1. That is how l was
-    # designed: every layout the kernel builds is (rows, k, l) with an l-stride
-    # of rows*ld, so the tensor only has to describe one slab and the stride
-    # walks to the rest. The compiled TVM-FFI signature enforces it --
-    # mC.shape[1] is tied to mB.shape[0], so a weight tensor carrying all E
-    # experts' rows is rejected at the call:
-    #     Mismatched mC.shape[1] ... expected to match mB.shape[0]
-    # Callers therefore pass a one-expert VIEW of a buffer that holds all of
-    # them, contiguous and l-outermost.
-    if batch < 1:
-        raise ValueError(f"batch must be >= 1, got {batch}")
     n_w, k_packed = weight_fp4.shape
     m2 = act_fp4_rowpair.shape[0]
     assert m2 % 2 == 0, "activation must be row-pair interleaved (even rows)"
@@ -467,48 +416,6 @@ def mext_fold_gemm_sm103(
     # convenience arg concatenates per call (extra kernel; init-time use only).
     _dual = alpha_res is not None or alpha.numel() == 2
 
-    # Expert gather. The kernel reads it only for the WEIGHT's l, so the
-    # activation, its scale factors and the output stay compact -- one slot per
-    # ENTRY OF expert_ids, in that order, not per expert of the model.
-    if expert_ids is not None:
-        # Enforced here because the kernel cannot tell: for N-ext the weight is
-        # mA, so remapping mB's l would gather the ACTIVATION and quietly
-        # compute a permutation of the right answer.
-        assert store_mode in ("tma_mext", "direct_mext"), (
-            f"expert_ids is M-ext only (the weight is mB there); "
-            f"store_mode={store_mode!r} puts the weight on mA")
-        assert expert_ids.dtype == torch.int32 and expert_ids.is_cuda, (
-            f"expert_ids must be int32 CUDA, got {expert_ids.dtype} "
-            f"cuda={expert_ids.is_cuda}")
-        # batch (the l extent, one slot per table entry) and num_experts (the
-        # weight buffer's expert count) are INDEPENDENT: block-aligned tables
-        # give a busy expert several slots, so batch > num_experts is normal.
-        # Safety against OOB weight reads is the CONTENTS check below.
-        assert num_experts is not None, (
-            "expert_ids needs num_experts (the weight buffer's expert count)")
-        # Reading the table's CONTENTS costs a device->host sync, which is
-        # illegal mid-capture and a real per-call stall in a decode loop. The
-        # check still earns its place -- the entries come from the router, and
-        # an out-of-range one is an OOB TMA read on the weight buffer -- so
-        # keep it by default and let a hot path opt out.
-        if not (_SKIP_EXPERT_ID_CHECK
-                or torch.cuda.is_current_stream_capturing()):
-            _hi = int(expert_ids.max())
-            assert _hi < num_experts, (
-                f"expert_ids max {_hi} >= num_experts {num_experts}: the "
-                f"table points outside the weight buffer")
-        assert expert_ids.numel() == batch, (
-            f"expert_ids has {expert_ids.numel()} entries but batch={batch}; "
-            "pass batch=len(active_experts)")
-        _expert_arg = expert_ids
-    else:
-        # The compiled signature always carries the argument (it was baked from
-        # a fake tensor), so hand it something real and never read. Cached
-        # rather than allocated: this is the hot path for every non-MoE call,
-        # and a per-call torch.zeros would show up as our own overhead in every
-        # dense benchmark.
-        _expert_arg = _dummy_expert_ids(batch, weight_fp4.device)
-
     compiled = _compile_fold_gemm(
         mma_tiler_mn, cluster_shape_mn, out_dtype,
         mode=_mode, kernel_arch=kernel_arch,
@@ -519,16 +426,6 @@ def mext_fold_gemm_sm103(
         dsmem_split=dsmem_split,
         dual_alpha=_dual,
         strided_weight=_strided_w,
-        batch=batch,
-        # The gather is a COMPILE-TIME fork -- the kernel that reads the table
-        # is a DIFFERENT kernel. Validating expert_ids and then omitting these
-        # two asked for the plain kernel, which takes the weight's l from the
-        # scheduler: the table was marshalled into the launch and never read,
-        # and every slot silently used expert = its own position. Shapes,
-        # finiteness and magnitudes were all correct; only a bitwise check
-        # against per-expert calls caught it.
-        expert_gather=expert_ids is not None,
-        weight_batch=num_experts if expert_ids is not None else None,
     )
 
     if alpha_res is not None:
@@ -556,24 +453,16 @@ def mext_fold_gemm_sm103(
         # M-ext non-swap: activation on M, weight on N; output D[m_tok, n_w]
         # written naturally (no transpose). Swap operands (mA=act, mB=weight)
         # and SF (sf_m arg = act tiles, sf_n arg = weight tiles).
-        # Allocate 2D even when batched. The compiled wrapper's TVM-FFI
-        # signature bakes mC at ndim=2 (the compile-time fake tensor is 2D), so
-        # a 3D tensor is rejected outright. That is fine: the kernel's C layout
-        # is (m, n, l) with l OUTERMOST, which is exactly the memory of a
-        # contiguous (l*m, n) tensor. Reshape after the call, not before.
-        # Room for every expert; the kernel is handed a one-expert view and
-        # reaches the rest through the l-stride (m_tok*n_w apart).
-        d_t = torch.empty(batch * m_tok, n_w, dtype=out_dtype,
+        d_t = torch.empty(m_tok, n_w, dtype=out_dtype,
                           device=weight_fp4.device)
-        d_view = d_t if batch == 1 else d_t[:m_tok]
         # M-ext modes are sm100-only: wrapper takes the (inert) splitk ptrs.
         compiled(
-            act_fp4_rowpair, weight_fp4, d_view,
+            act_fp4_rowpair, weight_fp4, d_t,
             sf_n, sf_m, sf_k,
             act_sf.data_ptr(), weight_sf.data_ptr(),
-            alpha_t, 0, 0, _expert_arg,
+            alpha_t, 0, 0,
         )
-        return d_t if batch == 1 else d_t.view(batch, m_tok, n_w)
+        return d_t
 
     if store_mode == "tma":
         # N-ext: kernel writes row-major D[m_tok, n_w] via a transposed TMA view.
@@ -590,7 +479,7 @@ def mext_fold_gemm_sm103(
                 weight_fp4, act_fp4_rowpair, d_t,
                 sf_m, sf_n, sf_k,
                 weight_sf.data_ptr(), act_sf.data_ptr(),
-                alpha_t, _ws_ptr, _flags_ptr, _expert_arg,
+                alpha_t, _ws_ptr, _flags_ptr,
             )
         else:
             compiled(

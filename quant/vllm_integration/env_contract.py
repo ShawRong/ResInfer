@@ -38,12 +38,8 @@ KNOWN: dict[str, tuple] = {
                                      "legacy alias of RESIDUE_MEXT_PROJ_NAMES"),
     "RESIDUE_ENABLE_MOE": ("one", None,
                            "MoE expert takeover (residue_moe.py hook)"),
-    "RESIDUE_MOE_IMPL": ("enum", {"mext", "cutedsl"},
-                         "MoE experts impl; default cutedsl (the "
-                         "flashinfer-CuTeDSL graft). mext is DEPRECATED -- "
-                         "it puts the slot count in the fold compile key, so "
-                         "it JIT-compiles per capture size; selecting it "
-                         "prints a warning"),
+    "RESIDUE_MOE_IMPL": ("enum", {"cutedsl"},
+                         'MoE experts implementation: FlashInfer CuTeDSL. For deterministic evaluation, use RESIDUE_MOE_DETERMINISTIC_FINALIZE=1.'),
     "RESIDUE_MOE_DETERMINISTIC_FINALIZE": (
         "one", None,
         "MoE finalize that repeats bit-for-bit: each base+residue pair "
@@ -103,19 +99,27 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_ATTN_CONTEXT_KERNEL": ("one", None,
                                     "0 disables the paged context kernel"),
     "RESIDUE_ATTN_PREFILL_EXACT": ("one", None,
-                                   "force the gather_dequant oracle prefill"),
+                                   "force the gather_dequant oracle prefill; "
+                                   "same information as the default, "
+                                   "different arithmetic -- a reference, not "
+                                   "a serving mode"),
+    "RESIDUE_ATTN_PREFILL_BF16": ("one", None,
+                                  'Prefill attends live BF16 K/V instead of the FP4 pool. Disabled by default; do not enable for quality comparisons against FP4-cache prefill.'),
     "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
                                "capture ResAttn decode into CUDA graphs "
                                "(1.70-2.08x decode on sm100). PERFORMANCE "
-                               "only: ResAttn decode does not repeat bitwise "
-                               "in either mode -- split-K reduces through "
-                               "atomics and a graph fixes the launch "
-                               "sequence, not CTA scheduling"),
+                               "only: a graph fixes the launch sequence, not "
+                               "CTA scheduling, so it does not make decode "
+                               "repeat bitwise in either mode. For that, see "
+                               "RESIDUE_ATTN_REDUCTION"),
+    "RESIDUE_ATTN_REDUCTION": ("enum", {"legacy", "auto", "deterministic"},
+                               'How split-K partials merge. legacy uses atomics; auto uses atomics for 1-2 splits and a second-pass merge otherwise; deterministic always uses a second-pass merge. Select a repeatable mode for quality comparisons.'),
     "RESIDUE_ATTN_CG_CAPTURE_LEN": ("int", None,
                                     "sequence length the CUDA-graph capture "
                                     "plans against (default max_model_len); "
                                     "a short value selects the no-split "
-                                    "kernel, which uses no atomics at all"),
+                                    "kernel, which uses no atomics at all and "
+                                    "is measured bitwise repeatable"),
     # -- MoE -----------------------------------------------------------------
     "RESIDUE_MOE_MEXT": ("one", None, "MoE mext experiment gate"),
     "RESIDUE_MOE_OBSERVE": ("one", None, "MoE routing observer"),

@@ -132,13 +132,26 @@ def _auto_splits_qmul4(
     return splits, _split_reduction(splits)
 
 
+
+
+
+
+
+
+
+
+ATOMIC_REPRODUCIBLE_SPLITS = (1, 2)
+
+
 def _split_reduction(splits: int) -> str:
     'Which reduction merges the split-K partials. `RESIDUE_ATTN_REDUCTION`.'
     mode = os.environ.get("RESIDUE_ATTN_REDUCTION", "legacy")
     if mode == "deterministic":
         return "kernel"
     if mode == "auto":
-        return "atomic" if splits in (2, 4, 8) else "kernel"
+        return (
+            "atomic" if splits in ATOMIC_REPRODUCIBLE_SPLITS else "kernel"
+        )
     return "atomic"
 
 

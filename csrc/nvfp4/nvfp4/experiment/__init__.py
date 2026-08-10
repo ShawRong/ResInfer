@@ -5,4 +5,4 @@
 Imported lazily on purpose: `import nvfp4` must not trigger a JIT compile.
 """
 
-__all__ = ["moe_fold"]
+__all__: list[str] = []

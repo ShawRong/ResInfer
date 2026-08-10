@@ -63,7 +63,7 @@ class ResidueCuteDSLExperts(FlashInferCuteDSLExperts):
         if not FlashInferCuteDSLExperts._supports_current_device():
             return False
         try:
-            from nvfp4.experiment.moe_fold_grouped.swiglu_quant import load
+            from nvfp4.moe.swiglu_quant import load
             return load() is not None
         except Exception:
             return False
@@ -88,7 +88,7 @@ class ResidueCuteDSLExperts(FlashInferCuteDSLExperts):
     def _sf_idx(self, rows: int, cols: int, device) -> torch.Tensor:
         key = (rows, cols)
         if key not in self._sf_idx_cache:
-            from nvfp4.experiment.moe_cutedsl_graft.residue_glue import (
+            from nvfp4.moe.residue_glue import (
                 sf_unswizzle_indices,
             )
             self._sf_idx_cache[key] = sf_unswizzle_indices(rows, cols,
@@ -115,14 +115,14 @@ class ResidueCuteDSLExperts(FlashInferCuteDSLExperts):
     ) -> None:
         from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
 
-        from nvfp4.experiment.moe_cutedsl_graft.blockscaled_contiguous_grouped_gemm_finalize_fusion import (  # noqa: E501
+        from nvfp4.moe.blockscaled_contiguous_grouped_gemm_finalize_fusion import (  # noqa: E501
             blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4 as g2,
         )
 
-        from nvfp4.experiment.moe_cutedsl_graft.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+        from nvfp4.moe.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
             blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4 as g1,
         )
-        from nvfp4.experiment.moe_fold_grouped import swiglu_quant as sq
+        from nvfp4.moe import swiglu_quant as sq
 
         assert expert_map is None, "EP not supported on this path"
         assert not apply_router_weight_on_input
@@ -282,10 +282,10 @@ class ExtendedKCuteDSLExperts(FlashInferCuteDSLExperts):
     ) -> None:
         from flashinfer.fused_moe.cute_dsl.moe_utils import moe_sort
 
-        from nvfp4.experiment.moe_cutedsl_graft.blockscaled_contiguous_grouped_gemm_finalize_fusion import (  # noqa: E501
+        from nvfp4.moe.blockscaled_contiguous_grouped_gemm_finalize_fusion import (  # noqa: E501
             blockscaled_contiguous_grouped_gemm_finalize_fusion_nvfp4 as g2,
         )
-        from nvfp4.experiment.moe_cutedsl_graft.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
+        from nvfp4.moe.blockscaled_contiguous_gather_grouped_gemm_act_fusion import (  # noqa: E501
             blockscaled_contiguous_gather_grouped_gemm_act_fusion_nvfp4 as g1,
         )
         from nvfp4.quant import scaled_fp4_quant_with_mask_linear_sf

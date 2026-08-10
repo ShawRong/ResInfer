@@ -268,16 +268,24 @@ def context_kernel_eligible(
     head_size: int,
     page_size: int = _MMA_PAGE_SIZE,
 ) -> bool:
-    """Whether one prefixed request fits the context-kernel routing box.
+    """Whether one prefill request fits the context-kernel routing box.
 
     KV tails use the kernel's explicit length mask. Keep this decision pure so
     CPU tests can pin the CUDA-only routing contract.
+
+    `ctx_len == 0` (a fresh request) is ELIGIBLE. It used to be excluded, which
+    sent fresh prefill to varlen FlashAttention on the live bf16 activations --
+    less lossy than the fp4 pool every other nvfp4 backend prefills from, and
+    therefore a silent thumb on the scale in every cross-backend quality
+    comparison. A fresh request is not a different problem for the kernel: its
+    tokens are in the pool before dispatch, and full-sequence causal prefill is
+    trtllm-gen's primary case, not an edge of it.
     """
     ctx_len = seq_len - q_len
     return (
         head_size == 128
         and page_size == _MMA_PAGE_SIZE
-        and ctx_len > 0
+        and ctx_len >= 0
         and q_len > 0
     )
 
@@ -1177,28 +1185,7 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
     # ----------------------------------------------------------- prefill path
     def _prefill_bridge(self, q_all, k_all, v_all, pool, md, out3,
                         q_scale: float = 1.0) -> None:
-        """Prefill: append the chunk, then route by the source of readable KV.
-
-        Fresh requests keep compute in live-bf16 varlen FlashAttention. A
-        request with an existing prefix has no live activation for that prefix;
-        when enabled it reads the paged pool directly with the native FP4
-        context kernel, otherwise it uses gather_dequant+SDPA as an oracle.
-
-        Two sources for the K/V that attention reads, picked by
-        ``RESIDUE_ATTN_PREFILL_EXACT``:
-
-        * default (fast): the incoming bf16 K/V. Fresh prefill attends to the
-          tokens it just computed, so this differs from the cache only by
-          quantization noise, and it keeps the flash SDPA fast path.
-        * ``=1`` (faithful): read the fp4 cache back and attend on that, i.e.
-          exactly the bytes decode will see. Slower (a gather per request,
-          and a materialized mask) but it makes a quantization or layout bug
-          in the write path visible in the model output. Use it when
-          validating, not when measuring.
-
-        Chunked prefill (context already in the pool) always takes the
-        faithful path for the prefix -- the bf16 prefix is simply not in hand.
-        """
+        'Prefill: append the chunk, then route by the source of readable KV.'
         dev = q_all.device
         qsl = md.query_start_loc
         # Routing is host logic, so read the host copies the builder already
@@ -1230,7 +1217,12 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         #  3) 逐请求 SDPA on 读回的 fp4:前缀已在池里、bf16 原值不在手上时的
         #     唯一选择(chunked prefill / 前缀复用),也是 EXACT=1 的验证路径。
         exact = os.environ.get("RESIDUE_ATTN_PREFILL_EXACT") == "1"
-        use_flash = q_all.is_cuda and not exact
+        # Opt-in only. Reading the live bf16 activations is faster and less
+        # lossy than the fp4 pool every other backend prefills from, so making
+        # it the default silently biased every cross-backend comparison in our
+        # favour on prompt-sensitive work.
+        bf16_fast = os.environ.get("RESIDUE_ATTN_PREFILL_BF16") == "1"
+        use_flash = q_all.is_cuda and bf16_fast and not exact
 
         if use_flash and not md.has_prefill_context:
             # 整批都是 fresh prefill:一次调用搞定,且**不做任何 CPU 同步**。
@@ -1312,13 +1304,30 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
 
         if not q_all.is_cuda:
             PREFILL_PATH_COUNTS["per_request_bf16"] += 1
-            # CPU 回退只在 fresh 语义下有意义(bf16 原值即全部 KV)
-            pool_arg = pool if (exact or md.has_prefill_context) else None
+            # flash is CUDA-only, so the CPU path carries the same choice
+            # itself: the pool unless the bf16 opt-out was asked for, and only
+            # then when the bf16 values ARE the whole KV (no prefix in play).
+            bf16_ok = bf16_fast and not exact and not md.has_prefill_context
+            pool_arg = None if bf16_ok else pool
             self._attend_per_request(q_all, k_all, v_all, pool_arg, md, out3)
             return
 
-        PREFILL_PATH_COUNTS["per_request_fp4"] += 1
-        self._attend_per_request(q_all, k_all, v_all, pool, md, out3)
+        # Default: every prefill request, fresh or prefixed, reads the fp4
+        # pool. Fresh ones are eligible for the context kernel because their
+        # tokens are already in it -- `ctx_len > 0` was the only thing that
+        # used to exclude them, and dropping it is what aligns this backend's
+        # prompt attention with the one vLLM forces for nvfp4 KV.
+        all_prefill = list(range(md.num_decodes, n_reqs))
+        fallback = all_prefill
+        if context_kernel_enabled() and not exact:
+            fallback = self._attend_context_requests(
+                q_all, pool, md, out3, only=all_prefill, q_scale=q_scale
+            )
+        if fallback:
+            PREFILL_PATH_COUNTS["per_request_fp4"] += 1
+            self._attend_per_request(
+                q_all, k_all, v_all, pool, md, out3, only=fallback
+            )
 
     def _attend_context_requests(
         self, q_all, pool, md, out3, only, q_scale: float = 1.0
