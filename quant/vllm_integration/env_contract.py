@@ -128,7 +128,11 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_DEBUG_MASK": ("one", None, "mask debug prints"),
     "RESIDUE_DEBUG_TP": ("one", None, "TP debug prints"),
     "RESIDUE_DEBUG_CREATE_WEIGHTS": ("one", None, "create_weights prints"),
-    "RESIDUE_TENSOR_DUMP": ("free", None, "dump linear tensors to this dir"),
+    "RESIDUE_TENSOR_DUMP": ("free", None,
+                            "dump linear tensors to this dir. The tap is a "
+                            "real op and compiles into the graph -- do NOT "
+                            "use it to diagnose compile-related effects; the "
+                            "probe changes the compiled artifact"),
     "RESIDUE_TENSOR_DUMP_MAX_M": (
         "int", None,
         "tap rows above this are skipped (default 400, to skip warmup "

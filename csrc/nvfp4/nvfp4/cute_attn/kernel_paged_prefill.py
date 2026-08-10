@@ -1,9 +1,13 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
-# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors (modifications)
+# SPDX-License-Identifier: BSD-3-Clause
 #
 # 派生自 CUTLASS `examples/python/CuTeDSL/cute/blackwell/kernel/attention/fmha/
 # fmha.py` 的 `BlackwellFusedMultiHeadAttentionForward`(NVIDIA,BSD-3-Clause),
-# 见同目录 `_vendor_fmha_fwd.py` 的出处说明。
+# 见同目录 `_vendor_fmha_fwd.py` 的完整 BSD-3 正文。BSD-3 第 1 条要求源码再
+# 分发保留原版权声明与条件,所以本文件**沿用 BSD-3**,与同样派生的
+# `kernel_paged_decode.py` 一致 —— 此前它标的是 Apache-2.0 且没有 NVIDIA
+# 版权行,那是从 BSD-3 派生物单方面改标,开源前修正。
 'ResAttn 分页 NVFP4 **prefill(context)** attention kernel(warp 特化性能版)。'
 
 from __future__ import annotations
