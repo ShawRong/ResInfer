@@ -72,6 +72,7 @@ def make_runner_pair(
     run_tactic: Callable,                # (inputs, idx) -> Tensor
     candidate_extras: Callable,          # (inputs) -> tuple
     degraded_flag: list,                 # [bool], one per op module
+    on_degrade: Callable[[], None] | None = None,
 ):
     """[FallbackRunner(), CandidateRunner()] with the shared guarantees.
 
@@ -111,6 +112,8 @@ def make_runner_pair(
                           f"no precompiled kernel -- DEGRADING to the "
                           f"fallback (once per process; later shapes may do "
                           f"the same silently)", flush=True)
+                if on_degrade is not None:
+                    on_degrade()
                 return fallback_forward(inputs)
             return run_tactic(inputs, tactic)
 
@@ -129,13 +132,23 @@ def tuned_call(
     kill_env_value: str | None,
     announce_flag: list,
     announce: Callable[[object, int, list], str] | None = None,
+    record: Callable[[str], None] | None = None,
 ):
     """The shared serving entry: kill switch -> import guard -> choose_one.
 
     `kill_env_value` is the already-read env value ("0" disables); reading
     the env stays in the op module so the contract table has one owner.
+
+    `record`, when given, receives the resolved tactic source on EVERY call
+    ("autotuned" | "offline_table"); a degrade inside the candidate runner
+    overrides it afterwards via make_runner_pair's on_degrade. Exists so a
+    bench can report the ACTUAL source per row instead of an architecture
+    constant -- a field that looks like a measurement but is a constant is
+    this week's recurring bug shape.
     """
     if kill_env_value == "0":
+        if record is not None:
+            record("offline_table")
         return fallback_forward(inputs)
     try:
         from flashinfer.autotuner import AutoTuner
@@ -144,6 +157,8 @@ def tuned_call(
             announce_flag[0] = True
             print(f"[residue] {op_name}: flashinfer.autotuner unavailable "
                   f"-- serving the fallback", flush=True)
+        if record is not None:
+            record("offline_table")
         return fallback_forward(inputs)
 
     runners = runners_getter()
@@ -153,4 +168,6 @@ def tuned_call(
         announce_flag[0] = True
         print(f"[residue] {op_name}: {announce(runner, tactic, runners)}",
               flush=True)
+    if record is not None:
+        record("autotuned" if tactic >= 0 else "offline_table")
     return runner.forward(inputs, tactic=tactic)

@@ -43,6 +43,17 @@ _READY = [False]
 _ANNOUNCED = [False]
 _DEGRADED = [False]
 
+# Actual source of the most recent call's tactic (see sm120_fold_tuner).
+_LAST_SOURCE: list = [None]
+
+
+def last_tactic_source() -> str | None:
+    return _LAST_SOURCE[0]
+
+
+def _record_source(src: str) -> None:
+    _LAST_SOURCE[0] = src
+
 _CANDIDATES: list | None = None
 _INDEX_BY_TACTIC: dict | None = None
 
@@ -185,6 +196,7 @@ def _make_runners(out_dtype):
         run_tactic=_run,
         candidate_extras=_extras,
         degraded_flag=_DEGRADED,
+        on_degrade=lambda: _record_source("fallback"),
     )
 
 
@@ -234,4 +246,5 @@ def tuned_sm10x_fold(
         kill_env_value=("1" if tuner_enabled() else "0"),
         announce_flag=_ANNOUNCED,
         announce=_announce,
+        record=_record_source,
     )

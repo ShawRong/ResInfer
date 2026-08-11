@@ -517,6 +517,44 @@ def cmd_analyze(a) -> int:
                   "much an arm reasons. Read it on a decode venue (LCB, AIME).")
 
     ref, base = a.reference, a.baseline
+
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    def _floor_kind(arm_id):
+        p = pathlib.Path(a.out) / f"{arm_id}__provenance.json"
+        if not p.exists():
+            return None, "no provenance.json -- cannot tell which floor this is"
+        env = (json.loads(p.read_text()).get("env") or {})
+        patched = env.get("RESIDUE_PATCH_VLLM") == "1"
+        killed = env.get("RESIDUE_PREFILL_RESIDUE_OFF") == "1"
+        if not patched:
+            return "stock", "stock vLLM, residue patch never installed"
+        if killed:
+            return "runtime_off", ("our patched linear op with residue disabled "
+                                   "at run time -- K is still extended")
+        return "method", "residue ACTIVE -- this is not a floor at all"
+
+    kind, why = _floor_kind(base)
+    if kind is not None:
+        print(f"\n  floor: {base} -- {why}")
+        if kind == "runtime_off":
+            print("  This isolates the MECHANISM (same weights, one env var). It is")
+            print('  NOT the deployment alternative. Compare separately calibrated')
+            print('  stock plain exports when assessing deployment quality. Recovery')
+            print('  relative to a runtime-off arm describes that ablation only. To')
+            print('  compare deployment alternatives, use stock vLLM with a plain export.')
+        elif kind == "method":
+            print("  !! The baseline arm ran with residue ACTIVE. Every delta below")
+            print("  !! is method-vs-method, not method-vs-floor.")
     gate = {}
     if ref not in arms or base not in arms:
         
@@ -950,7 +988,15 @@ def pinned_engine_kwargs(a, max_model_len: int) -> dict:
     return dict(
         enforce_eager=bool(getattr(a, "enforce_eager", False)),   # 1
         max_num_batched_tokens=int(mnbt),                         # 2
-        kernel_config=KernelConfig(enable_flashinfer_autotune=False),  # 3
+        # Knob 3. Default OFF because autotune is pure run-to-run noise for a
+        # comparison table -- but OFF is also not what production serves, which
+        # is the same failure shape as measuring a floor nobody deploys. The
+        # flag exists to MEASURE whether that distinction costs anything: if
+        # tuned and untuned score identically, knob 3 can be relaxed to
+        # 'prewarm once, then fixed' and evaluation can use the production
+        # configuration; if they differ, the prewarm is mandatory.
+        kernel_config=KernelConfig(
+            enable_flashinfer_autotune=bool(getattr(a, 'flashinfer_autotune', False))),  # 3
         seed=a.seed,                                              # 4
         # 5: NVFP4 GEMM backend deliberately NOT forced -- forcing it distorts
         #    baselines, and vLLM>=0.26 ignores the old env anyway.
@@ -1478,6 +1524,8 @@ def main() -> int:
                         "residue checkpoint itself)")
     r.add_argument("--max-model-len", type=int, default=32768)
     r.add_argument("--max-num-seqs", type=int, default=8)
+    r.add_argument("--flashinfer-autotune", action="store_true",
+                   help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     r.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
     r.add_argument("--gpu-mem-util", type=float, default=0.85)
@@ -1518,6 +1566,8 @@ def main() -> int:
     
     
     q.add_argument("--max-num-seqs", type=int, default=8)
+    q.add_argument("--flashinfer-autotune", action="store_true",
+                   help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     q.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
     q.add_argument("--gpu-mem-util", type=float, default=0.85)
@@ -1550,6 +1600,8 @@ def main() -> int:
     k.add_argument("--decode-mext-off", action="store_true")
     k.add_argument("--max-model-len", type=int, default=4096)
     k.add_argument("--max-num-seqs", type=int, default=8)
+    k.add_argument("--flashinfer-autotune", action="store_true",
+                   help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     k.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
     k.add_argument("--gpu-mem-util", type=float, default=0.62)

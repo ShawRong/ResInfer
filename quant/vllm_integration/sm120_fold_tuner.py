@@ -36,6 +36,19 @@ _PRECOMPILED: set = set()
 _ANNOUNCED = [False]
 _DEGRADED = [False]
 
+# The ACTUAL source of the most recent call's tactic, for benches and probes:
+# "autotuned" | "offline_table" | "fallback" (degrade) | None (never called).
+# Under cudagraphs this reflects capture time -- replay never runs Python.
+_LAST_SOURCE: list = [None]
+
+
+def last_tactic_source() -> str | None:
+    return _LAST_SOURCE[0]
+
+
+def _record_source(src: str) -> None:
+    _LAST_SOURCE[0] = src
+
 # Kept as a module name for callers/tests; geometry itself is arch-generic.
 _weight_geometry = weight_geometry
 
@@ -159,6 +172,7 @@ def _make_runners(out_dtype):
         run_tactic=_run,
         candidate_extras=_extras,
         degraded_flag=_DEGRADED,
+        on_degrade=lambda: _record_source("fallback"),
     )
 
 
@@ -204,4 +218,5 @@ def tuned_sm120_fold(
         kill_env_value=os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1"),
         announce_flag=_ANNOUNCED,
         announce=_announce,
+        record=_record_source,
     )

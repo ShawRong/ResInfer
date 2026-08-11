@@ -283,32 +283,16 @@ def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
 
 # ----------------------------------------------------------------- timing
 def fold_tactic_source(sm: str, warned: bool) -> str:
-    """Where the fold's tile choice came from on this architecture.
-
-    Replaces a boolean `static_tactic_table`, which recorded "the warning
-    fired" and was therefore inverted on sm120: `run_fold_default` warns on
-    its first call of every process regardless of the table's quality, while
-    sm10x warns only when the tuner genuinely found nothing. The same flag
-    meant two different things per architecture.
-
-        autotuned      sm10x, tuner ran -- and this is the PRODUCTION path
-                       there: serving primes `tune_families` in its warmup
-                       window, so priming before timing is deployment
-                       behaviour, not special treatment.
-        offline_table  sm120. There is no runtime fold tuner by design; the
-                       tile table is itself the product of a full offline
-                       sweep (see cute_fold_sm120/tactics.py). Production
-                       reads this table too.
-        fallback       sm10x, tuner found nothing and the static table served.
-                       The only value that is actually a warning.
-
-    So the three architectures measure three different production paths, and
-    that asymmetry belongs to the system under test rather than to this
-    benchmark. Cross-architecture rows must NOT be read as same-mechanism
-    comparisons.
-    """
+    "Where the fold's tile choice came from on this architecture."
     if sm.startswith("sm12"):
-        return "offline_table"
+        try:
+            from quant.vllm_integration.sm120_fold_tuner import \
+                last_tactic_source
+
+            src = last_tactic_source()
+            return src if src is not None else "offline_table"
+        except Exception:                                  # noqa: BLE001
+            return "offline_table"    # pre-tuner tree: the constant IS true
     return "fallback" if warned else "autotuned"
 
 
@@ -538,6 +522,23 @@ def run(args) -> None:
                     if "fold FIRED" in buf.getvalue():
                         fold_seen[0] = True
                     assert_args_consumed(f, mext_args, label="mext")
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    
+                    if args.autotune:
+                        fi_autotuned(f, mext_args, m_bucket=m)
                     mext_kpc = kernels_per_call(f, mext_args)
                     before = nvfp4_fold.compile_stats()
                     t = timed_detail(f, mext_args, repeats=args.repeats)
@@ -559,6 +560,9 @@ def run(args) -> None:
                           "fold_fired_in_run": fold_seen[0],
                           "weight_mb": n * k / 2 / 1e6,
                           "kernels_per_call": mext_kpc,
+                          # fold_tactic_source is hardcoded per-arch on sm12x
+                          # and cannot report this; see the priming comment.
+                          "fold_tuner_primed": bool(args.autotune),
                           # The fold quantises the activation and the baseline
                           # does not, so +1 is expected and +3 was the alpha
                           # defect. Recorded, not asserted: a difference is not
@@ -597,6 +601,8 @@ def run(args) -> None:
                             True, False, False)
                         kext_args = (x, e["w"], e["sf"])
                         assert_args_consumed(f, kext_args, label=f"kext r={r}")
+                        if args.autotune:      # same fairness rule as mext
+                            fi_autotuned(f, kext_args, m_bucket=m)
                         kext_kpc = kernels_per_call(f, kext_args)
                         t = timed_detail(f, kext_args, repeats=args.repeats)
                         emit({"kind": "measure", "run_id": run_id,
@@ -612,6 +618,7 @@ def run(args) -> None:
                               "vs_ideal": t["us"] / ((1.0 + r) * stock["us"]),
                               "weight_mb": n * e["k_ext"] / 2 / 1e6,
                               "kernels_per_call": kext_kpc,
+                              "fold_tuner_primed": bool(args.autotune),
                               "kernels_vs_stock": (
                                   (kext_kpc - stock_kpc)
                                   if (kext_kpc is not None
