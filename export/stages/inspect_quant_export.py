@@ -327,7 +327,19 @@ class InspectQuantExportStage(Stage):
             with safe_open(shard, framework="pt", device="cpu") as handle:
                 keys.extend(handle.keys())
         if not keys:
-            raise FileNotFoundError(f"No safetensors found in {export_dir}")
+            # Name the resolution, not just the miss. `export_dir` arrives
+            # through ctx.resolve_path, which makes a RELATIVE path relative
+            # to case_dir -- correct for a stage, and surprising to a caller
+            # who passed `--out foo` from inside `foo` and now reads
+            # "No safetensors found in foo/foo". The behaviour is not the
+            # defect; a message that says "missing file" when the truth is
+            # "different directory than you meant" is.
+            raise FileNotFoundError(
+                f"No safetensors found in {export_dir} "
+                f"(exists={export_dir.exists()}). Relative export_dir values "
+                f"are resolved against the stage's case_dir, so a relative "
+                f"--out can land one level deeper than intended; pass an "
+                f"absolute path if this is not the directory you meant.")
         return sorted(keys)
 
     @staticmethod

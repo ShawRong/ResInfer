@@ -303,6 +303,25 @@ def install_env(a):
         if getattr(a, "residue_off", False):
             # threshold 0 -> every M is "> 0" -> residue killed everywhere
             os.environ["RESIDUE_PREFILL_RESIDUE_OFF_MIN_M"] = "0"
+    # The fourth cell of the kill-switch 2x2, and the only one no eval arm had
+    # ever used: MAX_M kills residue in the DECODE band, leaving prefill-only.
+    # Without it `both ~= prefill + decode` (complementary) and
+    # `both ~= max(prefill, decode)` (redundant) are indistinguishable -- the
+    # source comment in residue_linear_op.py says so, and 24 arms on disk had
+    # gone by with the cell unused because reaching it needed a raw env var.
+    if getattr(a, "prefill_only", None) is not None:
+        if a.plain:
+            raise SystemExit("--prefill-only is meaningless with --plain/--bf16")
+        os.environ["RESIDUE_PREFILL_RESIDUE_OFF"] = "1"
+        os.environ["RESIDUE_PREFILL_RESIDUE_OFF_MAX_M"] = str(a.prefill_only)
+        if os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M") is not None:
+            # Both bounds set means "kill where either holds", i.e. residue
+            # survives only between them -- not what anyone reaching for
+            # --prefill-only wants, and it would silently produce the plain arm
+            # under the prefill-only name.
+            raise SystemExit(
+                "--prefill-only cannot be combined with --residue-off: both "
+                "bounds set kills BOTH bands and yields the plain cell.")
     repo = a.repo or os.environ.get("RESINFER_REPO", "")
     if repo:
         parts = [repo, str(pathlib.Path(repo) / "csrc" / "nvfp4")]
@@ -350,6 +369,7 @@ def install_env(a):
             "VLLM_ENABLE_V1_MULTIPROCESSING", "RESIDUE_PATCH_VLLM",
             "RESIDUE_ENABLE_DECODE_MEXT", "RESIDUE_PREFILL_RESIDUE_OFF",
             "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M",
+            "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M",
             "VLLM_DISABLE_COMPILE_CACHE")), flush=True)
     # flashinfer JIT links -lcuda from a stub dir that may not contain it
     os.environ["LIBRARY_PATH"] = ("/usr/lib/x86_64-linux-gnu:"
@@ -422,7 +442,7 @@ def cmd_run(a) -> int:
         (out_dir / f"{a.arm}__{task}.jsonl").write_text(
             "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
         score = sum(r["score"] for r in rows) / len(rows)
-        print(f"[kit] {a.arm:<14}{task:<22}{METRIC[task]:<11}{score:.4f}  "
+        print(f"[kit] {a.arm:<20} {task:<22}{METRIC[task]:<11}{score:.4f}  "
               f"n={len(rows)}  prefill={ptok/max(ptok+gtok,1)*100:.1f}%  "
               f"prompt_med={sorted(r['n_prompt'] for r in rows)[len(rows)//2]:,}",
               flush=True)
@@ -516,6 +536,47 @@ def cmd_analyze(a) -> int:
                   "generation and the column carries no information about how "
                   "much an arm reasons. Read it on a decode venue (LCB, AIME).")
 
+        # Venue-qualification criterion 2, made mechanical.
+        #
+        # A venue can pass the damage test and still be scoring something other
+        # than the capability it names. On passage_retrieval_en, wrong answers
+        # sit at exactly the 32-token cap while right answers are 4-5 tokens,
+        # and bf16 hits the cap 0 times against the quantised arms' 29-39: the
+        # model paraphrases the passage instead of naming it and the cap turns
+        # that into a zero. That subset carried the largest "damage" in this
+        # project's tables for months. Criterion 1 cannot see it, so it gets
+        # its own column rather than a footnote somebody has to recompute.
+        print("\n=== truncation check (criterion 2: is the venue scoring the cap?) ===")
+        print(f"  {'arm':<22}{'subset':<22}{'n_gen ok':>9}{'n_gen bad':>10}"
+              f"{'bad@cap':>9}{'  verdict'}")
+        flagged = False
+        for x in order:
+            for t in tasks:
+                rows = arms[x].get(t) or []
+                if not rows or rows[0].get("n_gen") is None:
+                    continue
+                ok = [i["n_gen"] for i in rows if i.get("score", 0) >= 1]
+                bad = [i["n_gen"] for i in rows if i.get("score", 0) < 1]
+                if not bad:
+                    continue
+                mo = sorted(ok)[len(ok) // 2] if ok else 0
+                mb = sorted(bad)[len(bad) // 2]
+                cap = max(i["n_gen"] for i in rows)
+                at_cap = sum(1 for v in bad if v >= cap)
+                # The signature: wrong answers pinned at the ceiling while
+                # right answers are far below it.
+                suspect = at_cap >= max(3, 0.5 * len(bad)) and mo and mb >= 2 * mo
+                if suspect:
+                    flagged = True
+                print(f"  {x:<22}{t:<22}{mo:>9,}{mb:>10,}{at_cap:>9}"
+                      f"{'  <-- SCORING THE CAP' if suspect else ''}")
+        if flagged:
+            print("\n  !! At least one arm's wrong answers are pinned at the")
+            print("  !! generation cap while its right answers are far shorter.")
+            print("  !! This venue is scoring instruction-following/truncation,")
+            print("  !! not the capability it is named for. It FAILS criterion 2")
+            print("  !! regardless of how large its measured damage is.")
+
     ref, base = a.reference, a.baseline
 
     
@@ -529,19 +590,48 @@ def cmd_analyze(a) -> int:
     
     
     
-    def _floor_kind(arm_id):
+    def _prov(arm_id):
         p = pathlib.Path(a.out) / f"{arm_id}__provenance.json"
-        if not p.exists():
-            return None, "no provenance.json -- cannot tell which floor this is"
-        env = (json.loads(p.read_text()).get("env") or {})
-        patched = env.get("RESIDUE_PATCH_VLLM") == "1"
-        killed = env.get("RESIDUE_PREFILL_RESIDUE_OFF") == "1"
-        if not patched:
+        return json.loads(p.read_text()) if p.exists() else None
+
+    def _cell(arm_id):
+        """Which of the kill-switch 2x2 an arm actually ran, from provenance.
+
+        Never from the arm's name or the flag's name: the gate is called
+        PREFILL and with _MAX_M it kills the DECODE band. A whole session was
+        spent reading "off" as "the method is off" -- it is not; without a
+        bound, residue survives everywhere below the fold band, so the delta
+        an "off" arm defines is the PREFILL half only.
+        """
+        rec = _prov(arm_id)
+        if rec is None:
+            return None, "no provenance.json -- the cell cannot be determined"
+        env = rec.get("env") or {}
+        if env.get("RESIDUE_PATCH_VLLM") != "1":
             return "stock", "stock vLLM, residue patch never installed"
-        if killed:
-            return "runtime_off", ("our patched linear op with residue disabled "
-                                   "at run time -- K is still extended")
-        return "method", "residue ACTIVE -- this is not a floor at all"
+        if env.get("RESIDUE_PREFILL_RESIDUE_OFF") != "1":
+            return "both", "residue active everywhere"
+        lo = env.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M")
+        hi = env.get("RESIDUE_PREFILL_RESIDUE_OFF_MAX_M")
+        if lo == "0" and hi is None:
+            return "plain", "residue killed at every M (K still extended)"
+        if hi is not None and lo is None:
+            return "prefill-only", f"residue killed in the decode band (M <= {hi})"
+        if hi is not None and lo is not None:
+            return "between", ("BOTH bounds set -- residue survives only between "
+                               "them; almost certainly not what was intended")
+        return "decode-only", ("residue killed above the fold band -- PREFILL "
+                               "half only; decode residue is still live")
+
+    def _floor_kind(arm_id):
+        cell, why = _cell(arm_id)
+        if cell in (None, "stock"):
+            return ("stock" if cell else None), why
+        if cell == "both":
+            return "method", "residue ACTIVE -- this is not a floor at all"
+        if cell == "plain":
+            return "runtime_off", why
+        return cell, why
 
     kind, why = _floor_kind(base)
     if kind is not None:
@@ -555,6 +645,38 @@ def cmd_analyze(a) -> int:
         elif kind == "method":
             print("  !! The baseline arm ran with residue ACTIVE. Every delta below")
             print("  !! is method-vs-method, not method-vs-floor.")
+
+    
+    
+    
+    
+    print("\n=== arm identity (from provenance, never from the name) ===")
+    print(f"  {'arm':<22}{'kill-switch cell':<18}{'calibration':<22}note")
+    recipes: dict[str, list[str]] = {}
+    for arm_id in order:
+        cell, why = _cell(arm_id)
+        rec = _prov(arm_id)
+        cal = (rec or {}).get("calibration")
+        if cal is None:
+            fp = "UNRECORDED"
+        elif "error" in cal:
+            fp = "unreadable"
+        else:
+            fp = str(cal.get("recipe_fingerprint", "no-fingerprint"))[:12]
+        recipes.setdefault(fp, []).append(arm_id)
+        print(f"  {arm_id:<22}{str(cell):<18}{fp:<22}{why}")
+    live = {k: v for k, v in recipes.items() if k not in ("UNRECORDED", "unreadable")}
+    if len(live) > 1:
+        print("\n  !! ARMS SPAN MORE THAN ONE CALIBRATION RECIPE -- this is not one")
+        print('  !! table. Calibration recipes can affect the baseline and must be')
+        print('  !! matched across arms before interpreting the differences')
+        print("  !! reported below.")
+        for fp, names in live.items():
+            print(f"       {fp}: {', '.join(names)}")
+    elif not live:
+        print("\n  note: no arm records its calibration recipe, so 'same recipe'")
+        print("  is an assumption here, not a check. Export with")
+        print("  calibration_provenance.json beside the checkpoint to close this.")
     gate = {}
     if ref not in arms or base not in arms:
         
@@ -1025,6 +1147,21 @@ def write_provenance(a, out_dir, engine_kwargs: dict, extra: dict | None = None)
            "env": {k: os.environ.get(k) for k in sorted(
                [e for e in os.environ if e.startswith(("RESIDUE_", "VLLM_"))])},
            "python": platform.python_version(), "platform": platform.platform()}
+    
+    
+    
+    
+    
+    
+    
+    
+    rec["calibration"] = None
+    try:
+        cp = pathlib.Path(a.model) / "calibration_provenance.json"
+        if cp.exists():
+            rec["calibration"] = json.loads(cp.read_text())
+    except Exception as exc:  # noqa: BLE001
+        rec["calibration"] = {"error": f"{type(exc).__name__}: {exc}"}
     for mod in ("vllm", "torch", "flashinfer", "transformers"):
         try:
             rec.setdefault("versions", {})[mod] = __import__(mod).__version__
@@ -1522,13 +1659,26 @@ def main() -> int:
     r.add_argument("--residue-off", action="store_true",
                    help="kill residue at EVERY M (the plain floor, from the "
                         "residue checkpoint itself)")
+    r.add_argument("--prefill-only", type=int, metavar="FOLD_BAND",
+                   help="kill residue in the DECODE band (M <= FOLD_BAND), "
+                        "leaving prefill-only -- the 2x2's fourth cell, "
+                        "without which prefill+decode cannot be told apart "
+                        "from max(prefill, decode). Pass the fold band, "
+                        "typically 64.")
     r.add_argument("--max-model-len", type=int, default=32768)
     r.add_argument("--max-num-seqs", type=int, default=8)
     r.add_argument("--flashinfer-autotune", action="store_true",
                    help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     r.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
-    r.add_argument("--gpu-mem-util", type=float, default=0.85)
+    # knob 7. ONE default across every subcommand. They used to be 0.85 /
+    # 0.85 / 0.62 / 0.55 / 0.55, which makes "unset" not a value -- the
+    # same defect as the max_num_seqs 8-vs-4 split that silently divided
+    # one table across two batch compositions. 0.55 is what every table on
+    # record used; 0.85 on a 178GiB card asks for 151GiB and is the most
+    # aggressive KV allocation available, which is not a default an
+    # unattended task should inherit.
+    r.add_argument("--gpu-mem-util", type=float, default=0.55)
     r.add_argument("--mext-max-m", type=int, default=64)
     r.add_argument("--limit", type=int, default=None)
     r.add_argument("--seed", type=int, default=42)
@@ -1570,7 +1720,7 @@ def main() -> int:
                    help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     q.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
-    q.add_argument("--gpu-mem-util", type=float, default=0.85)
+    q.add_argument("--gpu-mem-util", type=float, default=0.55)
     q.add_argument("--mext-max-m", type=int, default=64)
     q.add_argument("--seed", type=int, default=42)
     q.add_argument("--force", action="store_true")
@@ -1604,7 +1754,7 @@ def main() -> int:
                    help="DIAGNOSTIC: run with FlashInfer autotune ON (the production setting). Off by default -- knob 3. A table must not mix the two.")
     k.add_argument("--max-num-batched-tokens", type=int, default=None,
                    help="knob 2 -- MUST be explicit; any fixed value works, what matters is that it is identical across the table")
-    k.add_argument("--gpu-mem-util", type=float, default=0.62)
+    k.add_argument("--gpu-mem-util", type=float, default=0.55)
     k.add_argument("--mext-max-m", type=int, default=64)
     k.add_argument("--max-gen", type=int, default=256)
     k.add_argument("--limit", type=int, default=None)
