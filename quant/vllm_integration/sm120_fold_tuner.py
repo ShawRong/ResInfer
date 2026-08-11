@@ -42,8 +42,17 @@ _DEGRADED = [False]
 _LAST_SOURCE: list = [None]
 
 
+
+
+_LAST_TILE: list = [None]
+
+
 def last_tactic_source() -> str | None:
     return _LAST_SOURCE[0]
+
+
+def last_tactic_tile() -> tuple[int, int, int] | None:
+    return _LAST_TILE[0]
 
 
 def _record_source(src: str) -> None:
@@ -93,6 +102,7 @@ def _run_fold_tile(inputs, tile, out_dtype) -> torch.Tensor:
     if m_pad != m:
         x_in = torch.zeros(m_pad, x.shape[1], dtype=x.dtype, device=x.device)
         x_in[:m] = x
+    _LAST_TILE[0] = tile
     x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(x_in, gs_inv, layout_mode=1)
     out = mext_fold_gemm_sm120(
         weight, x_fp4, wsb, x_sf.view(torch.float8_e4m3fn), alpha, out_dtype,

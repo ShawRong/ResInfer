@@ -29,10 +29,17 @@ _DEGRADED = [False]
 
 # Actual source of the most recent call's tactic (see sm120_fold_tuner).
 _LAST_SOURCE: list = [None]
+# The tactic that ACTUALLY ran (see sm120_fold_tuner). None on the legacy
+# path, which resolves its tile inside nvfp4.fold and does not report it.
+_LAST_TILE: list = [None]
 
 
 def last_tactic_source() -> str | None:
     return _LAST_SOURCE[0]
+
+
+def last_tactic_tile():
+    return _LAST_TILE[0]
 
 
 def _record_source(src: str) -> None:
@@ -117,6 +124,7 @@ def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
     from nvfp4.cute_fold.host import mext_fold_gemm_sm103
 
     mode, tiler, cluster, ab = _candidates()[idx]
+    _LAST_TILE[0] = (mode, tiler, cluster, ab)
     x_fp4, x_sf = _quant_row_pair(inputs)
     _, weight, _, wsb, alpha = inputs
     out = mext_fold_gemm_sm103(
@@ -133,6 +141,7 @@ def _run_fallback(inputs, out_dtype) -> torch.Tensor:
     run_fold consults the in-process tuned cache, then the static table."""
     from nvfp4.fold import run_fold
 
+    _LAST_TILE[0] = None      # legacy path picks internally and stays mute
     x_fp4, x_sf = _quant_row_pair(inputs)
     _, weight, _, wsb, alpha = inputs
     major, minor = torch.cuda.get_device_capability()

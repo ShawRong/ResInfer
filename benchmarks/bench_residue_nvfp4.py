@@ -290,6 +290,19 @@ def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
 
 
 # ----------------------------------------------------------------- timing
+def fold_tactic_tile(sm: str):
+    'WHICH tile/tactic actually ran, not just where the choice came from.'
+    mod = ("quant.vllm_integration.sm120_fold_tuner" if sm.startswith("sm12")
+           else "quant.vllm_integration.sm10x_fold_tuner")
+    try:
+        import importlib
+
+        tile = importlib.import_module(mod).last_tactic_tile()
+        return list(tile) if isinstance(tile, tuple) else tile
+    except Exception:                                      # noqa: BLE001
+        return None
+
+
 def fold_tactic_source(sm: str, warned: bool) -> str:
     "Where the fold's tile choice came from on this architecture."
     if sm.startswith("sm12"):
@@ -579,6 +592,7 @@ def run(args) -> None:
                           # the row is not a measurement of the kernel.
                           "jit_during_timing": _compiled_delta(before, after),
                           "fold_tactic_source": fold_tactic_source(sm, bool(tw.hits)),
+                          "fold_tactic_tile": fold_tactic_tile(sm),
                           "fold_fired_in_run": fold_seen[0],
                           "weight_mb": n * k / 2 / 1e6,
                           "kernels_per_call": mext_kpc,
@@ -641,6 +655,7 @@ def run(args) -> None:
                               "weight_mb": n * e["k_ext"] / 2 / 1e6,
                               "kernels_per_call": kext_kpc,
                               "fold_tuner_primed": bool(args.autotune),
+                              "fold_tactic_tile": fold_tactic_tile(sm),
                               "kernels_vs_stock": (
                                   (kext_kpc - stock_kpc)
                                   if (kext_kpc is not None
