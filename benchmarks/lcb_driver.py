@@ -409,6 +409,20 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path,
     
     
     env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    env["LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu:" + env.get("LIBRARY_PATH", "")
     # probe_site FIRST (its sitecustomize chain-loads the repo's), repo root
     # SECOND (`quant` is not pip-installed; the plugin imports it from here).
     env["PYTHONPATH"] = ":".join(

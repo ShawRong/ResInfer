@@ -48,11 +48,11 @@ def weight_geometry(weight: torch.Tensor) -> tuple[int, int, int | None]:
 
 
 def make_tuning_config(buckets: Sequence[int], map_fn: Callable[[int], int]):
-    """Build the one-dynamic-dim (input 0, dim 0) TuningConfig every residue
-    tuner uses. Caller caches the result (it is hashed into cache keys)."""
+    'Build the one-dynamic-dim (input 0, dim 0) TuningConfig every residue'
     from flashinfer.autotuner import DynamicTensorSpec, TuningConfig
 
     return TuningConfig(
+        use_cold_l2_cache=True,
         dynamic_tensor_specs=(
             DynamicTensorSpec(
                 input_idx=(0,),
@@ -62,6 +62,67 @@ def make_tuning_config(buckets: Sequence[int], map_fn: Callable[[int], int]):
             ),
         ),
     )
+
+
+# What the last tuning window actually achieved, per op. Reported, never
+# assumed -- see cold_tuning_state.
+_COLD_STATE: dict[str, dict] = {}
+
+
+def cold_tuning_state(op_name: str | None = None):
+    'Did the tuning window actually run cold? Ask; do not infer.'
+    if op_name is None:
+        return dict(_COLD_STATE)
+    return _COLD_STATE.get(op_name)
+
+
+def prime_cold_tuning(op_name: str, inputs: list) -> dict:
+    """Raise the AutoTuner's `repeat` until the clone set clears L2.
+
+    `repeat` lives on the AutoTuner singleton, not on a TuningConfig, so
+    this is process-wide and therefore SYMMETRIC: the baseline tunes with
+    the same value. That is the property to preserve -- a per-arm repeat
+    would hand the two arms different profiling conditions, which is the
+    fairness rule arriving through a parameter nobody thinks of as an arm
+    property.
+
+    Returns the state, and records it for `cold_tuning_state`.
+    """
+    import torch
+    from flashinfer.autotuner import AutoTuner
+
+    tuner = AutoTuner.get()
+    one_buffer = sum(
+        t.numel() * t.element_size() for t in inputs if isinstance(t, torch.Tensor)
+    )
+    try:
+        l2 = tuner._get_l2_cache_size_in_bytes()
+    except Exception:
+        l2 = torch.cuda.get_device_properties(0).L2_cache_size
+    state = {"one_buffer_bytes": one_buffer, "l2_bytes": l2,
+             "repeat_before": tuner.repeat}
+    if one_buffer <= 0:
+        state.update(cold=False, why="no tensor inputs measured")
+        _COLD_STATE[op_name] = state
+        return state
+    # Enough clones that the working set exceeds L2 outright; the +1 is the
+    # original, and one extra is margin against a partial last touch.
+    need_buffers = int(l2 // one_buffer) + 2
+    uncapped = l2 * 3 // one_buffer + 1
+    need_repeat = min(uncapped, need_buffers) - 1
+    if need_repeat > tuner.repeat:
+        tuner.repeat = need_repeat
+    buffers = min(uncapped, tuner.repeat + 1)
+    workset = buffers * one_buffer
+    state.update(repeat=tuner.repeat, num_buffers=buffers,
+                 workset_bytes=workset, workset_over_l2=workset / l2,
+                 cold=workset > l2)
+    if not state["cold"]:
+        state["why"] = ("clone count capped below what L2 needs -- "
+                        f"{buffers} x {one_buffer / 1e6:.1f}MB does not clear "
+                        f"{l2 / 1e6:.1f}MB")
+    _COLD_STATE[op_name] = state
+    return state
 
 
 def make_runner_pair(
@@ -162,6 +223,12 @@ def tuned_call(
         return fallback_forward(inputs)
 
     runners = runners_getter()
+    # Only inside a tuning window does choose_one actually profile, so that
+    # is the only place raising `repeat` costs anything or buys anything.
+    # Outside it this is a cache lookup and the state stays as the window
+    # left it -- which is what the bench should report.
+    if AutoTuner.get().is_tuning_mode:
+        prime_cold_tuning(op_name, inputs)
     runner, tactic = AutoTuner.get().choose_one(
         op_name, runners, config_getter(), inputs)
     if announce is not None and not announce_flag[0]:

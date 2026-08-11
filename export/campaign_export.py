@@ -76,6 +76,33 @@ BASE_MODEL = os.environ.get("RESIDUE_CAMPAIGN_BASE", "")
 # project price the whole pipeline while reading as NVFP4's cost.
 ORIG_BF16 = os.environ.get("RESIDUE_CAMPAIGN_ORIG_BF16", "")
 
+# Where the solver frontier's policy_metadata/ lives. STEP 1b writes it
+# under the campaign's own output directory, so the default is derived from
+# that rather than fixed relative to the repo -- the two used to disagree,
+# and the symptom was a preflight failing for policies nothing would ever
+# put where it looked.
+FRONTIER_DIR = os.environ.get("RESIDUE_CAMPAIGN_FRONTIER", "")
+
+
+def resolve_policy(spec: dict, out_root=None) -> str | None:
+    """A spec's `policy` is a FILENAME; this says where to find it.
+
+    Order: RESIDUE_CAMPAIGN_FRONTIER, else <out>/solver_frontier_4b. An
+    absolute path in the spec is honoured as-is, so an externally produced
+    frontier can still be pointed at.
+    """
+    pol = spec.get("policy")
+    if not pol:
+        return None
+    if os.path.isabs(pol):
+        return pol
+    root = FRONTIER_DIR or (str(Path(out_root) / "solver_frontier_4b")
+                            if out_root else "")
+    if not root:
+        return pol            # unresolvable: preflight reports it as missing
+    return str(Path(root) / "policy_metadata" / pol)
+
+
 _ENV_HELP = {
     "RESIDUE_CAMPAIGN_DATASET": "calibration .jsonl for " + RECIPE["dataset_id"],
     "RESIDUE_CAMPAIGN_BASE": "the GPTQ base every quantised arm is built from",
@@ -137,17 +164,13 @@ SPECS: dict[str, list[dict[str, Any]]] = {
     # where the bad checkpoints came from.
     "solver_4b": [
         {"arm": "solver_b4p5", "ratio": 0.125,
-         "policy": f"{REPO}/runs/solver_frontier_4b_seq2048/policy_metadata/"
-                   "gradient_effective_bits_budget4p5_residue_metadata.json"},
+         "policy": "gradient_effective_bits_budget4p5_residue_metadata.json"},
         {"arm": "solver_b5", "ratio": 0.25,
-         "policy": f"{REPO}/runs/solver_frontier_4b_seq2048/policy_metadata/"
-                   "gradient_effective_bits_budget5_residue_metadata.json"},
+         "policy": "gradient_effective_bits_budget5_residue_metadata.json"},
         {"arm": "solver_b6", "ratio": 0.5,
-         "policy": f"{REPO}/runs/solver_frontier_4b_seq2048/policy_metadata/"
-                   "gradient_effective_bits_budget6_residue_metadata.json"},
+         "policy": "gradient_effective_bits_budget6_residue_metadata.json"},
         {"arm": "solver_b8", "ratio": 1.0,
-         "policy": f"{REPO}/runs/solver_frontier_4b_seq2048/policy_metadata/"
-                   "gradient_effective_bits_budget8_residue_metadata.json"},
+         "policy": "gradient_effective_bits_budget8_residue_metadata.json"},
     ],
 }
 
@@ -276,8 +299,12 @@ def preflight(spec_name: str) -> int:
           f"known: {', '.join(sorted(SPECS))}")
     if arms:
         for a in arms:
-            if a.get("policy") is not None and not Path(a["policy"]).exists():
-                check(f"policy for arm {a['arm']}", False, a["policy"])
+            pol = resolve_policy(a, os.environ.get("RESIDUE_CAMPAIGN_OUT"))
+            if a.get("policy") is not None and not (pol and Path(pol).exists()):
+                check(f"policy for arm {a['arm']}", False,
+                      (pol or a["policy"]) + "   <- produced by the solver "
+                      "frontier (step 1b); preflight solver_4b AFTER it, "
+                      "not before")
         print(f"  {len(arms)} arm(s): {', '.join(a['arm'] for a in arms)}")
 
     print("=== gpu ===")
@@ -340,7 +367,7 @@ def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
 
     arm = spec["arm"]
     ratio = spec.get("ratio")
-    policy = spec.get("policy")
+    policy = resolve_policy(spec, out_root)
     d = out_root / arm
     art = out_root / "_artifacts" / arm
 
