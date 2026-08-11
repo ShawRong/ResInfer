@@ -40,6 +40,11 @@ _LAYOUT_ROW_PAIR = 1
 # warmup_fold_default compiled the row_pair candidates (symbolic shapes:
 # one compile set serves every (n_w, k, m), strided and contiguous).
 _READY = [False]
+# Tactic indices that EXECUTED in this process (tuning window or serving):
+# a kernel that just ran is compiled, so it may serve even without the full
+# precompile -- the same semantic weld as sm120's _note_compiled (family
+# bug #7: two individually-correct modules whose semantics did not join).
+_EXECUTED: set = set()
 _ANNOUNCED = [False]
 _DEGRADED = [False]
 
@@ -135,11 +140,13 @@ def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
     mode, tiler, cluster, ab = _candidates()[idx]
     x_fp4, x_sf = _quant_row_pair(inputs)
     _, weight, _, wsb, alpha = inputs
-    return mext_fold_gemm_sm103(
+    out = mext_fold_gemm_sm103(
         weight, x_fp4, wsb, x_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster, store_mode=mode,
         kernel_arch=_arch(), ab_stage_override=ab, pi_via_layout=False,
     )
+    _EXECUTED.add(idx)
+    return out
 
 
 def _run_fallback(inputs, out_dtype) -> torch.Tensor:
@@ -179,7 +186,9 @@ def _make_runners(out_dtype):
         legal = _legal_indices(int(inputs[0].shape[0]))
         if tuning:
             return legal
-        return legal if _READY[0] else []
+        if _READY[0]:
+            return legal
+        return [i for i in legal if i in _EXECUTED]
 
     def _run(inputs, i):
         return _run_tactic(inputs, i, out_dtype)
