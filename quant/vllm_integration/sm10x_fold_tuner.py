@@ -1,27 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""FlashInfer-autotuned tactic selection for the sm10x CuTeDSL decode fold.
-
-Phase 3 of the fold-autotune-via-flashinfer plan, row_pair family only --
-the default build's sole family (A4/A6 stay on the in-process tuner until
-Level 2 lands). Same scaffold as the sm120 fold and the prefill tuner:
-runners[0] is the pre-existing serving path (dict-cache hit or static
-table via `fold.run_fold` with the family pinned), candidates are indices
-into FAMILY_TACTICS[("row_pair","std")] with the list's hash in the
-cache-key extras, and outside the tuning window only warmed tactics are
-offered.
-
-DEFAULT OFF (RESIDUE_SM10X_FOLD_TUNER=0): this machine has no sm10x GPU,
-so the switch ships dark and a pod task validates it on B200 before the
-default flips. Until then the in-process dict tuner keeps serving sm100
-decode exactly as before -- at no point is sm10x without a tuned path.
-After the flip, the dict machinery in cute_fold/tactics.py is deleted
-(the convergence this module exists for).
-
-What sm10x gains over the dict tuner, same as everywhere else: JSON
-persistence (no per-boot retune), TP consistency (leader tunes, one cache
-broadcast), and the shared prewarm/audit tooling.
-"""
+'FlashInfer-autotuned tactic selection for the sm10x CuTeDSL decode fold.'
 
 from __future__ import annotations
 
@@ -221,7 +200,13 @@ def _announce(runner, tactic, runners) -> str:
 
 
 def tuner_enabled() -> bool:
-    return os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "0") == "1"
+    
+    
+    
+    
+    
+    
+    return os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1"
 
 
 def tuned_sm10x_fold(

@@ -3272,7 +3272,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # `weight_ext[:, :k_base_packed]` view: width k_base, rows k_ext apart.
         # make_ordered_layout would rebuild a compact layout and silently read
         # the wrong elements, so build the layout explicitly instead.
-        # (Same shape/stride decoupling the SM120 C++ path uses --
+        # (Same shape/stride decoupling the deleted SM120 C++ path used --
         #  stride_B = make_int_tuple_from<StrideB>(physical_k_ext, 0).)
         # The FP4 branch doubled k when recasting uint8 -> Float4E2M1FN, so the
         # strides must be doubled with it: they are counted in ELEMENTS.

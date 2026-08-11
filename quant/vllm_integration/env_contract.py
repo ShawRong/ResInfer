@@ -83,8 +83,8 @@ KNOWN: dict[str, tuple] = {
                                  "static table directly)"),
     "RESIDUE_SM10X_FOLD_TUNER": ("enum", {"0", "1"},
                                  "sm10x decode-fold FlashInfer tactic tuner "
-                                 "(default OFF pending sm100 validation; the "
-                                 "legacy in-process tuner serves meanwhile)"),
+                                 "(default ON since task-014 passed on B200; "
+                                 "0 = the legacy in-process tuner path)"),
     "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
                                    "kill the sm10x fold (mext_r1 layers then "
                                    "refuse to serve, by design)"),

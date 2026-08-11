@@ -240,8 +240,9 @@ def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
     return m > int(fold_max_m)
 
 # ── SM100/SM103 (B200/B300) CuTeDSL fold path ──────────────────────────────
-# On Blackwell datacenter GPUs the SM120 C++ fold GEMM does not exist; use the
-# CuTeDSL sm100/sm103 fork (nvfp4.cute_fold). It consumes the row_pair mext_r1
+# Blackwell datacenter GPUs use the CuTeDSL sm100/sm103 fork
+# (nvfp4.cute_fold). (This comment used to contrast with 'the SM120 C++ fold
+# GEMM' -- deleted 2a3e507; sm120 is CuTeDSL too now.) It consumes the row_pair mext_r1
 # quant layout directly (no m_pad, no tile8) and, for pure mext_r1 layers,
 # reads the full contiguous packed weight (k_base == full K, no prefix slice).
 # Cached: capability probe runs once.
@@ -910,7 +911,7 @@ def nvfp4_linear(
 
             if layout == "tile8":
                 # tile8 pads M to a multiple of 8 inside the quant op (same
-                # contract the SM120 C++ fold uses); out[:original_m] trims.
+                # contract the deleted SM120 C++ fold used); out[:original_m] trims.
                 x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
                     x,
                     input_global_scale_inv,

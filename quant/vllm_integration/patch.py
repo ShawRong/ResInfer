@@ -304,8 +304,9 @@ def _install_fold_decode_autotune_warmup() -> None:
     decode forwards INTO vLLM's warmup: while ``flashinfer_autotune`` runs, we
     temporarily wrap ``runner._dummy_run`` so its profiling call ALSO runs
     decode-sized forwards. Those execute inside the SAME ``autotune(cache=)``
-    context, so the fold's tactic -- keyed by op name ``mext_fold_fp4_gemm`` --
-    lands in the same JSON cache the leader saves and broadcasts. Every rank
+    context, so the fold tactics (``residue_fold_tile_sm120``,
+    ``residue_fold_tactic_sm10x``; the C++-era ``mext_fold_fp4_gemm`` died
+    with its op) land in the same JSON cache the leader saves and broadcasts. Every rank
     then loads one identical cache: TP-consistent, and persisted for fast
     restarts. Gated on ``is_tuning_mode`` so only the tuning (leader) rank pays
     the extra profiling. Best-effort: any failure leaves vLLM's warmup untouched.

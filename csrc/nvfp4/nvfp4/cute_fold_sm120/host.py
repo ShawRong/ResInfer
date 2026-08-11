@@ -67,7 +67,7 @@ def _fold_launch(
     # and k_ext for an ext-K residue layer whose weight is a
     # `weight_ext[:, :k_base_packed]` view: the problem's K stays k_base while
     # the rows sit k_ext apart, so the fold reads the base-K prefix in place
-    # with no copy. Same trick the SM120 C++ path uses --
+    # with no copy. Same trick the deleted SM120 C++ path used --
     #   stride_B = make_int_tuple_from<StrideB>(physical_k_ext, 0)
     # with the problem shape at k_base. A's SF needs nothing special:
     # `weight_scale_base` is already the contiguous re-swizzled base-K prefix.
