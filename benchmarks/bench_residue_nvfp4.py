@@ -293,6 +293,20 @@ def fold_tactic_source(sm: str, warned: bool) -> str:
             return src if src is not None else "offline_table"
         except Exception:                                  # noqa: BLE001
             return "offline_table"    # pre-tuner tree: the constant IS true
+    # sm10x: since RESIDUE_SM10X_FOLD_TUNER defaulted on (task-014 PASS),
+    # the FI tuner resolves the tactic and the dict-tuner warning bit below
+    # describes a path that no longer serves by default -- ask the tuner
+    # first, same as sm120, and keep the warned-logic for the legacy path
+    # (tuner disabled or pre-flip tree).
+    try:
+        from quant.vllm_integration.sm10x_fold_tuner import \
+            last_tactic_source as _sm10x_source
+
+        src = _sm10x_source()
+        if src is not None:
+            return src
+    except Exception:                                      # noqa: BLE001
+        pass
     return "fallback" if warned else "autotuned"
 
 
