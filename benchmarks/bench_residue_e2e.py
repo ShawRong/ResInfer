@@ -127,6 +127,80 @@ def _vllm_cli() -> str:
         f"{sys.executable} or on PATH. Run this script with the python of "
         "the environment vLLM is installed in.")
 
+def provenance(gpu: int, neighbors: list) -> dict:
+    """Everything needed, months later, to decide whether two tables compare.
+
+    The kernel benchmark in this directory carried this from the start; this
+    one did not, and the omission is the same failure it exists to prevent.
+    A summary.jsonl without it is not reproducible: the arm names and numbers
+    are there, but which commit, which vLLM, which GPU and which RESIDUE_*
+    produced them lives only in whoever ran it.
+
+    Env keys are written as "<unset>" rather than dropped, so "not set" and
+    "not recorded" stay distinguishable -- for RESIDUE_TENSOR_DUMP, "not set"
+    is exactly the claim being made.
+    """
+    import hashlib
+    import platform
+
+    def _v(mod):
+        try:
+            return __import__(mod).__version__
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    def _git(*a):
+        try:
+            r = subprocess.run(["git", "-C", str(REPO), *a],
+                               capture_output=True, text=True, timeout=20)
+            return r.stdout.strip() or None
+        except Exception:                                       # noqa: BLE001
+            return None
+
+    so = next(iter(sorted((REPO / "csrc" / "nvfp4" / "nvfp4").glob("_C*.so"))),
+              None)
+    md5 = None
+    if so:
+        h = hashlib.md5()
+        with open(so, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        md5 = h.hexdigest()
+
+    import torch
+    tracked = ("RESIDUE_PATCH_VLLM", "RESIDUE_PATCH_MODE",
+               "RESIDUE_ENABLE_DECODE_MEXT", "RESIDUE_DECODE_MEXT_MAX_M",
+               "RESIDUE_MEXT_PREFILL_PATH", "RESIDUE_SHARE_AUTOTUNE_CACHE",
+               "RESIDUE_TENSOR_DUMP", "RESIDUE_ATTN",
+               "VLLM_DISABLE_COMPILE_CACHE", "VLLM_ENABLE_V1_MULTIPROCESSING",
+               "VLLM_PLUGINS", "FLASHINFER_CUBIN_DIR", "CPATH", "CUDA_HOME")
+    q = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name,uuid,clocks.sm,temperature.gpu",
+         "--format=csv,noheader", "-i", str(gpu)],
+        capture_output=True, text=True)
+    return {
+        "kind": "provenance",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "repo_root": str(REPO),
+        "git_commit": _git("rev-parse", "HEAD"),
+        "git_subject": _git("log", "-1", "--format=%s"),
+        "git_dirty": bool(_git("status", "--porcelain")),
+        "ext_so": str(so) if so else None,
+        "ext_so_md5": md5,
+        "ext_so_mtime": (time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                       time.gmtime(so.stat().st_mtime))
+                         if so else None),
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": _v("torch"), "vllm": _v("vllm"),
+        "flashinfer": _v("flashinfer"), "cuda": torch.version.cuda,
+        "gpu_index": gpu, "gpu": q.stdout.strip(),
+        "gpu_neighbors": neighbors,
+        "vllm_cli": _vllm_cli(),
+        "env": {k: os.environ.get(k, "<unset>") for k in tracked},
+    }
+
+
 def _detect_quant(path: str) -> str | None:
     """Read the quantisation mode off the checkpoint instead of being told it.
 
@@ -168,7 +242,9 @@ def _num_prompts(conc: int) -> int:
     return min(256, max(32, 8 * conc))
 
 
-def assert_gpu_free(gpu: int, need_gib: float = 20.0) -> None:
+def assert_gpu_free(gpu: int, need_gib: float = 20.0,
+                    exclusive: bool = True) -> None:
+    'Refuse to measure unless the GPU has both the room AND no neighbours.'
     q = subprocess.run(
         ["nvidia-smi", "--query-gpu=memory.used,memory.total",
          "--format=csv,noheader,nounits", "-i", str(gpu)],
@@ -179,6 +255,35 @@ def assert_gpu_free(gpu: int, need_gib: float = 20.0) -> None:
         raise SystemExit(
             f"gpu{gpu} has only {free_gib:.1f} GiB free; need ~{need_gib}. "
             "Check for orphaned vLLM EngineCore (kill -9 -$pgid, not the pid).")
+
+    a = subprocess.run(
+        ["nvidia-smi", "--query-compute-apps=pid,used_memory",
+         "--format=csv,noheader,nounits", "-i", str(gpu)],
+        capture_output=True, text=True)
+    mine = {os.getpid()}
+    others = []
+    for line in a.stdout.strip().splitlines():
+        if not line.strip():
+            continue
+        pid_s, mem_s = (p.strip() for p in line.split(",")[:2])
+        if pid_s.isdigit() and int(pid_s) not in mine:
+            others.append((int(pid_s), mem_s))
+    if others and exclusive:
+        listing = "\n".join(f"    pid {q}  {m} MiB" for q, m in others)
+        raise SystemExit(
+            f"gpu{gpu} is NOT exclusive -- {len(others)} other compute "
+            f"process(es):\n{listing}\n"
+            f"  Free memory is not the test: a 1.4 GiB neighbour passes every "
+            f"memory threshold\n  and still takes SMs. Move to an empty GPU, "
+            f"or re-run with --allow-shared-gpu, which does not make the\n"
+            f"  numbers trustworthy -- it records the neighbours on every row "
+            f"so the reader can\n  decide. nvidia-smi's memory column is the "
+            f"handiest one and the most misleading.")
+    if others:
+        print(f"[warn] gpu{gpu} shared with {len(others)} process(es): "
+              f"{[q for q, _ in others]} -- recorded on every row; these "
+              f"timings are annotated, not clean.", flush=True)
+    return [{"pid": q, "used_mib": m} for q, m in others]
 
 
 def _wait_ready(port: int, timeout_s: int) -> float | None:
@@ -330,7 +435,8 @@ _KEEP = ("mean_ttft_ms", "median_ttft_ms", "p99_ttft_ms",
 
 def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
             port: int, outdir: pathlib.Path,
-            ready_timeout: int = 2400) -> dict:
+            ready_timeout: int = 2400,
+            neighbors: list | None = None) -> dict:
     env = dict(os.environ)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_NO_USAGE_STATS"] = "1"
@@ -440,6 +546,7 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
             _shutdown(proc, gpu)
 
     log = log_path.read_text(errors="ignore")
+    rec["gpu_neighbors"] = neighbors
     rec.update(parse_memory(log))
     rec.update(parse_decode_batch(log))
     rec["residue_patch_applied"] = "[residue" in log
@@ -458,6 +565,12 @@ def main() -> None:
                          "concurrency grid and WHICH arms must be present; "
                          "--models-root supplies where each one lives.")
     ap.add_argument("--outdir", default=None)
+    ap.add_argument("--allow-shared-gpu", action="store_true",
+                    help="run even when another process holds the GPU. This "
+                         "does NOT make the timings clean -- every row is "
+                         "annotated with the neighbouring PIDs so a reader can "
+                         "judge. A 1.4 GiB neighbour passes any memory check "
+                         "and still takes SMs.")
     ap.add_argument("--ready-timeout", type=int, default=2400,
                     help='Seconds to wait for /health. Prewarm the tactic cache or increase this timeout when cold autotuning is enabled.')
     ap.add_argument("--models-root", default=None,
@@ -491,12 +604,12 @@ def main() -> None:
                           f"runs/residue_e2e_"
                           f"{time.strftime('%Y%m%d_%H%M%S')}")
     outdir.mkdir(parents=True, exist_ok=True)
-    assert_gpu_free(a.gpu)
+    neighbors = assert_gpu_free(a.gpu, exclusive=not a.allow_shared_gpu)
 
     rounds = int(e.get("rounds", 1) or 1)
     rotate = bool(e.get("rotate_arms", False))
     with open(outdir / "spec_stamp.json", "w") as fh:
-        json.dump({**spec_mod.stamp(doc),
+        json.dump({**spec_mod.stamp(doc), **provenance(a.gpu, neighbors),
                    "concurrencies": list(CONCURRENCIES),
                    "input_len": INPUT_LEN, "output_len": OUTPUT_LEN,
                    "ready_timeout_s": a.ready_timeout}, fh, indent=2)
@@ -513,7 +626,8 @@ def main() -> None:
               f"{[t for t, *_ in order]}", flush=True)
         for slot, (tag, ratio, quant, model) in enumerate(order):
             rec = run_arm(tag, ratio, quant, model, a.gpu, a.port, rdir,
-                          ready_timeout=a.ready_timeout)
+                          ready_timeout=a.ready_timeout,
+                      neighbors=neighbors)
             # `round` and `arm_slot` are what make the rotation analysable:
             # without the slot you cannot tell a real arm effect from a
             # position effect, which is the whole reason for rotating.

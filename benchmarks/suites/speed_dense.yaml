@@ -39,22 +39,35 @@ name: speed_dense
 kernel:
   models: [qwen3_4b, qwen3_8b, qwen3_32b]
   projections: [qkv, o, gate_up, down]
-  families: [mext, kext]
+  # Each family declares the M range where it actually runs. They are NOT the
+  # same range, and sharing one grid produced a table with rows that describe
+  # a path no deployment takes.
+  #
+  # The dispatch (residue_linear_op.nvfp4_linear):
+  #
+  #     use_fold = fold_eligible and (is_mext_r1 or M <= fold_max_m)
+  #
+  # and a K-extended layer IS fold-eligible in production
+  # (RESIDUE_ENABLE_DECODE_MEXT=1). So below the band a K-extended layer folds:
+  # it reads the k_base prefix and never touches its salient columns, which is
+  # precisely why decode is ratio-blind. The K-extended GEMM only runs above
+  # the band. Measuring "kext" at M=1 therefore measures the legacy path at an
+  # M where nothing takes it -- a counterfactual reported as a cost.
+  families:
+    # Decode. Folds at every M below the band; above it a ratio-1.0 layer
+    # leaves for the wrapped K-loop. Sweeping past the band is the point: the
+    # step IS the deliverable, and the reader picks the knee off it.
+    mext:
+      m_grid: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
+      m_max_by_arch: {sm100: 512, sm103: 512, sm120: 128}
 
-  # 1.0 is absent on purpose: every channel salient means K-extension would
-  # duplicate the whole weight, and that case IS the mext family.
-  ratios: [0.125, 0.25, 0.5]
-
-  m_grid: [1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128,
-           160, 192, 256, 320, 384, 448, 512]
-
-  
-  
-  
-  m_max_by_arch:
-    sm100: 512
-    sm103: 512
-    sm120: 128
+    # Prefill. Starts one step above the band because that is where this path
+    # begins to run at all. Upper end is set by the largest prefill chunk a
+    # server actually issues.
+    kext:
+      ratios: [0.125, 0.25, 0.5]
+      m_grid: [128, 256, 512, 1024, 2048]
+      m_min_by_arch: {sm100: 256, sm103: 256, sm120: 128}
 
   
   

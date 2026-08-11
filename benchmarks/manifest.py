@@ -48,15 +48,41 @@ def stamp(spec: dict) -> dict:
     }
 
 
-def m_max_for(spec: dict, sm: str) -> int | None:
-    """The M ceiling this spec sets for an architecture.
+def m_grid_for(spec: dict, family: str, sm: str) -> list[int]:
+    """The M values this manifest says are meaningful for one family on one arch.
 
-    Returns None when the spec does not mention it, which the caller should
-    treat as "no opinion" rather than substituting a number of its own -- an
-    architecture the spec has never been sized for should say so, not quietly
-    inherit somebody else's ceiling.
+    The two families do NOT share a range, and giving them one produced rows
+    describing a path no deployment takes. A K-extended layer is fold-eligible
+    in production, so below the arch's fold band it FOLDS -- it reads the
+    k_base prefix and never touches its salient columns, which is why decode is
+    ratio-blind. The K-extended GEMM only runs above the band. So `kext`
+    declares a floor and `mext` declares a ceiling, and each is read here.
+
+    An architecture the manifest has never sized is refused by the caller
+    rather than handed another arch's numbers.
     """
-    return (spec.get("kernel", {}).get("m_max_by_arch", {}) or {}).get(sm)
+    fam = (spec.get("kernel", {}).get("families", {}) or {}).get(family)
+    if not isinstance(fam, dict):
+        raise SystemExit(
+            f"{spec.get('_path')}: kernel.families.{family} must be a mapping "
+            f"with its own m_grid; a shared grid cannot express that the two "
+            f"families run over different M.")
+    grid = fam.get("m_grid") or []
+    lo = (fam.get("m_min_by_arch") or {}).get(sm)
+    hi = (fam.get("m_max_by_arch") or {}).get(sm)
+    if lo is None and hi is None:
+        raise SystemExit(
+            f"{spec.get('_path')}: family {family!r} sets neither "
+            f"m_min_by_arch nor m_max_by_arch for {sm}. Add it -- an unsized "
+            f"architecture must not silently inherit another one's range.")
+    return [m for m in grid
+            if (lo is None or m >= lo) and (hi is None or m <= hi)]
+
+
+def ratios_for(spec: dict, family: str) -> list[float]:
+    """Ratios a family sweeps. Only `kext` has any; mext IS ratio 1.0."""
+    fam = (spec.get("kernel", {}).get("families", {}) or {}).get(family) or {}
+    return [float(x) for x in (fam.get("ratios") or [])]
 
 
 def resolve_arms(spec: dict, models_root: str | pathlib.Path) -> list[dict]:

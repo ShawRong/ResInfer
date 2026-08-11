@@ -158,6 +158,33 @@ TRACKED_ENV = (
 )
 
 
+def assert_gpu_exclusive(gpu: int, exclusive: bool = True) -> list[dict]:
+    'Refuse to time on a GPU that another process is computing on.'
+    rows = _nvsmi(physical_index(gpu), "compute-apps=pid,used_memory")
+    me = os.getpid()
+    others = []
+    for line in rows:
+        parts = [x.strip() for x in line.split(",")]
+        if parts and parts[0].isdigit() and int(parts[0]) != me:
+            others.append({"pid": int(parts[0]),
+                           "used_mib": parts[1] if len(parts) > 1 else None})
+    if others and exclusive:
+        listing = "\n".join(f"    pid {o['pid']}  {o['used_mib']} MiB"
+                             for o in others)
+        raise SystemExit(
+            f"gpu{gpu} is NOT exclusive -- {len(others)} other compute "
+            f"process(es):\n{listing}\n"
+            f"  This benchmark measures time, so a neighbour invalidates it. "
+            f"Free memory is not\n  the test: 1.4 GiB clears any threshold and "
+            f"still takes SMs. Use an empty GPU,\n  or --allow-shared-gpu, "
+            f"which annotates every row instead of cleaning anything.")
+    if others:
+        print(f"[bench] WARNING: sharing gpu{gpu} with "
+              f"{[o['pid'] for o in others]} -- every row is annotated; these "
+              f"timings are not clean.", flush=True)
+    return others
+
+
 def provenance(gpu: int, run_id: str) -> dict:
     so = next(iter(sorted(
         (REPO_ROOT / "csrc" / "nvfp4" / "nvfp4").glob("_C*.so"))), None)
@@ -252,8 +279,38 @@ def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
 
 
 # ----------------------------------------------------------------- timing
+def fold_tactic_source(sm: str, warned: bool) -> str:
+    """Where the fold's tile choice came from on this architecture.
+
+    Replaces a boolean `static_tactic_table`, which recorded "the warning
+    fired" and was therefore inverted on sm120: `run_fold_default` warns on
+    its first call of every process regardless of the table's quality, while
+    sm10x warns only when the tuner genuinely found nothing. The same flag
+    meant two different things per architecture.
+
+        autotuned      sm10x, tuner ran -- and this is the PRODUCTION path
+                       there: serving primes `tune_families` in its warmup
+                       window, so priming before timing is deployment
+                       behaviour, not special treatment.
+        offline_table  sm120. There is no runtime fold tuner by design; the
+                       tile table is itself the product of a full offline
+                       sweep (see cute_fold_sm120/tactics.py). Production
+                       reads this table too.
+        fallback       sm10x, tuner found nothing and the static table served.
+                       The only value that is actually a warning.
+
+    So the three architectures measure three different production paths, and
+    that asymmetry belongs to the system under test rather than to this
+    benchmark. Cross-architecture rows must NOT be read as same-mechanism
+    comparisons.
+    """
+    if sm.startswith("sm12"):
+        return "offline_table"
+    return "fallback" if warned else "autotuned"
+
+
 class TacticWatch:
-    'Record whether the fold ran on the STATIC tactic table.'
+    "Record whether the fold's own tile warning fired."
 
     MARK = "STATIC tactic table"
 
@@ -277,15 +334,6 @@ class TacticWatch:
 
 
 
-def cosine(a: torch.Tensor, b: torch.Tensor) -> float:
-    a32, b32 = a.float().flatten(), b.float().flatten()
-    return torch.nn.functional.cosine_similarity(a32, b32, dim=0).item()
-
-
-def rel_mae(ref: torch.Tensor, out: torch.Tensor) -> float:
-    d = (ref.float() - out.float()).abs().mean().item()
-    denom = ref.float().abs().mean().item()
-    return d / denom if denom else float("nan")
 
 
 # ------------------------------------------------------------------- main
@@ -307,18 +355,30 @@ def run(args) -> None:
 
     major, minor = torch.cuda.get_device_capability(device)
     sm = f"sm{major}{minor}"
-    m_max = (args.m_max
-             or spec_mod.m_max_for(getattr(args, "manifest_doc", {}) or {}, sm)
-             or DEFAULT_M_MAX.get(sm))
-    if m_max is None:
-        raise SystemExit(
-            f"no M ceiling for {sm}: the spec does not list it and there is no "
-            f"built-in default. Pass --m-max explicitly, or add {sm} to the "
-            f"spec's kernel.m_max_by_arch -- an unsized architecture must not "
-            f"silently inherit another one's ceiling.")
-    grid = ((getattr(args, "manifest_doc", {}) or {}).get("kernel", {})
-            .get("m_grid") or M_GRID)
-    m_grid = [m for m in grid if m <= m_max]
+    
+    
+    
+    
+    
+    
+    
+    
+    doc = getattr(args, "manifest_doc", {}) or {}
+    m_mext = spec_mod.m_grid_for(doc, "mext", sm) if doc else list(M_GRID)
+    m_kext = spec_mod.m_grid_for(doc, "kext", sm) if doc else list(M_GRID)
+    if args.m_max:                       # explicit override caps both
+        m_mext = [m for m in m_mext if m <= args.m_max]
+        m_kext = [m for m in m_kext if m <= args.m_max]
+    if args.family == "mext":
+        m_kext = []
+    elif args.family == "kext":
+        m_mext = []
+    # The baseline is the denominator for both, so it is timed wherever either
+    # family has a point.
+    m_grid = sorted(set(m_mext) | set(m_kext))
+    if not m_grid:
+        raise SystemExit(f"no M points for {sm} in this manifest")
+    ratios = spec_mod.ratios_for(doc, "kext") if doc else list(args.ratios)
 
     run_id = args.run_id or time.strftime("%Y%m%d-%H%M%S", time.gmtime())
     out = pathlib.Path(args.out)
@@ -330,18 +390,23 @@ def run(args) -> None:
             fh.flush()
 
     fold_seen = [False]      # sticky; see the fold_fired check below
+    neighbors = assert_gpu_exclusive(
+        args.gpu, exclusive=not args.allow_shared_gpu)
     prov = provenance(args.gpu, run_id)
+    prov["gpu_neighbors"] = neighbors
     prov["stock_kernel_class"] = stock_name
     prov["m_grid"] = m_grid
+    prov["m_grid_mext"] = m_mext
+    prov["m_grid_kext"] = m_kext
     prov.update(spec_mod.stamp(getattr(args, "manifest_doc", {}) or {}))
     prov["manifest_overrides"] = getattr(args, "manifest_overrides", [])
-    prov["ratios"] = list(args.ratios)
+    prov["ratios"] = list(ratios)
     emit(prov)
-    print(f"[bench] {sm}  stock={stock_name}  M<= {m_max}  "
+    print(f"[bench] {sm}  stock={stock_name}  "
+          f"mext M={m_mext[0] if m_mext else '-'}..{m_mext[-1] if m_mext else '-'}  "
+          f"kext M={m_kext[0] if m_kext else '-'}..{m_kext[-1] if m_kext else '-'}  "
           f"commit={prov['git_commit'][:12] if prov['git_commit'] else '?'}")
-    if prov["gpu"].get("neighbors"):
-        print(f"[bench] WARNING: {prov['gpu']['neighbors']} other compute "
-              f"process(es) on this GPU -- timings are not trustworthy.")
+
 
     for model in args.models:
         for proj, (n, k) in SHAPES[model].items():
@@ -351,7 +416,7 @@ def run(args) -> None:
             # kext weights: K grows to K*(1+r). Built once per ratio and
             # reused across M so the per-M timings differ only in M.
             kext = {}
-            for r in args.ratios:
+            for r in ratios:
                 idx = salient_indices(k, r, device)
                 w_ext_bf16 = torch.cat(
                     [w_bf16, w_bf16.index_select(-1, idx)], dim=-1)
@@ -363,7 +428,6 @@ def run(args) -> None:
             for m in m_grid:
                 x = torch.randn(m, k, device=device, dtype=dtype)
                 x_gs = global_scale(x)
-                ref = (x.float() @ w_bf16.float().T).to(dtype)
 
                 # ---- stock: vLLM's own selector, vLLM's own kernel object
                 base_layer.alpha = (1.0 / (x_gs * w_gs)).reshape(())
@@ -397,10 +461,9 @@ def run(args) -> None:
                 stock = timed_detail(stock_fn, (x, base_layer.weight),
                                      repeats=args.repeats)
                 tune_gain = (untuned["us"] / stock["us"]) if stock["us"] else None
-                y_stock = stock_kernel.apply_weights(base_layer, x)
                 emit({"kind": "measure", "run_id": run_id, "family": "stock",
                       "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
-                      "ratio": 0.0, "stock_kernel_class": stock_name,
+                      "ratio": 0.0, "stock_kernel_class": stock_name, "gpu_neighbors": neighbors,
                       # Context, not a gate: ~0.94 for every arm including
                       # this one, because it is NVFP4's quantisation error
                       # rather than anything about the kernel.
@@ -411,14 +474,12 @@ def run(args) -> None:
                       # every ratio in this row flatters the residue path.
                       "autotune_gain": tune_gain,
                       "autotune_requested": bool(args.autotune),
-                      "cos_vs_bf16": cosine(ref, y_stock),
-                      "rel_mae_vs_bf16": rel_mae(ref, y_stock),
  **stock})
 
                 placeholder = torch.zeros(1, dtype=torch.uint8, device=device)
 
                 # ---- mext: ratio 1.0, weight stored once, rows doubled
-                if args.family in ("mext", "both"):
+                if m in m_mext:
                     f = lambda *_: torch.ops.residue.nvfp4_linear(   # noqa: E731
                         x, w_fp4, x_gs, w_sf, w_sf, placeholder,
                         (1.0 / (x_gs * w_gs)).reshape(()),
@@ -447,7 +508,6 @@ def run(args) -> None:
                         fold_seen[0] = True
                     before = nvfp4_fold.compile_stats()
                     t = timed_detail(f, (x, w_fp4), repeats=args.repeats)
-                    y = f()
                     after = nvfp4_fold.compile_stats()
                     for hit in tw.hits:
                         emit({"kind": "tactic_fallback", "run_id": run_id,
@@ -455,51 +515,75 @@ def run(args) -> None:
                               "n": n, "k": k, "m": m, "warning": hit})
                     emit({"kind": "measure", "run_id": run_id, "family": "mext",
                           "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
-                          "ratio": 1.0, "stock_kernel_class": stock_name,
+                          "ratio": 1.0, "stock_kernel_class": stock_name, "gpu_neighbors": neighbors,
                           "vs_stock": t["us"] / stock["us"],
                           "vs_stock_min": t["p50_us"] / stock["p50_us"],
-                          "cos_vs_bf16": cosine(ref, y),
-                          "rel_mae_vs_bf16": rel_mae(ref, y),
 
                           # Non-zero means the timing window paid for a JIT and
                           # the row is not a measurement of the kernel.
                           "jit_during_timing": _compiled_delta(before, after),
-                          "static_tactic_table": bool(tw.hits),
+                          "fold_tactic_source": fold_tactic_source(sm, bool(tw.hits)),
                           "fold_fired_in_run": fold_seen[0],
                           **t})
 
                 # ---- kext: ratio r < 1, K grows to K*(1+r)
-                if args.family in ("kext", "both"):
-                    for r in args.ratios:
+                if m in m_kext:
+                    for r in ratios:
                         e = kext[r]
                         alpha = (1.0 / (x_gs * e["gs"])).reshape(())
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        
                         f = lambda *_, e=e, alpha=alpha: torch.ops.residue.nvfp4_linear(  # noqa: E731
                             x, e["w"], x_gs, e["sf"], e["sf"], placeholder,
                             alpha, k, int(e["idx"].numel()), 0, n,
-                            False, False, False)
+                            True, False, False)
                         t = timed_detail(f, (x, e["w"]), repeats=args.repeats)
-                        y = f()
                         emit({"kind": "measure", "run_id": run_id,
                               "family": "kext", "rep": args.rep, "model": model, "proj": proj,
                               "n": n, "k": k, "m": m, "ratio": r,
                               "k_ext": e["k_ext"],
-                              "stock_kernel_class": stock_name,
+                              "stock_kernel_class": stock_name, "gpu_neighbors": neighbors,
                               # absolute: what a deployment actually pays
                               "vs_stock": t["us"] / stock["us"],
                               # normalised: (1+r) is the arithmetic floor, so
                               # this column is ~1.0 iff we pay nothing beyond
                               # the arithmetic the extension implies
                               "vs_ideal": t["us"] / ((1.0 + r) * stock["us"]),
-                              "cos_vs_bf16": cosine(ref, y),
-                              "rel_mae_vs_bf16": rel_mae(ref, y),
                               **t})
 
                 del x
-            del w_bf16, w_fp4, w_sf, kext
+            # base_layer holds w_fp4 / w_sf too, so dropping only the local
+            # names leaves them live and empty_cache() frees nothing.
+            del w_bf16, w_fp4, w_sf, kext, base_layer
             torch.cuda.empty_cache()
             print(f"[bench] done {model}/{proj}  N={n} K={k}")
 
+    neighbors_end = assert_gpu_exclusive(args.gpu, exclusive=False)
+    if [o["pid"] for o in neighbors_end] != [o["pid"] for o in neighbors]:
+        print(f"[bench] WARNING: GPU occupancy CHANGED during the run "
+              f"(start={[o['pid'] for o in neighbors]} "
+              f"end={[o['pid'] for o in neighbors_end]}). A process arriving "
+              f"or leaving mid-run means the rows before and after it are not "
+              f"comparable.", flush=True)
     emit({"kind": "run_summary", "run_id": run_id, "rep": args.rep,
+          "gpu_neighbors_start": neighbors,
+          "gpu_neighbors_end": neighbors_end,
+          "gpu_occupancy_changed":
+              [o["pid"] for o in neighbors_end] != [o["pid"] for o in neighbors],
           "baseline_autotuned_per_m": bool(args.autotune),
           "fold_fired_in_run": fold_seen[0],
           "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -549,6 +633,10 @@ def main() -> None:
                         "driver loops this and rows carry the index")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-id", default=None)
+    p.add_argument("--allow-shared-gpu", action="store_true",
+                   help="time even when another process holds the GPU. Does "
+                        "NOT clean the numbers -- it annotates every row with "
+                        "the neighbouring PIDs instead of refusing.")
     p.add_argument("--no-autotune", dest="autotune", action="store_false",
                    help="skip FlashInfer tuning of the BASELINE; recorded "
                         "in provenance because it changes what stock means")
