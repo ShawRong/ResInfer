@@ -269,7 +269,26 @@ def assert_gpu_free(gpu: int, need_gib: float = 20.0,
         if pid_s.isdigit() and int(pid_s) not in mine:
             others.append((int(pid_s), mem_s))
     if others and exclusive:
-        listing = "\n".join(f"    pid {q}  {m} MiB" for q, m in others)
+        # Name the neighbour while it still exists (see _common.pid_identity):
+        # a refusal that says only "pid 12345" cannot answer "whose job?"
+        # ten seconds later.
+        def _ident(q):
+            try:
+                from benchmarks._common import pid_identity
+            except ImportError:
+                from _common import pid_identity
+            d = pid_identity(q)
+            extra = ""
+            if d.get("cmdline"):
+                extra += f"\n      cmd  {d['cmdline']}"
+            if d.get("cwd"):
+                extra += f"\n      cwd  {d['cwd']}"
+            if d.get("note"):
+                extra += f"\n      ({d['note']})"
+            return extra
+
+        listing = "\n".join(f"    pid {q}  {m} MiB{_ident(q)}"
+                            for q, m in others)
         raise SystemExit(
             f"gpu{gpu} is NOT exclusive -- {len(others)} other compute "
             f"process(es):\n{listing}\n"

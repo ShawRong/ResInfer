@@ -20,7 +20,7 @@ try:                          # `python -m benchmarks.bench_residue_nvfp4`
     from benchmarks import manifest as spec_mod
     from benchmarks._common import (assert_args_consumed, fi_autotuned,
                                     kernels_per_call, l2_accounting,
-                                    timed_detail)
+                                    pid_identity, timed_detail)
 except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # Both invocations must work: the README advertises the module form, and
     # a bare `from _common import ...` resolves only in the second, where the
@@ -29,7 +29,8 @@ except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # ModuleNotFoundError before anything runs.
     import manifest as spec_mod
     from _common import (assert_args_consumed, fi_autotuned,
-                         kernels_per_call, l2_accounting, timed_detail)
+                         kernels_per_call, l2_accounting, pid_identity,
+                         timed_detail)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
@@ -169,11 +170,18 @@ def assert_gpu_exclusive(gpu: int, exclusive: bool = True) -> list[dict]:
     for line in rows:
         parts = [x.strip() for x in line.split(",")]
         if parts and parts[0].isdigit() and int(parts[0]) != me:
-            others.append({"pid": int(parts[0]),
-                           "used_mib": parts[1] if len(parts) > 1 else None})
+            # Identity NOW: the neighbour may exit before anyone asks whose
+            # job it was, and then the pid alone answers nothing.
+            other = {"used_mib": parts[1] if len(parts) > 1 else None}
+            other.update(pid_identity(int(parts[0])))
+            others.append(other)
     if others and exclusive:
-        listing = "\n".join(f"    pid {o['pid']}  {o['used_mib']} MiB"
-                             for o in others)
+        listing = "\n".join(
+            f"    pid {o['pid']}  {o['used_mib']} MiB"
+            + (f"\n      cmd  {o['cmdline']}" if o.get("cmdline") else "")
+            + (f"\n      cwd  {o['cwd']}" if o.get("cwd") else "")
+            + (f"\n      ({o['note']})" if o.get("note") else "")
+            for o in others)
         raise SystemExit(
             f"gpu{gpu} is NOT exclusive -- {len(others)} other compute "
             f"process(es):\n{listing}\n"

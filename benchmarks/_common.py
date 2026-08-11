@@ -230,3 +230,38 @@ def reldiff(out, ref) -> float:
     if denom == 0.0:
         return float(torch.abs(o).max())
     return float((o - r).abs().max()) / denom
+
+
+def pid_identity(pid: int) -> dict:
+    'Who is that neighbour? Read /proc AT DETECTION TIME, not later.'
+    import os
+    import pathlib
+
+    out: dict = {"pid": int(pid)}
+    base = pathlib.Path(f"/proc/{int(pid)}")
+    try:
+        raw = (base / "cmdline").read_bytes()
+        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+        if cmd:
+            out["cmdline"] = cmd[:300]
+    except OSError:
+        pass
+    try:
+        # os.readlink, not Path.resolve(): resolve() is non-strict by default
+        # and happily returns "/proc/<dead pid>/cwd" for a process that no
+        # longer exists -- a plausible-looking string standing in for a
+        # missing fact, which is the one thing this helper must not produce.
+        out["cwd"] = os.readlink(str(base / "cwd"))
+    except OSError:
+        pass
+    try:
+        # Field 22 of /proc/pid/stat is starttime in clock ticks since boot.
+        # comm may contain spaces/parens, so split after the last ')'.
+        stat = (base / "stat").read_text()
+        fields = stat[stat.rfind(")") + 1:].split()
+        out["start_ticks"] = int(fields[19])
+    except (OSError, IndexError, ValueError):
+        pass
+    if len(out) == 1:
+        out["note"] = "process already exited -- identity unrecoverable"
+    return out
