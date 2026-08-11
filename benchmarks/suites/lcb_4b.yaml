@@ -32,14 +32,64 @@ seed: 42
 # differing purely in server-side RESIDUE_* env collide.
 cache_dir: per-run
 
-reference: bf16
+reference: orig_bf16   
+                       
+                       
+                       
+                       
+                       
+                       
+                       
+                       
 baseline: plain
 
 arms:
-  - id: bf16
-    path: base_bf16
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  - id: gptq_bf16
+    path: base_gptq_bf16
+    kind: fp16
+  - id: orig_bf16
+    path: base_orig_bf16
     kind: fp16
   - id: plain
+    path: plain
+    kind: modelopt_fp4
+  # Kept, renamed, and demoted to what it actually is: mechanism isolation on
+  # one checkpoint, never the floor.
+  - id: plain_runtime_off
     path: uniform_r0125
     kind: residue
     mext: "off"
@@ -51,7 +101,41 @@ arms:
     path: uniform_r025
     kind: residue
     mext: "on"
-  - id: anchor
-    path: anchor
+  - id: uniform_r05
+    path: uniform_r05
     kind: residue
     mext: "on"
+  - id: uniform_r10
+    path: uniform_r10
+    kind: residue
+    mext: "on"
+  # The solver's allocations at the SAME budgets as the uniform ladder above.
+  # Equal budget verified by pricing the EXPORTED checkpoints with one cost
+  # model (auto_search.cost), not by trusting the labels: the four pairs came
+  # out within 0.003 effective bits of each other, with the solver side
+  # slightly LOWER -- so a solver win cannot be bought with extra budget.
+  - id: solver_b4p5
+    path: solver_b4p5
+    kind: residue
+    mext: "on"
+  - id: solver_b5
+    path: solver_b5
+    kind: residue
+    mext: "on"
+  - id: solver_b6
+    path: solver_b6
+    kind: residue
+    mext: "on"
+  - id: solver_b8
+    path: solver_b8
+    kind: residue
+    mext: "on"
+
+
+
+
+
+
+
+calibration_recipe: nemotron_sft_n1024_seq2048_seed42_activation_max
+recipe_fingerprint: 7bf7ffff68af72b8   # analyze refuses arms that disagree

@@ -116,6 +116,11 @@ def gsm8k_score(pred: str, gts) -> float:
 
 SCORERS["gsm8k"] = gsm8k_score
 
+# Where each generative task's scorer stops reading. Kept next to the scorer so
+# the two cannot drift: a stop sequence that cuts BEFORE the scored span turns
+# every answer into a miss, and one that cuts after it only wastes tokens.
+STOPS = {"gsm8k": ["Question:"]}
+
 # name -> (hf path, config, split, kind)
 DOWNSTREAM = {
     "gsm8k":         ("gsm8k", "main", "test", "gen"),
@@ -396,7 +401,8 @@ def cmd_run(a) -> int:
     
     
     ekw = pinned_engine_kwargs(a, a.max_model_len)
-    write_provenance(a, out_dir, ekw, {"venue": "longbench_v1", "subsets": todo})
+    write_provenance(a, out_dir, ekw, {"venue": "longbench_v1", "subsets": todo,
+                                      "max_gen": {t: MAXGEN[t] for t in todo}})
     llm = LLM(model=a.model, trust_remote_code=True, dtype="bfloat16",
               quantization=None if a.bf16 else "modelopt_fp4", **ekw)
 
@@ -454,6 +460,10 @@ def cmd_run(a) -> int:
 def cmd_analyze(a) -> int:
     """Reads ONLY the jsonl on disk. No GPU, seconds, re-runnable forever."""
     d = pathlib.Path(a.out)
+    def _prov(arm_id):
+        p = pathlib.Path(a.out) / f"{arm_id}__provenance.json"
+        return json.loads(p.read_text()) if p.exists() else None
+
     arms, tasks = {}, set()
     for f in sorted(d.glob("*__*.jsonl")):
         arm, task = f.stem.split("__", 1)
@@ -550,6 +560,7 @@ def cmd_analyze(a) -> int:
         print(f"  {'arm':<22}{'subset':<22}{'n_gen ok':>9}{'n_gen bad':>10}"
               f"{'bad@cap':>9}{'  verdict'}")
         flagged = False
+        nostops: list[str] = []
         for x in order:
             for t in tasks:
                 rows = arms[x].get(t) or []
@@ -561,15 +572,41 @@ def cmd_analyze(a) -> int:
                     continue
                 mo = sorted(ok)[len(ok) // 2] if ok else 0
                 mb = sorted(bad)[len(bad) // 2]
-                cap = max(i["n_gen"] for i in rows)
+                # Read the declared cap; only infer it when the run did not
+                # record one. Inferring it from `max(n_gen)` is the same
+                # inference-instead-of-reading this whole check exists to
+                # catch: with no item near the real ceiling, the longest
+                # generation masquerades as the cap.
+                declared = ((_prov(x) or {}).get("max_gen") or {}).get(t)
+                cap = int(declared) if declared else max(i["n_gen"] for i in rows)
                 at_cap = sum(1 for v in bad if v >= cap)
-                # The signature: wrong answers pinned at the ceiling while
-                # right answers are far below it.
+                # Signature A: wrong answers pinned at the ceiling while right
+                # answers are far below it -- the venue is scoring truncation.
                 suspect = at_cap >= max(3, 0.5 * len(bad)) and mo and mb >= 2 * mo
+                # Signature B, which A misses and which cost a false negative
+                # the day this check shipped: EVERYTHING at the cap. On GSM8K
+                # every generation ran to 512 because the prompt has no stop
+                # condition, so mb == mo and A's ratio test cannot fire. That
+                # is not automatically fatal -- if the scorer reads a prefix
+                # (here: the text before the model's next "Question:"), the
+                # score is unaffected and the cost is wasted tokens. If it
+                # reads the whole generation, the cap is deciding scores.
+                # Reported rather than asserted, because which one it is lives
+                # in the scorer, not here.
+                nostop = mo and mb and mo >= cap and mb >= cap
                 if suspect:
                     flagged = True
-                print(f"  {x:<22}{t:<22}{mo:>9,}{mb:>10,}{at_cap:>9}"
-                      f"{'  <-- SCORING THE CAP' if suspect else ''}")
+                if nostop:
+                    nostops.append(f"{x}/{t}")
+                note = ("  <-- SCORING THE CAP" if suspect
+                        else "  <-- NO STOP CONDITION" if nostop else "")
+                print(f"  {x:<22}{t:<22}{mo:>9,}{mb:>10,}{at_cap:>9}{note}")
+        if nostops and not flagged:
+            print(f"\n  note: every generation ran to the cap for {len(nostops)} arm/subset")
+            print("  pair(s) -- the prompt has no stop condition. Harmless IF the")
+            print("  scorer reads a prefix of the generation; if it reads all of it,")
+            print("  the cap is deciding the score. Check the scorer, then add a stop")
+            print("  sequence: it makes the run cheaper and the scored span identical.")
         if flagged:
             print("\n  !! At least one arm's wrong answers are pinned at the")
             print("  !! generation cap while its right answers are far shorter.")
@@ -590,10 +627,6 @@ def cmd_analyze(a) -> int:
     
     
     
-    def _prov(arm_id):
-        p = pathlib.Path(a.out) / f"{arm_id}__provenance.json"
-        return json.loads(p.read_text()) if p.exists() else None
-
     def _cell(arm_id):
         """Which of the kill-switch 2x2 an arm actually ran, from provenance.
 
@@ -1024,7 +1057,8 @@ def cmd_task(a) -> int:
     tok = AutoTokenizer.from_pretrained(a.model, trust_remote_code=True)
     a._venue = "task"
     ekw = pinned_engine_kwargs(a, a.max_model_len)
-    write_provenance(a, a.out, ekw, {"venue": "downstream", "tasks": todo})
+    write_provenance(a, a.out, ekw, {"venue": "downstream", "tasks": todo,
+                                     "max_gen": {t: a.max_gen for t in todo}})
     llm = LLM(model=a.model, trust_remote_code=True, dtype="bfloat16",
               quantization=None if a.bf16 else "modelopt_fp4", **ekw)
 
@@ -1037,7 +1071,18 @@ def cmd_task(a) -> int:
 
         rows = []
         if kind == "gen":
-            sp = SamplingParams(temperature=0.0, max_tokens=a.max_gen, seed=a.seed)
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            sp = SamplingParams(temperature=0.0, max_tokens=a.max_gen,
+                                seed=a.seed, stop=STOPS.get(name))
             outs = llm.generate([it["context"] for it in items], sp)
             for it, o in zip(items, outs):
                 pred = o.outputs[0].text
