@@ -316,14 +316,16 @@ def _install_fold_decode_autotune_warmup() -> None:
         return
     _orig_flashinfer_autotune = kw.flashinfer_autotune
 
-    # ONE decode-sized forward covers the FlashInfer-registered ops entirely:
-    # choose_one tunes EVERY bucket in the op's gen_tuning_buckets in one call
-    # (_generate_optimization_profiles emits one profile per bucket), so the
-    # sm120 C++ fold op is fully tuned by it. The CuTeDSL sm10x tuner is
-    # BUCKET-LOCAL instead -- run_fold_autotuned caches per (shape, m-bucket)
-    # and only measures the bucket it was called at. A mext_r1 layer takes the
-    # fold at EVERY M (4083dee), so on sm10x its prefill buckets need their own
-    # tuning forwards or they silently serve the static fallback table.
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
     _FOLD_MAX_M = 128
 
     def _flashinfer_autotune_with_fold(runner) -> None:
@@ -345,9 +347,10 @@ def _install_fold_decode_autotune_warmup() -> None:
             if (not _state["done"] and kwargs.get("is_profile")
                     and AutoTuner.get().is_tuning_mode):
                 _state["done"] = True
-                # The same forwards prime BOTH tuners. The C++ sm120 fold is
-                # tuned by FlashInfer via this autotune(cache=) context (tactic
-                # keyed on mext_fold_fp4_gemm; all buckets in the first call).
+                # The same forwards prime BOTH tuners. The FlashInfer-side
+                # residue ops (residue_mext_prefill_fp4_gemm; sm120 decode
+                # fold residue_fold_tile_sm120) tune via this autotune(cache=)
+                # context -- all buckets in the first call.
                 # The CuTeDSL sm10x fold keeps its own python cache instead, so
                 # it needs a window in which run_fold() is allowed to measure --
                 # it must never do that while serving, where a cudagraph

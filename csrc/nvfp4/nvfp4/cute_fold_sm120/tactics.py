@@ -8,19 +8,36 @@ import os
 
 import torch
 
-# Width buckets. `n_w` is the GEMM's N (output features).
+
+
+
+
+
+
+
+
+
+
+
+
+
 _N_WIDE = 8192      # gate_up-class: needs tile_m=128 even at m_tok=1
-_N_MID = 4096       # qkv-class: needs tile_m=128 once m_tok >= 64
+_N_MIDWIDE = 6144   # fused-qkv-class: 8-datapath heads at head_dim 128
+_N_MID = 4096       # o/down-class upper half
 
 # (n_w bucket, m_tok upper bound inclusive) -> (tile_m, tile_n, tile_k)
 _TILE_TABLE = {
-    "wide": ((32, (128, 64, 128)), (1 << 30, (128, 128, 128))),
+    "wide": ((32, (128, 64, 256)), (1 << 30, (128, 128, 128))),
+    "midwide": ((32, (64, 64, 256)), (64, (128, 64, 256)),
+                (1 << 30, (128, 128, 128))),
     
     
     "mid": ((32, (64, 64, 256)), (1 << 30, (128, 64, 256))),
     "narrow": ((32, (64, 64, 128)), (64, (64, 64, 256)),
                (1 << 30, (64, 128, 128))),
 }
+
+_TABLE_ANNOUNCED = [False]
 
 
 def supports_capability(major: int, minor: int) -> bool:
@@ -31,6 +48,7 @@ def supports_capability(major: int, minor: int) -> bool:
 def select_tile(m_tok: int, n_w: int, k: int) -> tuple[int, int, int]:
     'Implementation details.'
     bucket = ("wide" if n_w >= _N_WIDE else
+              "midwide" if n_w >= _N_MIDWIDE else
               "mid" if n_w >= _N_MID else "narrow")
     for bound, tile in _TILE_TABLE[bucket]:
         if m_tok <= bound:
@@ -64,11 +82,20 @@ def run_fold_default(
 
     if not supports_capability(major, minor):
         raise RuntimeError(f"no sm120 fold kernel for capability ({major},{minor})")
-    if os.environ.get("RESIDUE_FOLD_SILENCE_DEFAULT", "0") != "1":
-        from ..fold import warn_default_path
-
+    # NOT warn_default_path(): that warning means "a tuned path exists and you
+    # are not on it", which was true on sm10x and FALSE here for two weeks --
+    # this table is itself the product of an offline full-tile sweep, and on
+    # sm120 it is a legitimate serving path (the fallback under the FlashInfer
+    # tuner in quant/.../sm120_fold_tuner.py, the whole path when that tuner
+    # is off). Announce once, as information, not as an alarm.
+    if (os.environ.get("RESIDUE_FOLD_SILENCE_DEFAULT", "0") != "1"
+            and not _TABLE_ANNOUNCED[0]):
+        _TABLE_ANNOUNCED[0] = True
         m_tok = act_fp4_rowpair.shape[0] // 2
-        warn_default_path("sm120", m_tok, f"tile={select_tile(m_tok, weight_fp4.shape[0], weight_fp4.shape[1] * 2)}")
+        tile = select_tile(m_tok, weight_fp4.shape[0], weight_fp4.shape[1] * 2)
+        print(f"[residue] sm120 fold: offline-swept static tile table "
+              f"(first call m_tok={m_tok} tile={tile}); the FlashInfer tuner, "
+              f"when enabled, overrides per (shape, m-bucket)", flush=True)
     return mext_fold_gemm_sm120(
         weight_fp4, act_fp4_rowpair, weight_sf, act_sf, alpha, out_dtype,
         m_tok_real=m_tok_real,

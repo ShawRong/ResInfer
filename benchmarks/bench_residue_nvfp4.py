@@ -18,7 +18,9 @@ import torch
 
 try:                          # `python -m benchmarks.bench_residue_nvfp4`
     from benchmarks import manifest as spec_mod
-    from benchmarks._common import fi_autotuned, timed_detail
+    from benchmarks._common import (assert_args_consumed, fi_autotuned,
+                                    kernels_per_call, l2_accounting,
+                                    timed_detail)
 except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # Both invocations must work: the README advertises the module form, and
     # a bare `from _common import ...` resolves only in the second, where the
@@ -26,7 +28,8 @@ except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # parent is on sys.path instead, so the bare name is not found at all --
     # ModuleNotFoundError before anything runs.
     import manifest as spec_mod
-    from _common import fi_autotuned, timed_detail
+    from _common import (assert_args_consumed, fi_autotuned,
+                         kernels_per_call, l2_accounting, timed_detail)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
@@ -432,8 +435,19 @@ def run(args) -> None:
                 # ---- stock: vLLM's own selector, vLLM's own kernel object
                 base_layer.alpha = (1.0 / (x_gs * w_gs)).reshape(())
                 base_layer.input_global_scale_inv = x_gs
-                stock_fn = lambda *_: stock_kernel.apply_weights(  # noqa: E731
-                    base_layer, x)
+                # Takes its tensors as PARAMETERS, and rebinds them onto the
+                # layer before dispatching. `apply_weights` reads the weight
+                # off `base_layer`, so a closure over it would be invisible to
+                # the rotating buffers and this arm would silently run warm --
+                # see `assert_args_consumed`. Rebinding is what lets the stock
+                # arm rotate at all without cloning the whole layer.
+                def stock_fn(x_, w_, sf_):
+                    base_layer.weight = w_
+                    base_layer.weight_scale = sf_
+                    return stock_kernel.apply_weights(base_layer, x_)
+
+                stock_args = (x, w_fp4, w_sf)
+                assert_args_consumed(stock_fn, stock_args, label="stock")
                 
                 
                 
@@ -454,13 +468,23 @@ def run(args) -> None:
                 
                 
                 
-                untuned = timed_detail(stock_fn, (x, base_layer.weight),
+                untuned = timed_detail(stock_fn, stock_args,
                                        repeats=max(2, args.repeats // 2))
                 if args.autotune:
-                    fi_autotuned(stock_fn, (x, base_layer.weight), m_bucket=m)
-                stock = timed_detail(stock_fn, (x, base_layer.weight),
+                    fi_autotuned(stock_fn, stock_args, m_bucket=m)
+                stock = timed_detail(stock_fn, stock_args,
                                      repeats=args.repeats)
+                # Rotation leaves the layer pointing at whichever clone ran
+                # last; those die with the call, and the next M would build
+                # its arguments from a dangling attribute.
+                base_layer.weight, base_layer.weight_scale = w_fp4, w_sf
                 tune_gain = (untuned["us"] / stock["us"]) if stock["us"] else None
+                l2 = l2_accounting(stock_args, device)
+                # Prefly, outside every timed window. See `kernels_per_call`:
+                # this is what catches a closure doing work the other arm does
+                # not, which no output or spread check can see.
+                stock_kpc = kernels_per_call(stock_fn, stock_args)
+                base_layer.weight, base_layer.weight_scale = w_fp4, w_sf
                 emit({"kind": "measure", "run_id": run_id, "family": "stock",
                       "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
                       "ratio": 0.0, "stock_kernel_class": stock_name, "gpu_neighbors": neighbors,
@@ -474,16 +498,23 @@ def run(args) -> None:
                       # every ratio in this row flatters the residue path.
                       "autotune_gain": tune_gain,
                       "autotune_requested": bool(args.autotune),
- **stock})
+                      
+                      
+                      
+                      "weight_mb": n * k / 2 / 1e6,
+                      "kernels_per_call": stock_kpc,
+                      **l2,
+                      **stock})
 
                 placeholder = torch.zeros(1, dtype=torch.uint8, device=device)
 
                 # ---- mext: ratio 1.0, weight stored once, rows doubled
                 if m in m_mext:
-                    f = lambda *_: torch.ops.residue.nvfp4_linear(   # noqa: E731
-                        x, w_fp4, x_gs, w_sf, w_sf, placeholder,
-                        (1.0 / (x_gs * w_gs)).reshape(()),
-                        k, k, 0, n, True, False, True)
+                    _alpha = (1.0 / (x_gs * w_gs)).reshape(())
+                    f = lambda x_, w_, sf_: torch.ops.residue.nvfp4_linear(   # noqa: E731
+                        x_, w_, x_gs, sf_, sf_, placeholder,
+                        _alpha, k, k, 0, n, True, False, True)
+                    mext_args = (x, w_fp4, w_sf)
                     # Compile OUTSIDE the counted window. sm120 JITs the fold
                     # per (n_w, k, m_tok, tile, a_ld) at ~1.3 s a shape; taking
                     # the snapshot before warmup counted that compile as if it
@@ -496,7 +527,7 @@ def run(args) -> None:
                     import io
                     buf = io.StringIO()
                     with TacticWatch() as tw, contextlib.redirect_stdout(buf):
-                        f()
+                        f(*mext_args)
                         torch.cuda.synchronize()
                     # The stack announces the fold ONCE per process, not per
                     # call, so this is sticky: False on later rows would be a
@@ -506,8 +537,10 @@ def run(args) -> None:
                     # in that file folded and the file is not what it claims.
                     if "fold FIRED" in buf.getvalue():
                         fold_seen[0] = True
+                    assert_args_consumed(f, mext_args, label="mext")
+                    mext_kpc = kernels_per_call(f, mext_args)
                     before = nvfp4_fold.compile_stats()
-                    t = timed_detail(f, (x, w_fp4), repeats=args.repeats)
+                    t = timed_detail(f, mext_args, repeats=args.repeats)
                     after = nvfp4_fold.compile_stats()
                     for hit in tw.hits:
                         emit({"kind": "tactic_fallback", "run_id": run_id,
@@ -524,6 +557,17 @@ def run(args) -> None:
                           "jit_during_timing": _compiled_delta(before, after),
                           "fold_tactic_source": fold_tactic_source(sm, bool(tw.hits)),
                           "fold_fired_in_run": fold_seen[0],
+                          "weight_mb": n * k / 2 / 1e6,
+                          "kernels_per_call": mext_kpc,
+                          # The fold quantises the activation and the baseline
+                          # does not, so +1 is expected and +3 was the alpha
+                          # defect. Recorded, not asserted: a difference is not
+                          # automatically a fault, but it must be explainable.
+                          "kernels_vs_stock": (
+                              (mext_kpc - stock_kpc)
+                              if (mext_kpc is not None
+                                  and stock_kpc is not None) else None),
+                          **l2_accounting(mext_args, device),
                           **t})
 
                 # ---- kext: ratio r < 1, K grows to K*(1+r)
@@ -547,11 +591,14 @@ def run(args) -> None:
                         
                         
                         
-                        f = lambda *_, e=e, alpha=alpha: torch.ops.residue.nvfp4_linear(  # noqa: E731
-                            x, e["w"], x_gs, e["sf"], e["sf"], placeholder,
+                        f = lambda x_, w_, sf_, e=e, alpha=alpha: torch.ops.residue.nvfp4_linear(  # noqa: E731
+                            x_, w_, x_gs, sf_, sf_, placeholder,
                             alpha, k, int(e["idx"].numel()), 0, n,
                             True, False, False)
-                        t = timed_detail(f, (x, e["w"]), repeats=args.repeats)
+                        kext_args = (x, e["w"], e["sf"])
+                        assert_args_consumed(f, kext_args, label=f"kext r={r}")
+                        kext_kpc = kernels_per_call(f, kext_args)
+                        t = timed_detail(f, kext_args, repeats=args.repeats)
                         emit({"kind": "measure", "run_id": run_id,
                               "family": "kext", "rep": args.rep, "model": model, "proj": proj,
                               "n": n, "k": k, "m": m, "ratio": r,
@@ -563,6 +610,13 @@ def run(args) -> None:
                               # this column is ~1.0 iff we pay nothing beyond
                               # the arithmetic the extension implies
                               "vs_ideal": t["us"] / ((1.0 + r) * stock["us"]),
+                              "weight_mb": n * e["k_ext"] / 2 / 1e6,
+                              "kernels_per_call": kext_kpc,
+                              "kernels_vs_stock": (
+                                  (kext_kpc - stock_kpc)
+                                  if (kext_kpc is not None
+                                      and stock_kpc is not None) else None),
+                              **l2_accounting(kext_args, device),
                               **t})
 
                 del x

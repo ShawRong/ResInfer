@@ -355,6 +355,18 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         except Exception as e:                            # noqa: BLE001
             print(f"[residue] sm100 kloop precompile skipped: "
                   f"{type(e).__name__}: {str(e)[:70]}", flush=True)
+        # Phase-3 fold tuner (dark by default): warm the row_pair candidate
+        # set so a persisted cache entry finds its kernel on a later boot.
+        # Symbolic shapes -- one warm covers every layer, so first
+        # registration triggers it, same as the kloop above.
+        try:
+            from .sm10x_fold_tuner import precompile_row_pair, tuner_enabled
+
+            if tuner_enabled():
+                precompile_row_pair()
+        except Exception as e:                            # noqa: BLE001
+            print(f"[residue] sm10x fold-tuner precompile skipped: "
+                  f"{type(e).__name__}: {str(e)[:70]}", flush=True)
     if not _sm120_fold_available():
         return
     try:
@@ -381,6 +393,16 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         print(f"[residue] sm120 fold pre-compiled n_w={key[0]} k={key[1]} "
               f"k_ext={key[2]} mext_r1={key[3]} tiles={tiles} (dynamic m; "
               f"{len(_SM120_FOLD_SHAPES)} shapes so far)", flush=True)
+        
+        
+        
+        
+        from .sm120_fold_tuner import precompile_fold_tiles
+
+        a_ld = None if key[2] == key[1] else key[2]
+        n_cand = precompile_fold_tiles(key[0], key[1], a_ld=a_ld)
+        print(f"[residue] fold tuner candidates pre-compiled n_w={key[0]} "
+              f"k={key[1]} a_ld={a_ld} x {n_cand} tiles", flush=True)
         if key[3]:
             # mext_r1 prefill routes to the tuned two_gemm/k_loop dispatch;
             # pre-compile the kloop grid HERE so get_valid_tactics can offer it
@@ -643,12 +665,13 @@ def _tune_mext_families_sm10x(
     )
 
 
-# CuTeDSL SM120 fold (nvfp4.cute_fold_sm120) -- OPT-IN alternative to the C++
-# SM120 fold op. Same row_pair mext_r1 quant layout as the SM10x fork; the
-# kernel is validated bit-exact against the C++ op (52 fuzz cases + a
-# four-corner loop vs an independent plain-NVFP4 twin, see
 
-# RESIDUE_SM120_CUTEDSL_FOLD=1; default OFF keeps the C++ path byte-identical.
+
+
+
+
+
+
 _SM120_DSL_ENABLED: bool | None = None
 _SM120_DSL_FIRED = [False]
 
@@ -664,40 +687,23 @@ def _run_mext_fold_gemm_sm120_cutedsl(
     output_n: int,
     k_base: int,
 ) -> torch.Tensor:
-    'SM120 CuTeDSL fold: row_pair mext_r1 quant + compact fold GEMM.'
-    from nvfp4.cute_fold_sm120 import act_pad_multiple
-    from nvfp4.fold import run_fold
+    'SM120 CuTeDSL fold, tile picked by the FlashInfer tuner.'
+    from .sm120_fold_tuner import tuned_sm120_fold
 
-    pad_mult = act_pad_multiple(int(original_m), int(output_n), int(k_base))
-    m_padded = ((int(original_m) + pad_mult - 1) // pad_mult) * pad_mult
-    x_in = x
-    if m_padded != x.shape[0]:
-        x_in = torch.zeros(m_padded, x.shape[1], dtype=x.dtype, device=x.device)
-        x_in[: x.shape[0]] = x
-
-    x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
-        x_in,
-        input_global_scale_inv,
-        layout_mode=_LAYOUT_ROW_PAIR,
-    )
     if not _SM120_DSL_FIRED[0]:
         _SM120_DSL_FIRED[0] = True
         print(
-            f"[residue] SM120 CuTeDSL MExt fold FIRED: act={tuple(x_fp4.shape)} "
-            f"weight={tuple(weight.shape)} m={original_m} pad->{m_padded}",
+            f"[residue] SM120 CuTeDSL MExt fold FIRED: "
+            f"weight={tuple(weight.shape)} m={original_m}",
             flush=True,
         )
-    major, minor = torch.cuda.get_device_capability()
-    return run_fold(
-        int(major),
-        int(minor),
+    return tuned_sm120_fold(
+        x,
         weight,
-        x_fp4,
+        input_global_scale_inv,
         weight_scale_base,
-        x_sf.view(torch.float8_e4m3fn),
         alpha,
         output_dtype,
-        m_tok_real=int(original_m),
     )
 
 
@@ -863,6 +869,25 @@ def nvfp4_linear(
             )
 
             major, minor = torch.cuda.get_device_capability()
+
+            from .sm10x_fold_tuner import tuned_sm10x_fold, tuner_enabled
+
+            if tuner_enabled() and not ENABLE_MEXT_FAMILY:
+                
+                
+                
+                
+                
+                
+                out = tuned_sm10x_fold(
+                    x,
+                    _base_k_weight_view(weight, k_base),
+                    input_global_scale_inv,
+                    weight_scale_base,
+                    alpha,
+                    output_dtype,
+                )
+                return out[:original_m]
 
             if ENABLE_MEXT_FAMILY and is_tuning_mode():
                 # Warmup window: this is the ONLY place both layouts of the

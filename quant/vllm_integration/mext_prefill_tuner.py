@@ -157,62 +157,53 @@ def precompile_kloop_sm120(n_w: int, k: int,
     return done
 
 
+
+
+
+
+
+
+
+
+
+# for the numbers that justified it.
+
+_DEGRADED = [False]
+_ANNOUNCED = [False]
+
+
+def _kloop_valid_tactics(inputs, tuning):
+    if _is_sm10x():
+        if tuning:
+            return list(range(len(KLOOP_SM100_CFGS)))
+        return [i for i, (t, c) in enumerate(KLOOP_SM100_CFGS)
+                if ("sm100", t, c) in _PRECOMPILED]
+    w = inputs[1]
+    n_w, k = int(w.shape[0]), int(w.shape[1]) * 2
+    if tuning:
+        # Warmup window: compiling is legal (and lru-cached before the
+        # timed reps), so every candidate competes.
+        return list(range(len(KLOOP_TILES)))
+    
+    
+    
+    
+    return [i for i, tile in enumerate(KLOOP_TILES)
+            if (n_w, k, tile) in _PRECOMPILED]
+
+
 def _make_runners():
-    from flashinfer.autotuner import AutoTuner, TunableRunner
+    from .fi_tuner_base import make_runner_pair
 
-    class TwoGemmRunner(TunableRunner):
-        """runners[0]: FlashInfer's designated fallback. Any cache miss or
-        skipped op serves this -- the never-JIT guarantee."""
-
-        def get_valid_tactics(self, inputs, profile):
-            return [0]
-
-        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-            return _run_two_gemm(inputs)
-
-        def get_cache_key_extras(self, inputs):
-            return ("two_gemm", 1)
-
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    # for the numbers that justified it.
-    class KloopRunner(TunableRunner):
-        def get_valid_tactics(self, inputs, profile):
-            tuning = AutoTuner.get().is_tuning_mode
-            if _is_sm10x():
-                if tuning:
-                    return list(range(len(KLOOP_SM100_CFGS)))
-                return [i for i, (t, c) in enumerate(KLOOP_SM100_CFGS)
-                        if ("sm100", t, c) in _PRECOMPILED]
-            w = inputs[1]
-            n_w, k = int(w.shape[0]), int(w.shape[1]) * 2
-            if tuning:
-                # Warmup window: compiling is legal (and lru-cached before
-                # the timed reps), so every candidate competes.
-                return list(range(len(KLOOP_TILES)))
-            
-            
-            
-            
-            return [i for i, tile in enumerate(KLOOP_TILES)
-                    if (n_w, k, tile) in _PRECOMPILED]
-
-        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
-            if tactic < 0:
-                return _run_two_gemm(inputs)
-            return _run_kloop(inputs, tactic)
-
-        def get_cache_key_extras(self, inputs):
-            return ("k_loop", 1)
-
-    return [TwoGemmRunner(), KloopRunner()]
+    return make_runner_pair(
+        _CUSTOM_OP,
+        fallback_forward=_run_two_gemm,
+        fallback_extras=("two_gemm", 1),
+        valid_tactics=_kloop_valid_tactics,
+        run_tactic=_run_kloop,
+        candidate_extras=lambda inputs: ("k_loop", 1),
+        degraded_flag=_DEGRADED,
+    )
 
 
 _RUNNERS = None
@@ -243,10 +234,21 @@ def tuned_mext_prefill(
                 return _run_kloop(inputs, i)
         return _run_two_gemm(inputs)
 
-    from flashinfer.autotuner import AutoTuner
+    from .fi_tuner_base import tuned_call
 
-    if _RUNNERS is None:
-        _RUNNERS = _make_runners()
-    runner, tactic = AutoTuner.get().choose_one(
-        _CUSTOM_OP, _RUNNERS, _tuning_config(), inputs)
-    return runner.forward(inputs, tactic=tactic)
+    def _runners():
+        global _RUNNERS
+        if _RUNNERS is None:
+            _RUNNERS = _make_runners()
+        return _RUNNERS
+
+    return tuned_call(
+        _CUSTOM_OP,
+        runners_getter=_runners,
+        config_getter=_tuning_config,
+        inputs=inputs,
+        fallback_forward=_run_two_gemm,
+        kill_env_value=None,       # no kill switch: two_gemm IS the fallback
+        announce_flag=_ANNOUNCED,
+        announce=None,
+    )

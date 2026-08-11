@@ -44,6 +44,98 @@ RELDIFF_SAME_FAMILY = 1e-3
 RELDIFF_CROSS_IMPL = 1e-2
 
 
+def assert_args_consumed(fn: Callable[..., Any], args: Sequence[Any],
+                         *, label: str = "") -> None:
+    'Fail loudly when a timed callable ignores the buffers handed to it.'
+    import torch
+
+    idxs = [i for i, a in enumerate(args)
+            if torch.is_tensor(a) and a.is_cuda]
+    if not idxs:
+        return
+    ref = fn(*args)
+    if not torch.is_tensor(ref):
+        return                          # cannot decide; do not pretend to
+    ref = ref.clone()
+
+    ignored = []
+    for i in idxs:
+        probe = list(args)
+        # Zero, not negate: the arguments span bf16 activations, uint8-packed
+        # FP4 weights and FP8 scale factors, and `neg` is not defined on the
+        # last of those. Zero is a legal encoding in all three and drives the
+        # output to zero (or to NaN, if a scale is divided by) -- either way it
+        # moves, which is all this needs.
+        probe[i] = torch.zeros_like(args[i])
+        try:
+            got = fn(*probe)
+        except Exception:
+            continue                    # it looked at the tensor; that is the
+            #                             question being asked here
+        if torch.is_tensor(got) and torch.equal(ref, got):
+            ignored.append(i)
+    fn(*args)                           # restore state the callable mutated
+
+    if ignored:
+        raise RuntimeError(
+            f"timed callable {label or fn!r} ignores input_args at index "
+            f"{ignored}: perturbing them did not change the output. "
+            f"cold_l2_cache rotates exactly these buffers, so they would be "
+            f"cloned and never read, and every measurement here would be a "
+            f"warm-L2 timing wearing a cold-L2 label. Take the tensors as "
+            f"parameters instead of reading them from the closure.")
+
+
+def kernels_per_call(fn: Callable[..., Any], args: Sequence[Any],
+                     *, reps: int = 5) -> float | None:
+    'CUDA kernel launches inside ONE invocation of a timed callable.'
+    import torch
+    from torch.autograd import DeviceType
+    from torch.profiler import ProfilerActivity, profile
+
+    try:
+        fn(*args)                       # warm: never count a JIT
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as prof:
+            for _ in range(reps):
+                fn(*args)
+            torch.cuda.synchronize()
+        n = sum(e.count for e in prof.key_averages()
+                if e.device_type == DeviceType.CUDA
+                and e.self_device_time_total > 0)
+        return n / reps
+    except Exception:
+        return None                     # an instrument, never a blocker
+
+
+def l2_accounting(args: Sequence[Any], device: Any) -> dict:
+    """How the rotating buffers landed, recorded per row rather than recalled.
+
+    `calculate_rotation_count` returns 1 when the arguments already exceed L2,
+    and the helper then disables rotation because the cache is cold anyway. So
+    `rotations == 1` and `rotations > 1` are both correct and mean opposite
+    things; a row cannot be read without knowing which it was.
+    """
+    import torch
+    from flashinfer.testing.utils import calculate_rotation_count
+
+    tensors = [a for a in args if torch.is_tensor(a) and a.is_cuda]
+    if not tensors:
+        return {"arg_mb": 0.0, "rotations": 0, "l2_resident": None}
+    nbytes = sum(t.numel() * t.element_size() for t in tensors)
+    try:
+        rot = int(calculate_rotation_count(tensors, device))
+    except Exception:                   # helper is test-only; never fatal
+        rot = -1
+    return {
+        "arg_mb": nbytes / 1e6,
+        "rotations": rot,
+        # True  -> one copy fits, rotation is what keeps it cold
+        # False -> the working set alone exceeds L2; cold either way
+        "l2_resident": (rot > 1) if rot > 0 else None,
+    }
+
+
 def timed(fn: Callable[..., Any], args: Sequence[Any] = (),
           *, repeat_iters: int = 25, iters_within_graph: int = 8,
           repeats: int = 5) -> float:

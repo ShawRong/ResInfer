@@ -236,7 +236,14 @@ def act_layout_for(
 
 
 def warn_default_path(arch: str, m_tok: int, detail: str = "") -> None:
-    """Announce, once per process, that the untuned table is serving.
+    """Announce, once per process, that the untuned sm10x table is serving.
+
+    sm10x ONLY. This warning means "a tuned path exists on this arch and you
+    are not on it" -- true on sm10x, whose tuner primes at engine init. It
+    used to also fire unconditionally on sm120, where the static table is
+    itself an offline full-sweep product and a legitimate serving path; that
+    was a false alarm, and sm120 now announces its table as information in
+    cute_fold_sm120.tactics instead of calling here.
 
     Once, not per call: this sits in the decode path and the message is a
     build-configuration fact, not a per-request event.

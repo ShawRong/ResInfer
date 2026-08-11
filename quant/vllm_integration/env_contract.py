@@ -77,6 +77,14 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_FOLD_MEXT": ("one", None, "enable A4/A6 tile8 families (sm10x)"),
     "RESIDUE_FOLD_SILENCE_DEFAULT": ("one", None,
                                      "silence the static-tactic-table warning"),
+    "RESIDUE_SM120_FOLD_TUNER": ("enum", {"0", "1"},
+                                 "sm120 decode-fold FlashInfer tile tuner "
+                                 "(default on; 0 = serve the offline-swept "
+                                 "static table directly)"),
+    "RESIDUE_SM10X_FOLD_TUNER": ("enum", {"0", "1"},
+                                 "sm10x decode-fold FlashInfer tactic tuner "
+                                 "(default OFF pending sm100 validation; the "
+                                 "legacy in-process tuner serves meanwhile)"),
     "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
                                    "kill the sm10x fold (mext_r1 layers then "
                                    "refuse to serve, by design)"),
