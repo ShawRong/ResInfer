@@ -265,3 +265,13 @@ def pid_identity(pid: int) -> dict:
     if len(out) == 1:
         out["note"] = "process already exited -- identity unrecoverable"
     return out
+
+
+def warm_equally(fn: Callable[..., Any], args: Sequence[Any] = (),
+                 *, calls: int = 400) -> None:
+    'Put the GPU in the same thermal/clock state for every arm.'
+    import torch
+
+    for _ in range(int(calls)):
+        fn(*args)
+    torch.cuda.synchronize()

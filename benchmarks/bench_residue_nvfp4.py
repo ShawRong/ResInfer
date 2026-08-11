@@ -20,7 +20,7 @@ try:                          # `python -m benchmarks.bench_residue_nvfp4`
     from benchmarks import manifest as spec_mod
     from benchmarks._common import (assert_args_consumed, fi_autotuned,
                                     kernels_per_call, l2_accounting,
-                                    pid_identity, timed_detail)
+                                    pid_identity, timed_detail, warm_equally)
 except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # Both invocations must work: the README advertises the module form, and
     # a bare `from _common import ...` resolves only in the second, where the
@@ -30,7 +30,7 @@ except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     import manifest as spec_mod
     from _common import (assert_args_consumed, fi_autotuned,
                          kernels_per_call, l2_accounting, pid_identity,
-                         timed_detail)
+                         timed_detail, warm_equally)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
@@ -487,10 +487,12 @@ def run(args) -> None:
                 
                 
                 
+                warm_equally(stock_fn, stock_args)
                 untuned = timed_detail(stock_fn, stock_args,
                                        repeats=max(2, args.repeats // 2))
                 if args.autotune:
                     fi_autotuned(stock_fn, stock_args, m_bucket=m)
+                warm_equally(stock_fn, stock_args)
                 stock = timed_detail(stock_fn, stock_args,
                                      repeats=args.repeats)
                 # Rotation leaves the layer pointing at whichever clone ran
@@ -511,10 +513,19 @@ def run(args) -> None:
                       # this one, because it is NVFP4's quantisation error
                       # rather than anything about the kernel.
                       "stock_untuned_us": untuned["us"],
-                      # >1 means tuning helped, so it demonstrably ran. ~1.0
-                      # with --autotune on is the alarm: either the shape was
-                      # already tuned, or the tuner silently did nothing and
-                      # every ratio in this row flatters the residue path.
+                      
+                      
+                      
+                      
+                      
+                      
+                      
+                      
+                      
+                      
+                      
+                      # below narrows the gap; it does not license the
+                      
                       "autotune_gain": tune_gain,
                       "autotune_requested": bool(args.autotune),
                       
@@ -574,6 +585,10 @@ def run(args) -> None:
                     
                     if args.autotune:
                         fi_autotuned(f, mext_args, m_bucket=m)
+                    
+                    
+                    
+                    warm_equally(f, mext_args)
                     mext_kpc = kernels_per_call(f, mext_args)
                     before = nvfp4_fold.compile_stats()
                     t = timed_detail(f, mext_args, repeats=args.repeats)
@@ -639,6 +654,7 @@ def run(args) -> None:
                         assert_args_consumed(f, kext_args, label=f"kext r={r}")
                         if args.autotune:      # same fairness rule as mext
                             fi_autotuned(f, kext_args, m_bucket=m)
+                        warm_equally(f, kext_args)      # and equal warm-up
                         kext_kpc = kernels_per_call(f, kext_args)
                         t = timed_detail(f, kext_args, repeats=args.repeats)
                         emit({"kind": "measure", "run_id": run_id,
