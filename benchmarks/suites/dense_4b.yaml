@@ -23,7 +23,29 @@ max_num_seqs: 8
 
 
 reference: bf16
-baseline: plain
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+baseline: plain_stock
 
 # Without this the suite prints scores and venue conditioning and NO paired
 # comparison -- the thing the table exists to produce -- and nothing says the
@@ -39,7 +61,7 @@ baseline: plain
 # PyYAML and not under this kit's no-dependency fallback -- the exact
 # machine-dependent split already closed once in this directory, and the kit's
 # premise is that it installs nothing on the machine it was written for.
-compare: uniform_r0125 vs uniform_r0125_off; uniform_r025 vs uniform_r025_off; anchor vs anchor_off; uniform_r0125 vs plain; anchor vs uniform_r0125
+compare: uniform_r0125 vs uniform_r0125_off; uniform_r025 vs uniform_r025_off; anchor vs anchor_off; uniform_r0125 vs plain_stock; uniform_r0125 vs plain_runtime_off; anchor vs uniform_r0125
 
 # Runs before any arm and blocks the suite. Two DIFFERENT checkpoints, because
 # a same-checkpoint gate cannot see queue contamination.
@@ -54,7 +76,17 @@ arms:
   - id: bf16
     path: base_bf16
     flags: ["--bf16"]
-  - id: plain
+  # The deployment alternative: a separate plain NVFP4 export, stock vLLM.
+  # Verified bit-identical base weights to the residue exports
+  # (q_proj base slice md5 685d99484524), so this differs from them in the
+  # method and the serving path, not in the quantisation of the base.
+  - id: plain_stock
+    path: plain_nvfp4
+    flags: ["--plain"]
+  # The mechanism isolation: same checkpoint as uniform_r0125, residue killed
+  # at every M. Kept because it needs no second export and varies exactly one
+  # thing -- but it is NOT the floor a recovery percentage should divide by.
+  - id: plain_runtime_off
     path: uniform_r0125
     flags: ["--residue-off"]
 

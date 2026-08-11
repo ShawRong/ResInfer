@@ -255,7 +255,21 @@ def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
 
         from .residue_linear_op import _SM120_FOLD_SHAPES
 
-        if torch.cuda.get_device_capability()[0] == 10 and _SM120_FOLD_SHAPES:
+        if _SM120_FOLD_SHAPES:
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
             mnbt = int(getattr(runner.scheduler_config,
                                "max_num_batched_tokens", 0) or 0)
 
