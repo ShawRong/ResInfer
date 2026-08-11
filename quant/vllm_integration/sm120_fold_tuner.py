@@ -94,10 +94,23 @@ def _run_fold_tile(inputs, tile, out_dtype) -> torch.Tensor:
         x_in = torch.zeros(m_pad, x.shape[1], dtype=x.dtype, device=x.device)
         x_in[:m] = x
     x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(x_in, gs_inv, layout_mode=1)
-    return mext_fold_gemm_sm120(
+    out = mext_fold_gemm_sm120(
         weight, x_fp4, wsb, x_sf.view(torch.float8_e4m3fn), alpha, out_dtype,
         tile_shape_mnk=tile, m_tok_real=m,
     )
+    # THE WHITELIST LEARNS FROM EXECUTION: this kernel just ran, so it is
+    # compiled in this process's cache -- serving it cannot JIT. Without
+    # this, only serving's PWAL ever fed the whitelist, and any caller that
+    # tunes without registering shapes (the kernel bench) degraded every
+    # tile-runner win back to the table -- 7 of 32 rows on the field's
+    # first day out, caught by fold_tactic_source=fallback.
+    _note_compiled(weight, tile)
+    return out
+
+
+def _note_compiled(weight: torch.Tensor, tile: tuple[int, int, int]) -> None:
+    n_w, k_logical, a_ld = _weight_geometry(weight)
+    _PRECOMPILED.add((n_w, k_logical, a_ld, tile))
 
 
 def _table_tile(inputs) -> tuple[int, int, int]:
