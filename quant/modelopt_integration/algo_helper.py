@@ -25,6 +25,14 @@ __all__ = [
 ]
 
 
+# The single source of truth for which salience metrics exist. It used to be
+# an inline set inside the constructor, which meant any caller wanting to
+# validate one before loading a 7.6GB model had to write out a second copy --
+# and a second copy of a fact is a copy that drifts. Exported so the export
+# preflight can reject a typo in seconds instead of after the model load.
+SALIENCE_METRICS = frozenset({"activation_max", "nvfp4_error_weighted"})
+
+
 class ResidueHelper:
     cache_mode: bool = False
     
@@ -43,8 +51,10 @@ class ResidueHelper:
         self.residue_ratio = residue_ratio
         self.salience_metric = salience_metric
 
-        if salience_metric not in {"activation_max", "nvfp4_error_weighted"}:
-            raise ValueError(f"Unsupported residue salience metric: {salience_metric!r}")
+        if salience_metric not in SALIENCE_METRICS:
+            raise ValueError(
+                f"Unsupported residue salience metric: {salience_metric!r}; "
+                f"known: {sorted(SALIENCE_METRICS)}")
 
         self.act_scale = 0.0
         self.num_tokens = 0

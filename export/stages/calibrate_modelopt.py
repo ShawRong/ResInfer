@@ -468,12 +468,21 @@ class ModelOptCalibrateStage(Stage):
         if quant_mode == "residue":
             from quant.modelopt_integration.registry import build_residue_cfg
 
+            # salience_metric was being dropped here: callers passed it, the
+            # campaign fingerprint CERTIFIED it, and this call used
+            # build_residue_cfg's own default instead. The numbers were right
+            # only because the two happened to agree -- set the recipe to
+            # nvfp4_error_weighted and you got a new fingerprint over an
+            # identical model. A field a fingerprint attests to must be a field
+            # the pipeline actually consumes; otherwise the fingerprint is a
+            # promise with no mechanism behind it.
             quant_cfg = build_residue_cfg(
                 fmt=quant_fmt,
                 ratio=params.get("ratio", 0.25),
                 calib_block_size=params.get("calib_block_size", 8),
                 quant_scope=quant_scope,
                 use_sequential=params.get("use_sequential", False),
+                salience_metric=params.get("salience_metric", "activation_max"),
             )
         elif quant_mode == "awq_lite":
             # Standalone AWQ-lite W4A4: import from our package to register custom

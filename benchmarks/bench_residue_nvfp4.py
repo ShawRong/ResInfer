@@ -383,6 +383,32 @@ class TacticWatch:
 # ------------------------------------------------------------------- main
 def run(args) -> None:
     device = torch.device(f"cuda:{args.gpu}")
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    _cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+    _n = torch.cuda.device_count()
+    # `device` is a torch.device, not an int -- read its index rather than
+    # assuming the type from the name. (Assuming it cost one more run: the
+    # first version of this very check raised TypeError instead of the
+    # message it exists to print.)
+    _idx = device.index if getattr(device, "index", None) is not None else 0
+    if _idx >= _n:
+        raise SystemExit(
+            f"--gpu {_idx} but this process can only see {_n} device(s).\n"
+            + (f"CUDA_VISIBLE_DEVICES={_cvd} is remapping them: index {_idx} "
+               f"here means the {_idx+1}th of that list, not physical GPU "
+               f"{_idx}.\n  Either unset it and pass the physical index, or "
+               f"pass an index within 0..{_n-1}.\n"
+               if _cvd else
+               "CUDA_VISIBLE_DEVICES is not set, so this machine really has "
+               f"{_n} visible device(s).\n"))
     torch.cuda.set_device(device)
     dtype = torch.bfloat16
     torch.manual_seed(args.seed)

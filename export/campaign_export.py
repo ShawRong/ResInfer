@@ -334,6 +334,21 @@ def preflight(spec_name: str) -> int:
                       "not before")
         print(f"  {len(arms)} arm(s): {', '.join(a['arm'] for a in arms)}")
 
+    print("=== recipe fields the pipeline must actually consume ===")
+    
+    
+    
+    
+    
+    
+    try:
+        from quant.modelopt_integration.algo_helper import SALIENCE_METRICS
+        check(f"salience_metric {RECIPE['salience_metric']!r} is a known metric",
+              RECIPE["salience_metric"] in SALIENCE_METRICS,
+              f"known: {sorted(SALIENCE_METRICS)}")
+    except Exception as exc:  # noqa: BLE001
+        check("salience_metric validation", False, f"{type(exc).__name__}: {exc}")
+
     print("=== gpu ===")
     try:
         import torch
