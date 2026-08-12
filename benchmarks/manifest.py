@@ -9,7 +9,7 @@ an extra one silently widens it, and both produce something that looks like a
 complete result.
 
 Paths deliberately live outside the spec (see the header of
-`specs/residue_speed.yaml`): they are site-specific, and putting them in the
+`suites/speed_dense.yaml`): they are site-specific, and putting them in the
 file would destroy the portability the file exists to provide.
 """
 from __future__ import annotations

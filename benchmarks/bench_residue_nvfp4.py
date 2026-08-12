@@ -872,7 +872,7 @@ def main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--manifest", default=None,
                    help="benchmark spec YAML (default: the one shipped in "
-                        "benchmarks/specs/). Values it sets become the "
+                        "benchmarks/suites/, default speed_dense.yaml). Values it sets become the "
                         "defaults; an explicit flag still wins, and the "
                         "override is recorded in provenance.")
     p.add_argument("--gpu", type=int, default=0)
@@ -883,9 +883,7 @@ def main() -> None:
     p.add_argument("--m-max", type=int, default=None,
                    help="default is per-arch: 512 on sm100/sm103, 128 on sm120")
     p.add_argument("--repeats", type=int, default=5,
-                   help="cudagraph medians per point; the MIN is "
-                        "the reported number, the spread is the "
-                        "within-process noise floor")
+                   help='CUDA Graph medians per point. Report P50 as us, retain the minimum as us_mink, and report the within-process spread.')
     p.add_argument("--rep", type=int, default=0,
                    help="index of this WHOLE-PROCESS repetition. "
                         "Within-process medians share one autotune "

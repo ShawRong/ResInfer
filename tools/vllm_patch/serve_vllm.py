@@ -255,15 +255,31 @@ def detect_patch_mode(model_path: str, requested_quantization: str | None) -> tu
         if residue_metadata.exists():
             metadata = json.loads(residue_metadata.read_text())
             layers = metadata.get("layers", {})
-            has_mext_r1 = any(
-                layer_meta.get("runtime_mode") == "mext_r1"
+            # ANY residue runtime_mode, not just mext_r1. This used to test
+            # for mext_r1 alone, and the public storage-budget flow emits
+            # `extended_k` -- the majority mode on disk here, 4032 layers
+            # against 1412 -- so a real residue export auto-detected as NOT
+            # needing the patch. It would then be served as plain
+            # modelopt_fp4: no error, no warning, and weights whose K was
+            # widened read by a kernel that does not know it.
+            #
+            # A plain NVFP4 export does not write this file at all, so its
+            # presence with any moded layer is the marker. Passing
+            # --quantization residue_nvfp4 explicitly always worked; the
+            # documented promise of auto-detection is what did not.
+            modes = {
+                layer_meta.get("runtime_mode")
                 for layer_meta in layers.values()
                 if isinstance(layer_meta, dict)
-            )
-            if has_mext_r1:
+                and layer_meta.get("runtime_mode")
+            }
+            if modes:
                 needs_patch = True
                 if quantization is None:
                     quantization = "residue_nvfp4"
+                print(f"[serve] residue metadata: {len(layers)} layer(s), "
+                      f"runtime modes {sorted(modes)} -- enabling the patch",
+                      flush=True)
 
     return needs_patch, quantization
 

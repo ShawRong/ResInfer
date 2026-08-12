@@ -83,6 +83,7 @@ import argparse
 import json
 import os
 import pathlib
+import re
 import signal
 import subprocess
 import time
@@ -328,6 +329,66 @@ _MEM_PATTERNS = (
 )
 
 
+def gpu_state(gpu: int) -> dict:
+    """Clock and temperature AT THIS MOMENT, for stamping onto one arm's row.
+
+    `provenance()` samples once, before the sweep. An eight-round sweep runs
+    for hours, and the manifest's own comment promises that "clocks are
+    recorded per round and thermal drift becomes a column" -- which a single
+    sample at t=0 cannot deliver. A claim in a manifest that the code does not
+    implement is the defect this directory keeps paying for; here it is one
+    call per arm.
+    """
+    q = subprocess.run(
+        ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu,"
+         "power.draw,clocks_event_reasons.active",
+         "--format=csv,noheader,nounits", "-i", str(gpu)],
+        capture_output=True, text=True)
+    row = (q.stdout or "").strip().splitlines()
+    if not row:
+        return {}
+    v = [x.strip() for x in row[0].split(",")]
+    keys = ("clock_sm_mhz", "clock_max_sm_mhz", "temp_c", "power_w",
+            "throttle_reasons")
+    return {f"{k}_at_arm": val for k, val in zip(keys, v)}
+
+
+def engagement(log: str) -> dict:
+    'Did the residue patch reach the process that runs forward?'
+    applied = re.findall(r"\[residue:plugin\] applied in pid=(\d+)", log)
+    in_engine = bool(re.search(
+        r"\(EngineCore pid=(\d+)\)\s*\[residue:plugin\] applied", log))
+    env_lines = re.findall(r"\[residue:env\] (mode=[^\n]*)", log)
+    resolved = env_lines[-1].strip() if env_lines else None
+    mext_on = bool(resolved and "decode_mext=on" in resolved)
+
+    out = {"residue_plugin_pids": sorted(set(applied)),
+           "residue_plugin_in_engine": in_engine,
+           "residue_env_resolved": resolved,
+           "engagement_error": None}
+    if "[residue:plugin] FAILED" in log:
+        out["engagement_error"] = ("residue plugin FAILED -- this arm would "
+                                   "serve plain NVFP4 under a residue label")
+    elif not applied:
+        out["engagement_error"] = ("no '[residue:plugin] applied' in the serve "
+                                   "log -- the plugin never ran in any process")
+    elif not in_engine:
+        out["engagement_error"] = (
+            "the plugin applied only outside EngineCore. The launcher's log "
+            "looks healthy and the process that runs forward is unpatched; "
+            "set VLLM_ENABLE_V1_MULTIPROCESSING=0 or fix plugin coverage")
+    elif resolved is None:
+        out["engagement_error"] = ("no '[residue:env]' line -- the env "
+                                   "contract never resolved, so what the arm "
+                                   "actually serves is unrecorded")
+    elif not mext_on:
+        out["engagement_error"] = (
+            f"decode_mext is not on ({resolved}) -- a residue export served "
+            f"this way takes the legacy K-ext branch and measures the plain "
+            f"floor under a method arm's name")
+    return out
+
+
 def parse_decode_batch(log_text: str) -> dict:
     """The decode batch sizes actually reached, from vLLM's own progress lines.
 
@@ -455,8 +516,19 @@ _KEEP = ("mean_ttft_ms", "median_ttft_ms", "p99_ttft_ms",
 def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
             port: int, outdir: pathlib.Path,
             ready_timeout: int = 2400,
-            neighbors: list | None = None) -> dict:
+            neighbors: list | None = None,
+            hygiene_env: dict | None = None) -> dict:
     env = dict(os.environ)
+    # The manifest's `hygiene.env` block, applied. It used to be read by
+    # nothing at all: the yaml declared VLLM_DISABLE_COMPILE_CACHE=1 and no
+    # code consulted it, so the knob was decoration on a file that is
+    # committed as the spec itself. "<unset>" means remove the variable, which
+    # is how the spec says "this must not be set" as opposed to "leave it".
+    for k, v in (hygiene_env or {}).items():
+        if str(v) == "<unset>":
+            env.pop(k, None)
+        else:
+            env[k] = str(v)
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_NO_USAGE_STATS"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
@@ -542,14 +614,11 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
                 return rec
             rec["ready_s"] = round(ready_s, 1)
             early = log_path.read_text(errors="ignore")
-            if quant == "residue_nvfp4":
-                if "[residue:plugin] FAILED" in early:
-                    rec["error"] = ("residue plugin FAILED -- arm would serve "
-                                    "plain NVFP4 under a residue label")
-                    return rec
-                if "residue" not in early.lower():
-                    rec["error"] = "no residue marker in serve log"
-                    return rec
+            eng = engagement(early)
+            rec.update(eng)
+            if quant == "residue_nvfp4" and eng.get("engagement_error"):
+                rec["error"] = eng["engagement_error"]
+                return rec
             print(f"[{tag}] ready in {ready_s:.0f}s", flush=True)
             for conc in pending:
                 rj = outdir / f"{tag}_c{conc}.json"
@@ -580,7 +649,7 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=8199)
     ap.add_argument("--manifest", default=None,
                     help="benchmark spec YAML (default: the one shipped in "
-                         "benchmarks/specs/). It fixes the workload, the "
+                         "benchmarks/suites/, default speed_dense.yaml). It fixes the workload, the "
                          "concurrency grid and WHICH arms must be present; "
                          "--models-root supplies where each one lives.")
     ap.add_argument("--outdir", default=None)
@@ -644,9 +713,15 @@ def main() -> None:
         print(f"\n[round {rnd + 1}/{rounds}] order="
               f"{[t for t, *_ in order]}", flush=True)
         for slot, (tag, ratio, quant, model) in enumerate(order):
+            before = gpu_state(a.gpu)
             rec = run_arm(tag, ratio, quant, model, a.gpu, a.port, rdir,
                           ready_timeout=a.ready_timeout,
-                      neighbors=neighbors)
+                          neighbors=neighbors,
+                          hygiene_env=(doc.get("hygiene", {}) or {}).get("env"))
+            # Before AND after: one sample cannot show drift, and drift is
+            # what an unlocked multi-hour sweep has to be read against.
+            rec["gpu_before"] = before
+            rec["gpu_after"] = gpu_state(a.gpu)
             # `round` and `arm_slot` are what make the rotation analysable:
             # without the slot you cannot tell a real arm effect from a
             # position effect, which is the whole reason for rotating.
