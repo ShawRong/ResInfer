@@ -1429,12 +1429,29 @@ def _argv_task(man, root, arm, out, a):
 
 
 def _argv_external(name):
+    """These venues have a driver; it is just not this one.
+
+    This used to end with "the driver is a separate program and is not built
+    yet", which was true when written and stopped being true when
+    lcb_driver shipped. A reader hitting it concluded the venue was
+    unavailable and stopped -- the same defect the README carried, found the
+    same way, by someone running the shipped code without having written it.
+
+    So the refusal now routes rather than dead-ends. It still refuses: the
+    scorer lives in a separate environment for a reason (lighteval's
+    transformers floor is years ahead of what vLLM pins), and pretending
+    otherwise from inside this process would import the wrong stack.
+    """
     def f(man, root, arm, out, a):
         raise NotImplementedError(
-            f"venue '{name}' is not driven by this kit. It needs a served model "
-            f"and lighteval, which live in envs/lighteval/. The manifest is "
-            f"still the spec -- see benchmarks/README.md -- but the driver is "
-            f"a separate program and is not built yet.")
+            f"venue '{name}' is not scored by this kit -- it needs lighteval, "
+            f"which cannot co-install with vLLM and lives in "
+            f"envs/lighteval/. USE THE DRIVER THAT DOES:\n"
+            f"    python -m benchmarks.lcb_driver --manifest <this manifest> "
+            f"--models-root <dir> --arms <a,b> --out <dir>\n"
+            f"It launches one server per arm through the production "
+            f"attachment chain and refuses to score a cache replay. See the "
+            f"LiveCodeBench section of benchmarks/README.md.")
     return f
 
 

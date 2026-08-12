@@ -62,11 +62,26 @@ dependencies = [
     "lm-eval[longbench,ruler,math]>=0.4.9.2",
     "rouge>=1.0.1",
 
-    # ── PD-disaggregated KV transfer (NIXL) ──────────────────────────────
-    # Required for the PD eval / sweep workflow. vllm main does
-    # not declare nixl as a hard dep, so we pin it explicitly here.
-    "nixl==1.1.0",
-    "nixl-cu13==1.1.0",                   # CUDA 13 backend for nixl
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
 
     # ── Profiling / timing ────────────────────────────────────────────────
     "cupti-python==13.2.0",               # used by flashinfer bench + nsys timing harnesses

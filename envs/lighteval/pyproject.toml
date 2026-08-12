@@ -8,8 +8,15 @@ dependencies = [
     
     
     
-    "lighteval==0.13.0",
-    "litellm==1.86.0",
+    
+    
+    
+    
+    
+    
+    
+    "lighteval[litellm]==0.13.0",
+    "litellm[caching]==1.86.0",
     "openai==2.38.0",
     "datasets==4.8.4",
     "transformers==5.9.0",

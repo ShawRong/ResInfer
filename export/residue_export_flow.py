@@ -44,23 +44,43 @@ def _default_output_dir() -> Path:
     return Path("/tmp") / f"resinfer_awq_clean_residue_export_smoke_{stamp}"
 
 
+# The hub id used when nothing else is given. It is a NETWORK operation:
+# ~1.5 GB on first use, unusable where there is no outbound network (the
+# export pod), and it makes an otherwise deterministic run depend on
+# whichever revision the hub is serving today.
+HUB_FALLBACK_MODEL = "Qwen/Qwen3-0.6B"
+
+
 def _default_model_path() -> str:
-    env_path = os.environ.get("MODEL_PATH")
-    if env_path:
-        candidate = Path(env_path)
-        if not (candidate.is_absolute() and not candidate.exists()):
-            return env_path
-    # Last resort, and it is a NETWORK operation: this id downloads ~1.5 GB
-    # on first use, does not work at all where there is no outbound network
-    # (the export pod), and makes an otherwise deterministic run depend on
-    # whichever revision the hub is serving today. Say so rather than
-    # spending four minutes looking stuck, which is how it was found.
-    fallback = "Qwen/Qwen3-0.6B"
-    print(f"[export] no MODEL_PATH set -- falling back to the hub id "
-          f"{fallback!r}, which WILL DOWNLOAD. Set MODEL_PATH to a local "
-          f"checkout to avoid it, or HF_HUB_OFFLINE=1 to make the fetch "
-          f"fail loudly instead of waiting.", flush=True)
-    return fallback
+    """MODEL_PATH if set, else the hub id. No checks, no printing.
+
+    Two bugs lived here and both came from doing more than this:
+
+    * it PRINTED a "you are about to download" warning, and argparse
+      evaluates defaults while building the parser -- so an explicit
+      `--model_path /some/local/dir` was still told it would download.
+      An alarm that fires on correct usage is worse than no alarm; it
+      teaches the reader to ignore the one that matters.
+    * it silently discarded MODEL_PATH when the path did not exist, which
+      turned a typo in a local path into a network fetch. A wrong value the
+      user supplied should produce a path error naming their value, never a
+      substitution they did not ask for.
+
+    So: return what was asked for. Whether it is a download is decided
+    after parsing, when the final value is known.
+    """
+    return os.environ.get("MODEL_PATH") or HUB_FALLBACK_MODEL
+
+
+def warn_if_hub_download(model_path: str) -> None:
+    """Called AFTER parsing, when args.model_path is actually settled."""
+    if model_path != HUB_FALLBACK_MODEL:
+        return
+    print(f"[export] model_path is the hub id {model_path!r}, which WILL "
+          f"DOWNLOAD ~1.5 GB on first use. Pass --model_path (or set "
+          f"MODEL_PATH) to a local checkout to avoid it, or "
+          f"HF_HUB_OFFLINE=1 to make the fetch fail loudly instead of "
+          f"waiting.", flush=True)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -107,7 +127,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--nvfp4_seq_len", type=int, default=64)
     parser.add_argument("--nvfp4_batch_size", type=int, default=1)
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    # Only now is the value settled: an explicit --model_path beats the
+    # default, and warning before this point told correct invocations they
+    # were about to download.
+    warn_if_hub_download(args.model_path)
+    return args
 
 
 def _run_stage(stage, ctx, params: dict[str, Any]):
