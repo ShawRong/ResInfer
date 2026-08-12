@@ -1,8 +1,14 @@
 # OSS-safe model registry.
 #
-# Values may be either Hugging Face repo IDs or local paths. For local
-# development, create configs/models.local.yaml with the same structure; local
-# entries override these defaults and are ignored by git.
+# Values may be either Hugging Face repo IDs or local paths. The ids below
+# are the canonical names, not a recommendation to fetch them: each one
+# downloads on first use, and on a machine with no outbound network -- the
+# export pod, for one -- an id here is simply unusable.
+#
+# So point them at what you already have: copy configs/models.local.example.yaml
+# to configs/models.local.yaml and give local paths. Local entries override
+# these and are ignored by git, so an absolute path there is correct and
+# never ships.
 
 models:
   llama3_8b:

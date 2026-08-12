@@ -69,3 +69,14 @@ elif [ -n "${CONDA_PREFIX:-}" ] && [ -d "$CONDA_PREFIX/targets/x86_64-linux/incl
 fi
 # Fallback: system libcuda.so (driver library)
 export LIBRARY_PATH="/usr/lib/x86_64-linux-gnu:${LIBRARY_PATH:-}"
+
+# Hugging Face: prefer a mirror, and do not send model weights through an
+# http proxy. A proxy exists for traffic that cannot reach its destination;
+# a multi-gigabyte checkpoint can, faster, and sending it through the proxy
+# occupies that link for everything else. Both are overridable -- set
+# HF_ENDPOINT yourself and this leaves it alone.
+export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
+# Set HF_HUB_OFFLINE=1 to make any download fail loudly instead of waiting.
+# Worth doing on a run that is supposed to touch only local checkpoints:
+# a silent 1.5 GB fetch is a hidden dependency AND a hidden variable, since
+# what you get depends on the hub's current revision.
