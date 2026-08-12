@@ -803,8 +803,26 @@ def main() -> int:
     r.add_argument("--spec", default="p1_p4_4b"); r.add_argument("--out", required=True)
     r.add_argument("--force", action="store_true")
     v = sub.add_parser("verify"); v.add_argument("--out", required=True)
-    k = sub.add_parser("smoke", help="run the whole chain at nano scale")
-    k.add_argument("--out", default=None)
+    k = sub.add_parser(
+        "smoke",
+        help="run the whole chain at nano scale (0.6B, 4 calibration lines, "
+             "minutes). REQUIRES RESIDUE_CAMPAIGN_SMOKE_BASE=<a small "
+             "unquantised model>; without it this exits 3 after creating a "
+             "temp directory, which reads as a failure rather than a "
+             "missing input.",
+        description="Rehearse the whole export chain at nano scale: 0.6B, "
+                    "four calibration lines, two arms, then verify. Minutes, "
+                    "and it exercises the real code paths rather than a "
+                    "simplified copy.\n\n"
+                    "REQUIRED: RESIDUE_CAMPAIGN_SMOKE_BASE=<path to a small "
+                    "unquantised model>. RESIDUE_CAMPAIGN_DATASET is used if "
+                    "set, otherwise four synthetic lines are generated.\n\n"
+                    "Run this before anything expensive. Every defect this "
+                    "chain has shipped was control flow, and control flow "
+                    "runs at any scale.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    k.add_argument("--out", default=None,
+                   help="where to put the rehearsal; a temp dir by default")
     a = p.parse_args()
     if a.cmd == "preflight":
         return preflight(a.spec)

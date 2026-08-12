@@ -1,7 +1,7 @@
 [project]
 name = "resinfer-lighteval"
 version = "0.1.0"
-description = "Isolated lighteval environment for the decode-venue benchmarks (LiveCodeBench, AIME avg@8)"
+description = "Isolated lighteval environment for the decode-venue benchmarks (LiveCodeBench, AIME avg@n)"
 requires-python = ">=3.12,<3.13"
 dependencies = [
     
