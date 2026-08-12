@@ -236,6 +236,33 @@ def _fp_from(components: dict) -> str:
     return hashlib.sha256(blob).hexdigest()[:16]
 
 
+# The fields that are a property of the RECIPE, not of the machine. Only
+# these can be compared against a constant: the shas identify the actual
+# bytes, which are legitimately different on every machine that builds its
+# own base -- and a campaign that builds its own base is the design, not a
+# degradation. Comparing a whole fingerprint against a foreign constant
+# deadlocked the pod: build mode rebuilt a 9-hour base to be tolerated,
+# reuse mode skipped the rebuild and was rejected, and neither completed.
+SEMANTIC_FIELDS = ("dataset_id", "calib_samples", "calib_seq_len", "seed",
+                   "quant_fmt", "quant_scope", "calib_block_size",
+                   "salience_metric")
+
+
+def check_recipe_semantics(expected: dict) -> list[str]:
+    """Compare only what a recipe OWNS. Returns the differences, if any.
+
+    Cross-machine identity of the actual bytes is `verify`'s job, and it
+    does it the way that is possible: every arm in one directory must
+    share one fingerprint. That is the property the campaign needs. Equality
+    to another machine's fingerprint is not, and demanding it is how a gate
+    ends up rejecting a correct run.
+    """
+    c = recipe_components()
+    return [f"{k}: expected {expected[k]!r}, got {c.get(k)!r}"
+            for k in SEMANTIC_FIELDS
+            if k in expected and c.get(k) != expected[k]]
+
+
 def explain_fingerprint_mismatch(expected: dict, got: dict) -> list[str]:
     """Which COMPONENT differs -- the whole point of keeping them."""
     out = []
@@ -538,6 +565,42 @@ def verify(out_root: Path) -> int:
         except Exception as exc:  # noqa: BLE001
             status = f"FAIL {type(exc).__name__}: {str(exc)[:110]}"
             bad += 1
+        # The bf16 reference arms are unquantised links, not exported arms:
+        # they were never calibrated, so they have no calibration
+        # provenance, and counting them as a distinct "recipe" makes every
+        # run report that its arms span two. Found by the nano smoke rather
+        # than by a pod round trip, which is the entire argument for having
+        # the smoke.
+        #
+        # They are excluded by what they ARE (no quantization_config), not
+        # by name -- a name test would pass the day someone adds a third
+        # reference and calls it something else.
+        cfg_p = d / "config.json"
+        try:
+            unquantised = "quantization_config" not in json.loads(
+                cfg_p.read_text())
+        except Exception:
+            unquantised = False
+        if unquantised:
+            print(f"  {d.name:18s} reference (unquantised) -- not a recipe arm")
+            continue
+        # The bf16 reference arms are unquantised links, not exported arms.
+        # They were never calibrated, so they have no calibration
+        # provenance, and counting them as a distinct "recipe" makes every
+        # run report that its arms span two -- which fails the campaign at
+        # its last gate, after all the GPU time is spent.
+        #
+        # Excluded by what they ARE (no quantization_config), never by
+        # name: a name test passes until someone adds a third reference and
+        # calls it something else.
+        try:
+            unquantised = "quantization_config" not in json.loads(
+                (d / "config.json").read_text())
+        except Exception:
+            unquantised = False
+        if unquantised:
+            print(f"  {d.name:18s} reference (unquantised) -- not a recipe arm")
+            continue
         fp = (prov or {}).get("recipe_fingerprint", "NO-PROVENANCE")
         fps.setdefault(fp, []).append(d.name)
         print(f"  {d.name:<18} ratio={str((prov or {}).get('residue_ratio')):<6} "
@@ -614,6 +677,109 @@ def cmd_run(a) -> int:
     return verify(out)
 
 
+SMOKE_SPEC = [
+    {"arm": "smoke_plain", "ratio": None},
+    {"arm": "smoke_r05", "ratio": 0.5},
+]
+
+
+def cmd_smoke(a) -> int:
+    """Run the WHOLE chain at nano scale, locally, in minutes.
+
+    Why this exists, and it is the most useful comment in this file:
+
+    Every defect this driver has shipped was found on the pod, one per
+    round trip, in the order the steps run -- the driver living in dev/,
+    a fingerprint that hashed absolute paths, a preflight placed before its
+    own producer, two components disagreeing about where the frontier
+    lives, a required key dropped by a rename, and a gate that no
+    pod-built base could satisfy. Six defects, six round trips, each one
+    reachable only after the previous was fixed, and each round trip
+    costing hours because the pod has no network and must be synced by
+    hand.
+
+    None of them needed a big model or real data to reproduce. Every one
+    of them is in the CONTROL FLOW, and control flow runs at any scale.
+    The gates we had -- yaml parse, bash -n, capability probes -- are all
+    static; not one of them EXECUTES the chain, which is why the defects
+    could only surface where it does execute.
+
+    So: 0.6B, four calibration lines, two arms, one ratio. It proves
+    nothing about numerics and is not meant to. It proves the chain runs,
+    which is the property we kept discovering we did not have.
+
+    RUN THIS BEFORE EVERY DISPATCH. It is cheaper than the round trip by
+    three orders of magnitude.
+    """
+    import tempfile
+    global DATASET_PATH, BASE_MODEL, ORIG_BF16
+    root = Path(a.out) if a.out else Path(tempfile.mkdtemp(prefix="campaign_smoke_"))
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"### campaign smoke -- nano scale, control flow only\n    {root}")
+
+    calib = root / "calib_nano.jsonl"
+    if not calib.exists():
+        src = DATASET_PATH
+        if src and Path(src).exists():
+            with open(src) as f, open(calib, "w") as g:
+                for i, line in enumerate(f):
+                    if i >= 4:
+                        break
+                    g.write(line)
+        else:
+            calib.write_text("\n".join(
+                json.dumps({"text": "the quick brown fox " * 64,
+                            "source_split": "smoke", "source_index": i})
+                for i in range(4)) + "\n")
+    print(f"    calibration: {calib} (4 lines)")
+
+    base = os.environ.get("RESIDUE_CAMPAIGN_SMOKE_BASE", "")
+    if not base or not Path(base).is_dir():
+        print("    GATE: set RESIDUE_CAMPAIGN_SMOKE_BASE to a small "
+              "unquantised model (a 0.6B is ideal).")
+        print("    The smoke needs a real checkpoint -- it exercises the "
+              "loader and the calibrator, which is where the defects were.")
+        return 3
+
+    # Point the module's globals at the nano inputs, then run the real
+    # code paths. Overriding here rather than re-implementing them is the
+    # whole point: a simplified copy would not have caught any of the six.
+    # Set the ENV as well as the globals. preflight checks that the
+    # variables are set, not merely that the paths resolve -- and that is
+    # correct, because on the pod an unset variable and a missing file need
+    # different fixes. A smoke that bypassed the env would exercise a path
+    # production never takes, which is the failure mode of every simplified
+    # copy this project has written.
+    os.environ["RESIDUE_CAMPAIGN_DATASET"] = str(calib)
+    os.environ["RESIDUE_CAMPAIGN_BASE"] = base
+    os.environ["RESIDUE_CAMPAIGN_ORIG_BF16"] = base
+    DATASET_PATH = str(calib)
+    BASE_MODEL = base
+    ORIG_BF16 = base
+    RECIPE["calib_samples"] = 4
+    RECIPE["calib_seq_len"] = 128
+    SPECS["__smoke__"] = SMOKE_SPEC
+
+    print("\n--- preflight")
+    if preflight("__smoke__") != 0:
+        print("SMOKE FAIL at preflight"); return 4
+    print(f"\n--- fingerprint: {recipe_fingerprint()}")
+    for k, v in sorted(recipe_components().items()):
+        print(f"      {k:20s} {v}")
+
+    print("\n--- run (two arms)")
+    class _A:
+        spec, out, force, gpu = "__smoke__", str(root / "campaign"), True, None
+    if cmd_run(_A()) != 0:
+        print("SMOKE FAIL at run"); return 5
+
+    print("\n--- verify")
+    rc = verify(Path(root) / "campaign")
+    print("\nSMOKE " + ("PASS -- the chain runs end to end" if rc == 0
+                         else "FAIL at verify"))
+    return rc
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -622,11 +788,15 @@ def main() -> int:
     r.add_argument("--spec", default="p1_p4_4b"); r.add_argument("--out", required=True)
     r.add_argument("--force", action="store_true")
     v = sub.add_parser("verify"); v.add_argument("--out", required=True)
+    k = sub.add_parser("smoke", help="run the whole chain at nano scale")
+    k.add_argument("--out", default=None)
     a = p.parse_args()
     if a.cmd == "preflight":
         return preflight(a.spec)
     if a.cmd == "verify":
         return verify(Path(a.out))
+    if a.cmd == "smoke":
+        return cmd_smoke(a)
     return cmd_run(a)
 
 
