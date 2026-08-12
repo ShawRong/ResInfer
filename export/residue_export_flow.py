@@ -50,7 +50,17 @@ def _default_model_path() -> str:
         candidate = Path(env_path)
         if not (candidate.is_absolute() and not candidate.exists()):
             return env_path
-    return "Qwen/Qwen3-0.6B"
+    # Last resort, and it is a NETWORK operation: this id downloads ~1.5 GB
+    # on first use, does not work at all where there is no outbound network
+    # (the export pod), and makes an otherwise deterministic run depend on
+    # whichever revision the hub is serving today. Say so rather than
+    # spending four minutes looking stuck, which is how it was found.
+    fallback = "Qwen/Qwen3-0.6B"
+    print(f"[export] no MODEL_PATH set -- falling back to the hub id "
+          f"{fallback!r}, which WILL DOWNLOAD. Set MODEL_PATH to a local "
+          f"checkout to avoid it, or HF_HUB_OFFLINE=1 to make the fetch "
+          f"fail loudly instead of waiting.", flush=True)
+    return fallback
 
 
 def _parse_args() -> argparse.Namespace:
