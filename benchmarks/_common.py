@@ -12,6 +12,7 @@ published benchmark needs are here.
 """
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -89,6 +90,13 @@ def assert_args_consumed(fn: Callable[..., Any], args: Sequence[Any],
 def kernels_per_call(fn: Callable[..., Any], args: Sequence[Any],
                      *, reps: int = 5) -> float | None:
     'CUDA kernel launches inside ONE invocation of a timed callable.'
+    d = device_ops(fn, args, reps=reps)
+    return None if d is None else d["ops_per_call"]
+
+
+def device_ops(fn: Callable[..., Any], args: Sequence[Any],
+               *, reps: int = 5) -> dict | None:
+    "Split one call's device work into KERNELS and everything else."
     import torch
     from torch.autograd import DeviceType
     from torch.profiler import ProfilerActivity, profile
@@ -100,22 +108,62 @@ def kernels_per_call(fn: Callable[..., Any], args: Sequence[Any],
             for _ in range(reps):
                 fn(*args)
             torch.cuda.synchronize()
-        n = sum(e.count for e in prof.key_averages()
-                if e.device_type == DeviceType.CUDA
-                and e.self_device_time_total > 0)
-        return n / reps
+        kern = nonkern = 0
+        nonkern_us = 0.0
+        names: list[str] = []
+        for e in prof.key_averages():
+            if e.device_type != DeviceType.CUDA or e.self_device_time_total <= 0:
+                continue
+            # The torch profiler spells these exactly this way; anything else
+            # is a kernel. Matching on the prefix rather than an allowlist so
+            # a new transfer flavour is classified as non-kernel by default --
+            # the safe direction, since the failure being guarded is an op
+            # ncu cannot see going unnoticed.
+            if e.key.startswith(("Memcpy", "Memset")):
+                nonkern += e.count
+                nonkern_us += e.self_device_time_total / reps
+                names.append(f"{e.key[:40]} "
+                             f"{e.self_device_time_total / reps:.2f}us")
+            else:
+                kern += e.count
+        return {"ops_per_call": (kern + nonkern) / reps,
+                "kernels_per_call_gpu": kern / reps,
+                "nonkernel_per_call": nonkern / reps,
+                "nonkernel_us": round(nonkern_us, 3),
+                "nonkernel_ops": names}
     except Exception:
         return None                     # an instrument, never a blocker
 
 
-def l2_accounting(args: Sequence[Any], device: Any) -> dict:
-    """How the rotating buffers landed, recorded per row rather than recalled.
+# Kernel calls captured in one CUDA graph. A CONSTANT, and shared by
+# `timed_detail` (which sets the graph up) and `l2_accounting` (which reports
+# whether the resulting working set is actually cold), because the whole defect
+# this guards against is those two numbers drifting apart.
+ITERS_WITHIN_GRAPH = 8
 
-    `calculate_rotation_count` returns 1 when the arguments already exceed L2,
-    and the helper then disables rotation because the cache is cold anyway. So
-    `rotations == 1` and `rotations > 1` are both correct and mean opposite
-    things; a row cannot be read without knowing which it was.
-    """
+
+def iters_for_cold_l2(args: Sequence[Any], device: Any, *,
+                      over_l2: float = 2.0,
+                      floor: int = ITERS_WITHIN_GRAPH) -> int:
+    'Calls per graph needed for the in-graph working set to exceed L2.'
+    import torch
+
+    tensors = [a for a in args if torch.is_tensor(a) and a.is_cuda]
+    if not tensors:
+        return floor
+    nbytes = sum(t.numel() * t.element_size() for t in tensors)
+    try:
+        from flashinfer.testing.utils import get_l2_cache_size
+
+        need = math.ceil(over_l2 * float(get_l2_cache_size(device)) / nbytes)
+    except Exception:                   # noqa: BLE001  version drift
+        return floor
+    return max(floor, need)
+
+
+def l2_accounting(args: Sequence[Any], device: Any,
+                  iters_within_graph: int | None = None) -> dict:
+    'How the rotating buffers landed, recorded per row rather than recalled.'
     import torch
     from flashinfer.testing.utils import calculate_rotation_count
 
@@ -127,13 +175,32 @@ def l2_accounting(args: Sequence[Any], device: Any) -> dict:
         rot = int(calculate_rotation_count(tensors, device))
     except Exception:                   # helper is test-only; never fatal
         rot = -1
-    return {
+    out = {
         "arg_mb": nbytes / 1e6,
         "rotations": rot,
         # True  -> one copy fits, rotation is what keeps it cold
         # False -> the working set alone exceeds L2; cold either way
         "l2_resident": (rot > 1) if rot > 0 else None,
     }
+    if iters_within_graph:
+        try:
+            from flashinfer.testing.utils import get_l2_cache_size
+
+            l2 = float(get_l2_cache_size(device))
+            work = float(nbytes * iters_within_graph)
+            out.update({
+                "workset_mb": round(work / 1e6, 2),
+                "l2_mb": round(l2 / 1e6, 2),
+                "workset_over_l2": round(work / l2, 3),
+                
+                
+                
+                "cold_l2_effective": work > l2,
+                "niw_for_cold_l2": math.ceil(l2 / nbytes) if nbytes else None,
+            })
+        except Exception:               # noqa: BLE001  version drift
+            out["cold_l2_effective"] = None
+    return out
 
 
 def timed(fn: Callable[..., Any], args: Sequence[Any] = (),
@@ -153,7 +220,8 @@ def timed(fn: Callable[..., Any], args: Sequence[Any] = (),
 
 
 def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
-                 *, repeat_iters: int = 25, iters_within_graph: int = 8,
+                 *, repeat_iters: int = 25,
+                 iters_within_graph: int = ITERS_WITHIN_GRAPH,
                  repeats: int = 5) -> dict:
     """`timed`, keeping the individual medians instead of collapsing them.
 
@@ -171,12 +239,45 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
             num_iters_within_graph=iters_within_graph,
             input_args=list(args), cold_l2_cache=True)
         medians.append(statistics.median(samples) * 1000.0)
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    ordered = list(medians)
     medians.sort()
     return {
-        "us": medians[0],                   # the headline number: min-of-k
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        "us": medians[len(medians) // 2],
+        "us_stat": "p50",
+        "us_mink": medians[0],              # the old headline, one gen only
         "p50_us": medians[len(medians) // 2],
         "max_us": medians[-1],
         "medians_us": medians,
+        "medians_order": ordered,           
         "spread_pct": (100.0 * (medians[-1] - medians[0]) / medians[0]
                        if medians[0] else float("nan")),
         "repeats": repeats,
@@ -209,6 +310,43 @@ def fi_autotuned(fn: Callable[..., Any], args: Sequence[Any],
         for _ in range(warmup):
             fn(*args)
     torch.cuda.synchronize()
+
+
+def fi_tactic_state() -> set | None:
+    """Opaque snapshot of FlashInfer's tuner cache keys, or None on drift.
+
+    Pair with `fi_tactic_resolved` around a priming call to learn WHICH tactic
+    the baseline settled on. Snapshotting keys rather than reading them keeps
+    this independent of the key's internal shape, which is a private structure
+    and has no compatibility promise.
+    """
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        return set(AutoTuner.get().profiling_cache)
+    except Exception:                                       # noqa: BLE001
+        return None                     # version drift: report, never guess
+
+
+def fi_tactic_resolved(before: set | None) -> list | None:
+    'Which (op, runner, tactic) the tuner picked since `before`.'
+    if before is None:
+        return None
+    try:
+        from flashinfer.autotuner import AutoTuner
+
+        cache = AutoTuner.get().profiling_cache
+        out = []
+        for k in set(cache) - before:
+            v = cache[k]
+            out.append({"op": k[0] if isinstance(k, tuple) and k else None,
+                        "runner": k[1] if isinstance(k, tuple) and len(k) > 1
+                        else None,
+                        "runner_id": v[0] if len(v) > 0 else None,
+                        "tactic": v[1] if len(v) > 1 else None})
+        return sorted(out, key=lambda d: (str(d["op"]), str(d["tactic"])))
+    except Exception:                                       # noqa: BLE001
+        return None
 
 
 def reldiff(out, ref) -> float:

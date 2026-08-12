@@ -397,6 +397,14 @@ def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
 
     calib_params = {
         "model_path": BASE_MODEL,
+        # The stage's required key. It gets the PATH, not the id: this
+        # branch hands the value to ModelOpt's own dataloader, and a path
+        # is what worked before the recipe split identity from location.
+        # The id would be a behaviour change with a silent failure mode --
+        # DatasetManager.get_spec() looks refs up in configs/datasets.yaml,
+        # so an unregistered id resolves to something else or raises, and
+        # "calibrated on the wrong data" does not announce itself.
+        "dataset_ref": DATASET_PATH,
         "dataset_id": RECIPE["dataset_id"],
         "dataset_path": DATASET_PATH,
         "calib_samples": RECIPE["calib_samples"],

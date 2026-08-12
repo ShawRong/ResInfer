@@ -78,8 +78,19 @@ kernel:
   
   
   
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   repeats: 5
-  process_reps: 3
+  process_reps: 5
 
   # Tune the BASELINE at each M before timing it. FlashInfer's advantage IS a
   # per-shape search; timing it cold measures it handicapped and flatters
@@ -149,8 +160,20 @@ hygiene:
   
   void_row_on_jit: true
 
-  # Locking clocks needs privileges a reproducer may not have, so clocks are
-  # recorded per round instead and thermal drift becomes a column.
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   lock_clocks: false
 
   env:

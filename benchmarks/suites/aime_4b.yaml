@@ -76,14 +76,31 @@ cache_dir: per-run
 # zero-drift result to this venue, and do not carry this venue's floor to a
 # greedy one.
 
-reference: bf16
+reference: orig_bf16   # role lives here, not in the arm's name
 baseline: plain
 
 arms:
-  - id: bf16
-    path: base_bf16
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  - id: orig_bf16
+    path: base_orig_bf16
     kind: fp16
   - id: plain
+    path: plain
+    kind: modelopt_fp4
+  - id: plain_runtime_off
     path: uniform_r0125
     kind: residue
     mext: "off"
@@ -91,7 +108,17 @@ arms:
     path: uniform_r0125
     kind: residue
     mext: "on"
-  - id: anchor
-    path: anchor
+  - id: uniform_r025
+    path: uniform_r025
     kind: residue
     mext: "on"
+  - id: solver_b4p5
+    path: solver_b4p5
+    kind: residue
+    mext: "on"
+  - id: solver_b5
+    path: solver_b5
+    kind: residue
+    mext: "on"
+
+calibration_recipe: nemotron_sft_n1024_seq2048_seed42_activation_max

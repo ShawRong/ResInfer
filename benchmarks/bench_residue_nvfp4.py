@@ -18,8 +18,10 @@ import torch
 
 try:                          # `python -m benchmarks.bench_residue_nvfp4`
     from benchmarks import manifest as spec_mod
-    from benchmarks._common import (assert_args_consumed, fi_autotuned,
-                                    kernels_per_call, l2_accounting,
+    from benchmarks._common import (assert_args_consumed, device_ops,
+                                    fi_autotuned, fi_tactic_resolved,
+                                    fi_tactic_state, ITERS_WITHIN_GRAPH,
+                                    iters_for_cold_l2, l2_accounting,
                                     pid_identity, timed_detail, warm_equally)
 except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # Both invocations must work: the README advertises the module form, and
@@ -28,9 +30,11 @@ except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
     # parent is on sys.path instead, so the bare name is not found at all --
     # ModuleNotFoundError before anything runs.
     import manifest as spec_mod
-    from _common import (assert_args_consumed, fi_autotuned,
-                         kernels_per_call, l2_accounting, pid_identity,
-                         timed_detail, warm_equally)
+    from _common import (assert_args_consumed, device_ops, fi_autotuned,
+                         fi_tactic_resolved, fi_tactic_state,
+                         ITERS_WITHIN_GRAPH, iters_for_cold_l2,
+                         l2_accounting,
+                         pid_identity, timed_detail, warm_equally)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
@@ -138,15 +142,33 @@ def gpu_state(index: int) -> dict:
     process is not measuring this kernel. Clocks are recorded rather than
     locked because locking needs privileges a reproducer may not have; a
     thermal drift then shows up as a column instead of an unexplained row.
+
+    `clock_max_sm_mhz` and `throttle_reasons` turn "was the clock steady"
+    from a memory into data. Both matter even when someone HAS locked the
+    card: a lock set above what the workload can sustain is silently
+    overridden by the power or thermal cap, and the only difference between
+    a held lock and a violated one is this field. Sampled at run start and
+    again at the end, so a run whose two samples disagree announces itself.
     """
     index = physical_index(index)
     out: dict = {"index": index}
-    rows = _nvsmi(index, "gpu=name,uuid,clocks.sm,clocks.mem,temperature.gpu,"
+    rows = _nvsmi(index, "gpu=name,uuid,clocks.sm,clocks.mem,clocks.max.sm,"
+                         "temperature.gpu,"
                          "power.draw,memory.used,memory.total")
     if rows:
-        keys = ("name", "uuid", "clock_sm_mhz", "clock_mem_mhz", "temp_c",
+        keys = ("name", "uuid", "clock_sm_mhz", "clock_mem_mhz",
+                "clock_max_sm_mhz", "temp_c",
                 "power_w", "mem_used_mib", "mem_total_mib")
         out.update(dict(zip(keys, [v.strip() for v in rows[0].split(",")])))
+    # Driver 580+ renamed clocks_throttle_reasons -> clocks_event_reasons;
+    # ask for the new name and fall back, rather than losing the field on
+    # whichever driver the reproducer has.
+    for field in ("clocks_event_reasons.active",
+                  "clocks_throttle_reasons.active"):
+        rows = _nvsmi(index, f"gpu={field}")
+        if rows and not rows[0].lower().startswith(("not supported", "n/a")):
+            out["throttle_reasons"] = rows[0].strip()
+            break
     apps = _nvsmi(index, "compute-apps=pid,used_memory")
     out["neighbors"] = max(0, len(apps) - 1)   # this process is one of them
     return out
@@ -407,11 +429,50 @@ def run(args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
 
     def emit(rec: dict) -> None:
+        # Stamped HERE rather than at each call site, so no row can forget it.
+        #
+        # Provenance already records the clock at run start and end. What that
+        # cannot do is attribute a clock event to the rows it touched: "the
+        # card throttled during this run" condemns every row, while "it
+        # throttled at 03:14" condemns six of them. A run is minutes long and
+        # a throttle is seconds, so without a per-row wall clock the coarse
+        # answer is the only one available -- and it is the useless one.
+        rec.setdefault("ts", time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
         with open(out, "a") as fh:
             fh.write(json.dumps(rec) + "\n")
             fh.flush()
 
     fold_seen = [False]      # sticky; see the fold_fired check below
+
+    def cold_tune() -> dict:
+        """What the TUNING windows achieved -- a different quantity from
+        `cold_l2_effective`, which is about the MEASUREMENT.
+
+        Both must be in the row. `cold_l2_cache=True` was a no-op in this
+        project for a year precisely because nothing recorded what a window
+        achieved as opposed to what it requested, and the two halves fail
+        independently: a run can measure cold against a tactic that was
+        selected hot, which is exactly what every row before 98500d3 did.
+        """
+        try:
+            from quant.vllm_integration.fi_tuner_base import cold_tuning_state
+
+            st = cold_tuning_state()
+        except Exception:                              # noqa: BLE001
+            return {}
+        return {"cold_tuning": st} if st else {}
+
+    def ops_of(fn, fn_args) -> dict:
+        'Device-op census for one arm, split into kernels and everything else.'
+        d = device_ops(fn, fn_args)
+        if d is None:
+            return {}
+        return {"kernels_per_call": d["ops_per_call"],
+                "kernels_per_call_gpu": d["kernels_per_call_gpu"],
+                "nonkernel_per_call": d["nonkernel_per_call"],
+                "nonkernel_us": d["nonkernel_us"],
+                "nonkernel_ops": d["nonkernel_ops"]}
+
     neighbors = assert_gpu_exclusive(
         args.gpu, exclusive=not args.allow_shared_gpu)
     prov = provenance(args.gpu, run_id)
@@ -467,6 +528,12 @@ def run(args) -> None:
 
                 stock_args = (x, w_fp4, w_sf)
                 assert_args_consumed(stock_fn, stock_args, label="stock")
+                # ONE niw for every arm at this point. Sized from the stock
+                # args, which are the smallest in the comparison (kext extends
+                # K), so every other arm is at least as cold. Sizing per-arm
+                # would give each a different graph and a different depth of
+                # cache flush -- the asymmetry this file exists to prevent.
+                niw = iters_for_cold_l2(stock_args, device)
                 
                 
                 
@@ -489,22 +556,32 @@ def run(args) -> None:
                 
                 warm_equally(stock_fn, stock_args)
                 untuned = timed_detail(stock_fn, stock_args,
+                                       iters_within_graph=niw,
                                        repeats=max(2, args.repeats // 2))
+                
+                
+                
+                
+                
+                tac_before = fi_tactic_state()
                 if args.autotune:
                     fi_autotuned(stock_fn, stock_args, m_bucket=m)
+                stock_tactics = fi_tactic_resolved(tac_before)
                 warm_equally(stock_fn, stock_args)
                 stock = timed_detail(stock_fn, stock_args,
+                                     iters_within_graph=niw,
                                      repeats=args.repeats)
                 # Rotation leaves the layer pointing at whichever clone ran
                 # last; those die with the call, and the next M would build
                 # its arguments from a dangling attribute.
                 base_layer.weight, base_layer.weight_scale = w_fp4, w_sf
                 tune_gain = (untuned["us"] / stock["us"]) if stock["us"] else None
-                l2 = l2_accounting(stock_args, device)
+                l2 = l2_accounting(stock_args, device, niw)
                 # Prefly, outside every timed window. See `kernels_per_call`:
                 # this is what catches a closure doing work the other arm does
                 # not, which no output or spread check can see.
-                stock_kpc = kernels_per_call(stock_fn, stock_args)
+                stock_ops = ops_of(stock_fn, stock_args)
+                stock_kpc = stock_ops.get("kernels_per_call")
                 base_layer.weight, base_layer.weight_scale = w_fp4, w_sf
                 emit({"kind": "measure", "run_id": run_id, "family": "stock",
                       "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
@@ -528,11 +605,15 @@ def run(args) -> None:
                       
                       "autotune_gain": tune_gain,
                       "autotune_requested": bool(args.autotune),
+                      # [] = already tuned in this process; None = the
+                      # tuner could not be read. Different facts.
+                      "fi_tactics": stock_tactics,
                       
                       
                       
                       "weight_mb": n * k / 2 / 1e6,
-                      "kernels_per_call": stock_kpc,
+                      **stock_ops,
+                      **cold_tune(),
                       **l2,
                       **stock})
 
@@ -589,9 +670,11 @@ def run(args) -> None:
                     
                     
                     warm_equally(f, mext_args)
-                    mext_kpc = kernels_per_call(f, mext_args)
+                    mext_ops = ops_of(f, mext_args)
+                    mext_kpc = mext_ops.get("kernels_per_call")
                     before = nvfp4_fold.compile_stats()
-                    t = timed_detail(f, mext_args, repeats=args.repeats)
+                    t = timed_detail(f, mext_args, iters_within_graph=niw,
+                                     repeats=args.repeats)
                     after = nvfp4_fold.compile_stats()
                     for hit in tw.hits:
                         emit({"kind": "tactic_fallback", "run_id": run_id,
@@ -601,7 +684,13 @@ def run(args) -> None:
                           "rep": args.rep, "model": model, "proj": proj, "n": n, "k": k, "m": m,
                           "ratio": 1.0, "stock_kernel_class": stock_name, "gpu_neighbors": neighbors,
                           "vs_stock": t["us"] / stock["us"],
-                          "vs_stock_min": t["p50_us"] / stock["p50_us"],
+                          # `vs_stock_min` deleted: it held p50/p50, which is
+                          # now what `vs_stock` is. The name said "min" and
+                          # the value was a median for as long as both
+                          # existed; making `us` the median removed the
+                          # field rather than the confusion needing a rename.
+                          "vs_stock_mink": (t["us_mink"] / stock["us_mink"]
+                                            if stock.get("us_mink") else None),
 
                           # Non-zero means the timing window paid for a JIT and
                           # the row is not a measurement of the kernel.
@@ -610,7 +699,8 @@ def run(args) -> None:
                           "fold_tactic_tile": fold_tactic_tile(sm),
                           "fold_fired_in_run": fold_seen[0],
                           "weight_mb": n * k / 2 / 1e6,
-                          "kernels_per_call": mext_kpc,
+                          **mext_ops,
+                          **cold_tune(),
                           # fold_tactic_source is hardcoded per-arch on sm12x
                           # and cannot report this; see the priming comment.
                           "fold_tuner_primed": bool(args.autotune),
@@ -622,7 +712,7 @@ def run(args) -> None:
                               (mext_kpc - stock_kpc)
                               if (mext_kpc is not None
                                   and stock_kpc is not None) else None),
-                          **l2_accounting(mext_args, device),
+                          **l2_accounting(mext_args, device, niw),
                           **t})
 
                 # ---- kext: ratio r < 1, K grows to K*(1+r)
@@ -652,11 +742,23 @@ def run(args) -> None:
                             True, False, False)
                         kext_args = (x, e["w"], e["sf"])
                         assert_args_consumed(f, kext_args, label=f"kext r={r}")
+                        
+                        
+                        
+                        
+                        
+                        
+                        
+                        with TacticWatch() as ktw:
+                            f(*kext_args)
+                            torch.cuda.synchronize()
                         if args.autotune:      # same fairness rule as mext
                             fi_autotuned(f, kext_args, m_bucket=m)
                         warm_equally(f, kext_args)      # and equal warm-up
-                        kext_kpc = kernels_per_call(f, kext_args)
-                        t = timed_detail(f, kext_args, repeats=args.repeats)
+                        kext_ops = ops_of(f, kext_args)
+                        kext_kpc = kext_ops.get("kernels_per_call")
+                        t = timed_detail(f, kext_args, iters_within_graph=niw,
+                                                repeats=args.repeats)
                         emit({"kind": "measure", "run_id": run_id,
                               "family": "kext", "rep": args.rep, "model": model, "proj": proj,
                               "n": n, "k": k, "m": m, "ratio": r,
@@ -669,14 +771,33 @@ def run(args) -> None:
                               # the arithmetic the extension implies
                               "vs_ideal": t["us"] / ((1.0 + r) * stock["us"]),
                               "weight_mb": n * e["k_ext"] / 2 / 1e6,
-                              "kernels_per_call": kext_kpc,
+                              **kext_ops,
+                              **cold_tune(),
                               "fold_tuner_primed": bool(args.autotune),
-                              "fold_tactic_tile": fold_tactic_tile(sm),
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              
+                              **({"fold_tactic_source": fold_tactic_source(
+                                      sm, bool(ktw.hits)),
+                                  "fold_tactic_tile": kext_tile}
+                                 if (kext_tile := fold_tactic_tile(sm))
+                                 is not None else
+                                 {"fold_tactic_source": None,
+                                  "fold_tactic_tile": None}),
                               "kernels_vs_stock": (
                                   (kext_kpc - stock_kpc)
                                   if (kext_kpc is not None
                                       and stock_kpc is not None) else None),
-                              **l2_accounting(kext_args, device),
+                              **l2_accounting(kext_args, device, niw),
                               **t})
 
                 del x
