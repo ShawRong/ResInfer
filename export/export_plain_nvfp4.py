@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import sys
+import argparse
 import pathlib
 import shutil
 
@@ -8,8 +8,19 @@ import torch
 
 
 def main() -> int:
-    base = pathlib.Path(sys.argv[1])
-    out = pathlib.Path(sys.argv[2])
+    # argparse, not raw sys.argv: this is the first command in the README's
+    # Path A, and `--help` used to exit 1 with IndexError on sys.argv[2] --
+    # so did running it with no arguments. The positional interface is
+    # unchanged; only the two ways of asking it what it wants now work.
+    ap = argparse.ArgumentParser(
+        description="Export a plain ModelOpt NVFP4 checkpoint (no residue).")
+    ap.add_argument("base", type=pathlib.Path,
+                    help="bf16 base model: a local path, or a HF repo id "
+                         "(which downloads)")
+    ap.add_argument("out", type=pathlib.Path,
+                    help="output directory for the exported checkpoint")
+    a = ap.parse_args()
+    base, out = a.base, a.out
     out.mkdir(parents=True, exist_ok=True)
 
     import modelopt.torch.quantization as mtq
