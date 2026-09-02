@@ -9,6 +9,10 @@
 #   - env-export/.venv: ModelOpt calibration/export env, versioned separately
 #     because TRT-LLM has its own torch ABI and ModelOpt dependency constraints.
 
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "resinfer"
 version = "0.1.0"
@@ -19,7 +23,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3.12",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
@@ -169,5 +172,25 @@ override-dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.0.1",
+]
+
+[tool.setuptools.packages.find]
+include = [
+    "auto_search",
+    "auto_search.*",
+    "export",
+    "export.*",
+    "quant",
+    "quant.*",
+]
+exclude = [
+    "benchmarks",
+    "benchmarks.*",
+    "csrc",
+    "csrc.*",
+    "tests",
+    "tests.*",
+    "tools",
+    "tools.*",
 ]
 
