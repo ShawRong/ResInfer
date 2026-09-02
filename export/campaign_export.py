@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+'One-shot campaign exporter: produce every arm of an eval phase, gated.'
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+RECIPE = {
+    # IDENTITY, not location. The location moves between machines; the
+    # recipe does not. `dataset_sha` below is what the fingerprint actually
+    # trusts -- this string is for humans and for error messages.
+    "dataset_id": "llama-nemotron-post-training/calibration_sft_n1024",
+    "calib_samples": 1024,
+    "calib_seq_len": 2048,
+    "seed": 42,
+    "quant_fmt": "nvfp4",
+    "quant_scope": "all",
+    "calib_block_size": 8,
+    "salience_metric": "activation_max",
+}
+
+# ── where things live: per-machine, and therefore NOT in this file ────────
+# The campaign runs on at least two machines (locally to prove the chain,
+# on the pod to produce the arms), so a path baked in here is wrong
+# everywhere except where it was written. Worse, it used to be hashed into
+# the recipe fingerprint, which made the fingerprint a machine id that
+# always matched locally and could never match anywhere else -- invisible
+# to any amount of local testing, by construction.
+#
+# Set these. `preflight` names the variable, not the missing file: on a pod
+# "no such path" reads as a broken sync, and "RESIDUE_CAMPAIGN_BASE unset"
+# does not.
+DATASET_PATH = os.environ.get("RESIDUE_CAMPAIGN_DATASET", "")
+BASE_MODEL = os.environ.get("RESIDUE_CAMPAIGN_BASE", "")
+# The untouched model, before GPTQ. Kept separate from BASE_MODEL on
+# purpose: conflating the two is what made every damage number in this
+# project price the whole pipeline while reading as NVFP4's cost.
+ORIG_BF16 = os.environ.get("RESIDUE_CAMPAIGN_ORIG_BF16", "")
+
+# Where the solver frontier's policy_metadata/ lives. STEP 1b writes it
+# under the campaign's own output directory, so the default is derived from
+# that rather than fixed relative to the repo -- the two used to disagree,
+# and the symptom was a preflight failing for policies nothing would ever
+# put where it looked.
+FRONTIER_DIR = os.environ.get("RESIDUE_CAMPAIGN_FRONTIER", "")
+
+
+def resolve_policy(spec: dict, out_root=None) -> str | None:
+    """A spec's `policy` is a FILENAME; this says where to find it.
+
+    Order: RESIDUE_CAMPAIGN_FRONTIER, else <out>/solver_frontier_4b. An
+    absolute path in the spec is honoured as-is, so an externally produced
+    frontier can still be pointed at.
+    """
+    pol = spec.get("policy")
+    if not pol:
+        return None
+    if os.path.isabs(pol):
+        return pol
+    root = FRONTIER_DIR or (str(Path(out_root) / "solver_frontier_4b")
+                            if out_root else "")
+    if not root:
+        return pol            # unresolvable: preflight reports it as missing
+    return str(Path(root) / "policy_metadata" / pol)
+
+
+_ENV_HELP = {
+    "RESIDUE_CAMPAIGN_DATASET": "calibration .jsonl for " + RECIPE["dataset_id"],
+    "RESIDUE_CAMPAIGN_BASE": "the GPTQ base every quantised arm is built from",
+    "RESIDUE_CAMPAIGN_ORIG_BF16": "the model before GPTQ (reference arm)",
+}
+
+
+def _sha_file(path: str) -> str:
+    'Implementation details.'
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def _sha_model(path: str) -> str:
+    "Head 8 MB + tail 8 MB + byte count over a model directory's tensors."
+    h = hashlib.sha256()
+    files = sorted(Path(path).glob("*.safetensors")) or sorted(Path(path).glob("*.bin"))
+    for f in files:
+        size = f.stat().st_size
+        h.update(f"{f.name}:{size}".encode())
+        with open(f, "rb") as fh:
+            h.update(fh.read(8 << 20))
+            if size > (16 << 20):
+                fh.seek(-(8 << 20), 2)
+                h.update(fh.read(8 << 20))
+    return h.hexdigest()[:16]
+
+# ── arm specs ─────────────────────────────────────────────────────────────
+# ratio None  -> plain NVFP4, no residue, no extension (the matched floor)
+# policy None -> uniform: indices derived from THIS calibration's activation_max
+# policy path -> an external allocation (the solver's), injected
+SPECS: dict[str, list[dict[str, Any]]] = {
+    # P1 baseline + P3 ladder + P2 allocation, one recipe, one directory
+    "p1_p4_4b": [
+        {"arm": "plain",          "ratio": None},
+        {"arm": "uniform_r0125",  "ratio": 0.125},
+        {"arm": "uniform_r025",   "ratio": 0.25},
+        {"arm": "uniform_r05",    "ratio": 0.5},
+        {"arm": "uniform_r10",    "ratio": 1.0},
+        # equal-budget solver arm; policy must be produced by auto_search and
+        # its own provenance must name the calibration it was searched under.
+        {"arm": "anchor", "ratio": 0.125, "policy": None,
+         "note": "set policy= to the solver metadata; omitted arms are skipped"},
+    ],
+    # smallest thing that answers "is there anything to recover at all"
+    "p0_floor_only": [
+        {"arm": "plain", "ratio": None},
+    ],
+    # The solver's allocations at the SAME budgets as the uniform ladder, so
+    # "uniform or solver" is finally an equal-budget question with one
+    # calibration behind both sides. `ratio` here is only the budget LABEL --
+    # it is not passed to calibration on this path (see build_arm); the whole
+    # allocation, per-layer ratios included, comes from the policy file, and the
+    # solver that produced it was run on the pinned recipe -- its driver's
+    # defaults are c4 / num_samples=2 / max_sample_length=64, which is exactly
+    # where the bad checkpoints came from.
+    "solver_4b": [
+        {"arm": "solver_b4p5", "ratio": 0.125,
+         "policy": "gradient_effective_bits_budget4p5_residue_metadata.json"},
+        {"arm": "solver_b5", "ratio": 0.25,
+         "policy": "gradient_effective_bits_budget5_residue_metadata.json"},
+        {"arm": "solver_b6", "ratio": 0.5,
+         "policy": "gradient_effective_bits_budget6_residue_metadata.json"},
+        {"arm": "solver_b8", "ratio": 1.0,
+         "policy": "gradient_effective_bits_budget8_residue_metadata.json"},
+    ],
+}
+
+
+def log(msg: str) -> None:
+    print(f"[campaign {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def recipe_fingerprint(extra: dict | None = None) -> str:
+    """Stable id for 'which calibration produced this'.
+
+    The eval side compares fingerprints across arms; two arms that differ here
+    are not comparable and `analyze` should say so rather than average them.
+    """
+    c = recipe_components(extra)
+    # A fingerprint built from UNRESOLVED components is the worst possible
+    # artifact: it is a valid-looking hash, and two arms exported with the
+    # env unset would carry the SAME one, so `verify` would report "one
+    # recipe across all arms" over two arms whose recipe is unknown. Refuse
+    # to produce a value instead -- an obviously-broken output beats a
+    # plausible one, every time.
+    unresolved = [k for k, v in c.items() if v in ("UNRESOLVED", "UNSET")]
+    if unresolved:
+        return "UNRESOLVED(" + ",".join(sorted(unresolved)) + ")"
+    return _fp_from(c)
+
+
+_FP_CACHE: dict = {}
+
+
+def recipe_components(extra: dict | None = None) -> dict:
+    """Every field the fingerprint is made of, so a mismatch can be DIFFED.
+
+    A gate that says "the fingerprint is wrong" sends the reader looking at
+    everything; one that says "dataset_sha differs, dataset_id is the same"
+    tells them in one line whether they synced wrong or are holding a
+    different calibration file -- two situations with nothing in common
+    except the symptom. Every expensive debugging session in this project
+    began with a gate that knew more than it said.
+
+    Digests, not paths: the same file on two machines must fingerprint the
+    same, and two different files under one name must not.
+    """
+    c = dict(RECIPE)
+    if DATASET_PATH and Path(DATASET_PATH).exists():
+        c["dataset_sha"] = _FP_CACHE.setdefault(
+            ("d", DATASET_PATH), _sha_file(DATASET_PATH))
+    else:
+        c["dataset_sha"] = "UNRESOLVED"
+    if BASE_MODEL and Path(BASE_MODEL).is_dir():
+        c["base_model_sha"] = _FP_CACHE.setdefault(
+            ("m", BASE_MODEL), _sha_model(BASE_MODEL))
+    else:
+        c["base_model_sha"] = "UNRESOLVED"
+    c["base_model_id"] = Path(BASE_MODEL).name if BASE_MODEL else "UNSET"
+    if extra:
+        c.update(extra)
+    return c
+
+
+def _fp_from(components: dict) -> str:
+    blob = json.dumps(components, sort_keys=True).encode()
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+# The fields that are a property of the RECIPE, not of the machine. Only
+# these can be compared against a constant: the shas identify the actual
+# bytes, which are legitimately different on every machine that builds its
+# own base -- and a campaign that builds its own base is the design, not a
+# degradation. Comparing a whole fingerprint against a foreign constant
+# deadlocked the pod: build mode rebuilt a 9-hour base to be tolerated,
+# reuse mode skipped the rebuild and was rejected, and neither completed.
+SEMANTIC_FIELDS = ("dataset_id", "calib_samples", "calib_seq_len", "seed",
+                   "quant_fmt", "quant_scope", "calib_block_size",
+                   "salience_metric")
+
+
+def check_recipe_semantics(expected: dict) -> list[str]:
+    """Compare only what a recipe OWNS. Returns the differences, if any.
+
+    Cross-machine identity of the actual bytes is `verify`'s job, and it
+    does it the way that is possible: every arm in one directory must
+    share one fingerprint. That is the property the campaign needs. Equality
+    to another machine's fingerprint is not, and demanding it is how a gate
+    ends up rejecting a correct run.
+    """
+    c = recipe_components()
+    return [f"{k}: expected {expected[k]!r}, got {c.get(k)!r}"
+            for k in SEMANTIC_FIELDS
+            if k in expected and c.get(k) != expected[k]]
+
+
+def explain_fingerprint_mismatch(expected: dict, got: dict) -> list[str]:
+    """Which COMPONENT differs -- the whole point of keeping them."""
+    out = []
+    for k in sorted(set(expected) | set(got)):
+        e, g = expected.get(k, "<absent>"), got.get(k, "<absent>")
+        if e != g:
+            out.append(f"    {k}: expected {e!r}, got {g!r}")
+    return out or ["    (no component differs -- compare the hashing itself)"]
+
+
+# ── preflight: everything that can be wrong before a GPU is touched ───────
+def preflight(spec_name: str) -> int:
+    """Name every missing input at once. A miss prints MISSING, never nothing.
+
+    Skipping a line makes 'absent' and 'fine' look identical, and absent is
+    what this is hunting.
+    """
+    bad = 0
+
+    def check(label: str, ok: bool, detail: str = "") -> None:
+        nonlocal bad
+        print(f"  {'OK     ' if ok else 'MISSING'} {label}" + (f"  {detail}" if detail else ""))
+        if not ok:
+            bad += 1
+
+    print("=== inputs ===")
+    for var, what in _ENV_HELP.items():
+        check(f"env {var}", bool(os.environ.get(var)), what)
+    check("base model", bool(BASE_MODEL) and Path(BASE_MODEL).is_dir(), BASE_MODEL
+          or "set RESIDUE_CAMPAIGN_BASE")
+    check("calibration dataset", bool(DATASET_PATH) and Path(DATASET_PATH).exists(),
+          DATASET_PATH or "set RESIDUE_CAMPAIGN_DATASET")
+    check("reference model (orig bf16)", bool(ORIG_BF16) and Path(ORIG_BF16).is_dir(),
+          ORIG_BF16 or "set RESIDUE_CAMPAIGN_ORIG_BF16")
+
+    print("=== packages (export venv) ===")
+    for mod in ("torch", "modelopt.torch.quantization", "safetensors", "transformers"):
+        try:
+            __import__(mod)
+            check(mod, True)
+        except Exception as exc:  # noqa: BLE001
+            check(mod, False, f"{type(exc).__name__}: {exc}")
+
+    print("=== stages ===")
+    try:
+        from export.stage_adapters import (  # noqa: F401
+            CheckQuantizerStateStage, ExportHFStage, InjectResidueMetadataStage,
+            InspectQuantExportStage, LoadHFStage, ModelOptCalibrateStage,
+            SnapshotQuantizerStateStage, StageContext,
+        )
+        check("export.stage_adapters (8 stages)", True)
+        check("InspectQuantExportStage._assert_extended_widths",
+              hasattr(InspectQuantExportStage, "_assert_extended_widths"),
+              "the widening gate -- without it a bad export dies at serving time")
+    except Exception as exc:  # noqa: BLE001
+        check("export.stage_adapters", False, f"{type(exc).__name__}: {exc}")
+
+    print("=== spec ===")
+    arms = SPECS.get(spec_name)
+    check(f"spec {spec_name!r}", arms is not None,
+          f"known: {', '.join(sorted(SPECS))}")
+    if arms:
+        for a in arms:
+            pol = resolve_policy(a, os.environ.get("RESIDUE_CAMPAIGN_OUT"))
+            if a.get("policy") is not None and not (pol and Path(pol).exists()):
+                check(f"policy for arm {a['arm']}", False,
+                      (pol or a["policy"]) + "   <- produced by the solver "
+                      "frontier (step 1b); preflight solver_4b AFTER it, "
+                      "not before")
+        print(f"  {len(arms)} arm(s): {', '.join(a['arm'] for a in arms)}")
+
+    print("=== recipe fields the pipeline must actually consume ===")
+    
+    
+    
+    
+    
+    
+    try:
+        from quant.modelopt_integration.algo_helper import SALIENCE_METRICS
+        check(f"salience_metric {RECIPE['salience_metric']!r} is a known metric",
+              RECIPE["salience_metric"] in SALIENCE_METRICS,
+              f"known: {sorted(SALIENCE_METRICS)}")
+    except Exception as exc:  # noqa: BLE001
+        check("salience_metric validation", False, f"{type(exc).__name__}: {exc}")
+
+    print("=== gpu ===")
+    try:
+        import torch
+        check("cuda", torch.cuda.is_available(),
+              torch.cuda.get_device_name(0) if torch.cuda.is_available() else "")
+    except Exception as exc:  # noqa: BLE001
+        check("cuda", False, str(exc))
+
+    print(f"\nrecipe fingerprint: {recipe_fingerprint()}")
+    for k, v in sorted(recipe_components().items()):
+        print(f"    {k:20s} {v}")
+    print("PREFLIGHT " + ("PASS" if not bad else f"FAIL -- {bad} missing"))
+    return 0 if not bad else 3
+
+
+# ── indices from the calibration itself ───────────────────────────────────
+def metadata_from_quantizer_state(state_path: Path, ratio: float,
+                                  block_size: int) -> dict:
+    'Build injectable residue metadata out of a residue-mode calibration.'
+    import torch
+    st = torch.load(state_path, map_location="cpu", weights_only=False)["modules"]
+    layers: dict[str, Any] = {}
+    for name, mod in st.items():
+        if not isinstance(mod, dict):
+            continue
+        iq = mod.get("input_quantizer")
+        if not isinstance(iq, dict) or "_salient_indices" not in iq:
+            continue
+        idx = iq["_salient_indices"]
+        idx = idx.tolist() if hasattr(idx, "tolist") else list(idx)
+        if not idx:
+            continue
+        layers[name] = {
+            "salient_indices": idx,
+            "num_salient": len(idx),
+            "runtime_mode": "extended_k",
+        }
+    return {"global": {"residue_ratio": ratio, "block_size": block_size},
+            "layers": layers}
+
+
+def find_quantizer_state(artifact_root: Path) -> Path:
+    hits = sorted(artifact_root.rglob("quantizer_state.pt"))
+    if not hits:
+        raise FileNotFoundError(
+            f"no quantizer_state.pt under {artifact_root} -- calibration did not "
+            f"save its state, so indices cannot be derived from it")
+    return hits[-1]
+
+
+# ── one arm ───────────────────────────────────────────────────────────────
+def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
+    from export.stage_adapters import (
+        CheckQuantizerStateStage, ExportHFStage, InjectResidueMetadataStage,
+        InspectQuantExportStage, LoadHFStage, ModelOptCalibrateStage,
+        SnapshotQuantizerStateStage, StageContext,
+    )
+
+    arm = spec["arm"]
+    ratio = spec.get("ratio")
+    policy = resolve_policy(spec, out_root)
+    d = out_root / arm
+    art = out_root / "_artifacts" / arm
+
+    residue = ratio is not None
+    
+    
+    
+    #     every layer's salient set is derived from THIS calibration's
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    quant_mode = "w4a4" if (policy or not residue) else "residue"
+
+    log(f">>> {arm}  ratio={ratio}  mode={quant_mode}"
+        + (f"  policy={policy}" if policy else ""))
+
+    ctx = StageContext(case_dir=d)
+    ctx = LoadHFStage(f"load_{arm}")(ctx, {
+        "model_path": BASE_MODEL, "dtype": "bfloat16", "trust_remote_code": True})
+
+    calib_params = {
+        "model_path": BASE_MODEL,
+        # The stage's required key. It gets the PATH, not the id: this
+        # branch hands the value to ModelOpt's own dataloader, and a path
+        # is what worked before the recipe split identity from location.
+        # The id would be a behaviour change with a silent failure mode --
+        # DatasetManager.get_spec() looks refs up in configs/datasets.yaml,
+        # so an unregistered id resolves to something else or raises, and
+        # "calibrated on the wrong data" does not announce itself.
+        "dataset_ref": DATASET_PATH,
+        "dataset_id": RECIPE["dataset_id"],
+        "dataset_path": DATASET_PATH,
+        "calib_samples": RECIPE["calib_samples"],
+        "calib_seq_len": RECIPE["calib_seq_len"],
+        "seed": RECIPE["seed"],
+        "quant_fmt": RECIPE["quant_fmt"],
+        "quant_mode": quant_mode,
+        "quant_scope": RECIPE["quant_scope"],
+        "calib_block_size": RECIPE["calib_block_size"],
+        "salience_metric": RECIPE["salience_metric"],
+        "artifact_root": str(art),
+        "verbose": False,
+    }
+    if residue and not policy:
+        # Only the uniform path uses it; under w4a4 it is inert, and passing it
+        # there would read as if it did something.
+        calib_params["ratio"] = ratio
+    ctx = ModelOptCalibrateStage(f"calib_{arm}")(ctx, calib_params)
+
+    meta_path = None
+    if residue:
+        ctx = SnapshotQuantizerStateStage(f"snap_{arm}")(ctx, {})
+
+        if policy:
+            meta_path = Path(policy)
+        else:
+            # uniform: derive from THIS calibration, do not import an older
+            # export's indices
+            state = find_quantizer_state(art)
+            meta = metadata_from_quantizer_state(
+                state, ratio, RECIPE["calib_block_size"])
+            if not meta["layers"]:
+                raise AssertionError(
+                    f"{arm}: residue-mode calibration produced no _salient_indices. "
+                    f"Check quant_mode -- 'w4a4' records none and ignores ratio.")
+            meta_path = out_root / "_indices" / f"{arm}.json"
+            meta_path.parent.mkdir(parents=True, exist_ok=True)
+            meta_path.write_text(json.dumps(meta))
+            log(f"    indices derived from this calibration: {len(meta['layers'])} layers, "
+                f"num_salient[0]={next(iter(meta['layers'].values()))['num_salient']}")
+
+        # Widening happens HERE, not in calibration (fail #2).
+        ctx = InjectResidueMetadataStage(f"inject_{arm}")(ctx, {
+            "residue_metadata_path": str(meta_path), "verbose": False})
+        # Injection must not touch any amax; the assertion lives in the flow.
+        ctx = CheckQuantizerStateStage(f"check_{arm}")(ctx, {})
+        mism = ctx.metrics.get("quantizer_state_mismatches")
+        if mism:
+            raise AssertionError(f"{arm}: injection moved {mism} quantizer states")
+
+    export_params = {
+        "export_dir": str(d), "export_target": "vllm",
+        "safe_serialization": True,
+        "calib_block_size": RECIPE["calib_block_size"], "verbose": False,
+    }
+    if residue:
+        # Fail #1: without this, layers/global are skipped and the export is
+        # unservable while reporting success.
+        export_params["save_kernel_metadata"] = True
+        export_params["residue_ratio"] = ratio
+    else:
+        export_params["save_kernel_metadata"] = False
+    ctx = ExportHFStage(f"export_{arm}")(ctx, export_params)
+
+    # Fail #2's gate. Runs on every arm, including plain (where it asserts the
+    # absence of a residue claim rather than its width).
+    inspect_params: dict[str, Any] = {
+        "export_dir": str(d),
+        "require_finite_export_tensors": True,
+        "forbid_salient_indices_in_safetensors": True,
+    }
+    if residue:
+        inspect_params["expected_residue_metadata_min_layers"] = 1
+        inspect_params["expected_extended_linear_dims_min"] = 1
+    ctx = InspectQuantExportStage(f"inspect_{arm}")(ctx, inspect_params)
+
+    prov = {
+        "arm": arm,
+        "base_model": BASE_MODEL,
+        "residue_ratio": ratio,
+        "policy": str(meta_path) if meta_path else None,
+        "indices_source": (
+            "n/a (plain)" if not residue
+            else "external policy" if policy
+            else "derived from this arm's own calibration"),
+        "recipe": RECIPE,
+        "recipe_fingerprint": recipe_fingerprint(),
+        "recipe_components": recipe_components(),
+        "exported_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "gpu": gpu,
+    }
+    (d / "calibration_provenance.json").write_text(json.dumps(prov, indent=1))
+    log(f"<<< {arm} OK -> {d}")
+    return prov
+
+
+# ── verification of a finished directory, no GPU ──────────────────────────
+def verify(out_root: Path) -> int:
+    from export.stage_adapters import InspectQuantExportStage, StageContext
+
+    out_root = out_root.resolve()  # see cmd_run: relative paths get doubled
+    arms = sorted(p for p in out_root.iterdir()
+                  if p.is_dir() and not p.name.startswith("_"))
+    if not arms:
+        print(f"no arms under {out_root}")
+        return 3
+    bad = 0
+    fps: dict[str, list[str]] = {}
+    for d in arms:
+        prov_p = d / "calibration_provenance.json"
+        prov = json.loads(prov_p.read_text()) if prov_p.exists() else None
+        # Absence must select the STRICTER gate, not the weaker one. First
+        # version read residue-ness off the provenance alone, so an arm with no
+        # provenance was treated as plain and skipped the widening check --
+        # i.e. the arm we know least about got the least scrutiny. Caught by
+        # running verify over a directory containing the broken export, which
+        # passed. Fall back to the artefact on disk.
+        if prov is not None:
+            residue = prov.get("residue_ratio") is not None
+        else:
+            residue = (d / "residue_kernel_metadata.json").exists()
+        params: dict[str, Any] = {
+            "export_dir": str(d), "require_finite_export_tensors": True,
+            "forbid_salient_indices_in_safetensors": True}
+        if residue:
+            params["expected_residue_metadata_min_layers"] = 1
+            params["expected_extended_linear_dims_min"] = 1
+        try:
+            InspectQuantExportStage(f"verify_{d.name}")(StageContext(case_dir=d), params)
+            status = "PASS"
+        except Exception as exc:  # noqa: BLE001
+            status = f"FAIL {type(exc).__name__}: {str(exc)[:110]}"
+            bad += 1
+        # The bf16 reference arms are unquantised links, not exported arms:
+        # they were never calibrated, so they have no calibration
+        # provenance, and counting them as a distinct "recipe" makes every
+        # run report that its arms span two. Found by the nano smoke rather
+        # than by a pod round trip, which is the entire argument for having
+        # the smoke.
+        #
+        # They are excluded by what they ARE (no quantization_config), not
+        # by name -- a name test would pass the day someone adds a third
+        # reference and calls it something else.
+        cfg_p = d / "config.json"
+        try:
+            unquantised = "quantization_config" not in json.loads(
+                cfg_p.read_text())
+        except Exception:
+            unquantised = False
+        if unquantised:
+            print(f"  {d.name:18s} reference (unquantised) -- not a recipe arm")
+            continue
+        # The bf16 reference arms are unquantised links, not exported arms.
+        # They were never calibrated, so they have no calibration
+        # provenance, and counting them as a distinct "recipe" makes every
+        # run report that its arms span two -- which fails the campaign at
+        # its last gate, after all the GPU time is spent.
+        #
+        # Excluded by what they ARE (no quantization_config), never by
+        # name: a name test passes until someone adds a third reference and
+        # calls it something else.
+        try:
+            unquantised = "quantization_config" not in json.loads(
+                (d / "config.json").read_text())
+        except Exception:
+            unquantised = False
+        if unquantised:
+            print(f"  {d.name:18s} reference (unquantised) -- not a recipe arm")
+            continue
+        fp = (prov or {}).get("recipe_fingerprint", "NO-PROVENANCE")
+        fps.setdefault(fp, []).append(d.name)
+        print(f"  {d.name:<18} ratio={str((prov or {}).get('residue_ratio')):<6} "
+              f"fp={fp[:8]:<8} {status}")
+        if prov is None:
+            bad += 1
+
+    print()
+    if set(fps) == {"NO-PROVENANCE"}:
+        print("!! NO ARM CARRIES PROVENANCE -- which calibration produced these "
+              "is unknown, so they cannot be asserted to be one table")
+    elif len(fps) > 1:
+        
+        print("!! ARMS SPAN MORE THAN ONE CALIBRATION RECIPE -- not one table:")
+        for fp, names in fps.items():
+            print(f"     {fp[:8]}: {', '.join(names)}")
+        bad += 1
+    else:
+        print(f"one recipe across all arms: {next(iter(fps))[:8]}")
+    print("VERIFY " + ("PASS" if not bad else f"FAIL ({bad})"))
+    return 0 if not bad else 4
+
+
+def cmd_run(a) -> int:
+    # Absolute, always: InspectQuantExportStage resolves `export_dir` relative
+    # to the context's case_dir, so a relative --out silently becomes
+    # <case_dir>/<case_dir> and the gate reports "No safetensors found" -- a
+    # missing-file error for a file that is present. Found while testing the
+    # gate, which is the argument for testing gates.
+    out = Path(a.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    arms = SPECS[a.spec]
+    gpu = os.environ.get("CUDA_VISIBLE_DEVICES")
+    manifest: list[dict] = []
+    for spec in arms:
+        if spec.get("policy", "unset") is None and spec["arm"] == "anchor":
+            log(f"skip {spec['arm']}: no policy given ({spec.get('note','')})")
+            continue
+        d = out / spec["arm"]
+        if (d / "calibration_provenance.json").exists() and not a.force:
+            log(f"skip {spec['arm']}: exists (use --force to rebuild)")
+            manifest.append(json.loads((d / "calibration_provenance.json").read_text()))
+            continue
+        if d.exists():
+            shutil.rmtree(d)
+        manifest.append(build_arm(spec, out, gpu))
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    
+    for link, target in (("base_gptq_bf16", BASE_MODEL),
+                         ("base_orig_bf16", ORIG_BF16)):
+        dst = out / link
+        if Path(target).is_dir():
+            if dst.is_symlink() or dst.exists():
+                dst.unlink()
+            dst.symlink_to(target)
+            log(f"reference link {link} -> {target}")
+        else:
+            log(f"WARNING reference {link}: target missing, {target}")
+
+    (out / "manifest.json").write_text(json.dumps(
+        {"spec": a.spec, "recipe_fingerprint": recipe_fingerprint(),
+         "recipe_components": recipe_components(),
+         "arms": manifest}, indent=1))
+    log(f"manifest -> {out / 'manifest.json'}")
+    return verify(out)
+
+
+SMOKE_SPEC = [
+    {"arm": "smoke_plain", "ratio": None},
+    {"arm": "smoke_r05", "ratio": 0.5},
+]
+
+
+def cmd_smoke(a) -> int:
+    """Run the WHOLE chain at nano scale, locally, in minutes.
+
+    Why this exists, and it is the most useful comment in this file:
+
+    Every defect this driver has shipped was found on the pod, one per
+    round trip, in the order the steps run -- the driver living in dev/,
+    a fingerprint that hashed absolute paths, a preflight placed before its
+    own producer, two components disagreeing about where the frontier
+    lives, a required key dropped by a rename, and a gate that no
+    pod-built base could satisfy. Six defects, six round trips, each one
+    reachable only after the previous was fixed, and each round trip
+    costing hours because the pod has no network and must be synced by
+    hand.
+
+    None of them needed a big model or real data to reproduce. Every one
+    of them is in the CONTROL FLOW, and control flow runs at any scale.
+    The gates we had -- yaml parse, bash -n, capability probes -- are all
+    static; not one of them EXECUTES the chain, which is why the defects
+    could only surface where it does execute.
+
+    So: 0.6B, four calibration lines, two arms, one ratio. It proves
+    nothing about numerics and is not meant to. It proves the chain runs,
+    which is the property we kept discovering we did not have.
+
+    RUN THIS BEFORE EVERY DISPATCH. It is cheaper than the round trip by
+    three orders of magnitude.
+    """
+    import tempfile
+    global DATASET_PATH, BASE_MODEL, ORIG_BF16
+    root = Path(a.out) if a.out else Path(tempfile.mkdtemp(prefix="campaign_smoke_"))
+    root.mkdir(parents=True, exist_ok=True)
+    print(f"### campaign smoke -- nano scale, control flow only\n    {root}")
+
+    calib = root / "calib_nano.jsonl"
+    if not calib.exists():
+        src = DATASET_PATH
+        if src and Path(src).exists():
+            with open(src) as f, open(calib, "w") as g:
+                for i, line in enumerate(f):
+                    if i >= 4:
+                        break
+                    g.write(line)
+        else:
+            calib.write_text("\n".join(
+                json.dumps({"text": "the quick brown fox " * 64,
+                            "source_split": "smoke", "source_index": i})
+                for i in range(4)) + "\n")
+    print(f"    calibration: {calib} (4 lines)")
+
+    base = os.environ.get("RESIDUE_CAMPAIGN_SMOKE_BASE", "")
+    if not base or not Path(base).is_dir():
+        print("    GATE: set RESIDUE_CAMPAIGN_SMOKE_BASE to a small "
+              "unquantised model (a 0.6B is ideal).")
+        print("    The smoke needs a real checkpoint -- it exercises the "
+              "loader and the calibrator, which is where the defects were.")
+        return 3
+
+    # Point the module's globals at the nano inputs, then run the real
+    # code paths. Overriding here rather than re-implementing them is the
+    # whole point: a simplified copy would not have caught any of the six.
+    # Set the ENV as well as the globals. preflight checks that the
+    # variables are set, not merely that the paths resolve -- and that is
+    # correct, because on the pod an unset variable and a missing file need
+    # different fixes. A smoke that bypassed the env would exercise a path
+    # production never takes, which is the failure mode of every simplified
+    # copy this project has written.
+    os.environ["RESIDUE_CAMPAIGN_DATASET"] = str(calib)
+    os.environ["RESIDUE_CAMPAIGN_BASE"] = base
+    os.environ["RESIDUE_CAMPAIGN_ORIG_BF16"] = base
+    DATASET_PATH = str(calib)
+    BASE_MODEL = base
+    ORIG_BF16 = base
+    RECIPE["calib_samples"] = 4
+    RECIPE["calib_seq_len"] = 128
+    SPECS["__smoke__"] = SMOKE_SPEC
+
+    print("\n--- preflight")
+    if preflight("__smoke__") != 0:
+        print("SMOKE FAIL at preflight"); return 4
+    print(f"\n--- fingerprint: {recipe_fingerprint()}")
+    for k, v in sorted(recipe_components().items()):
+        print(f"      {k:20s} {v}")
+
+    print("\n--- run (two arms)")
+    class _A:
+        spec, out, force, gpu = "__smoke__", str(root / "campaign"), True, None
+    if cmd_run(_A()) != 0:
+        print("SMOKE FAIL at run"); return 5
+
+    print("\n--- verify")
+    rc = verify(Path(root) / "campaign")
+    print("\nSMOKE " + ("PASS -- the chain runs end to end" if rc == 0
+                         else "FAIL at verify"))
+    return rc
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = p.add_subparsers(dest="cmd", required=True)
+    q = sub.add_parser("preflight"); q.add_argument("--spec", default="p1_p4_4b")
+    r = sub.add_parser("run")
+    r.add_argument("--spec", default="p1_p4_4b"); r.add_argument("--out", required=True)
+    r.add_argument("--force", action="store_true")
+    v = sub.add_parser("verify"); v.add_argument("--out", required=True)
+    k = sub.add_parser(
+        "smoke",
+        help="run the whole chain at nano scale (0.6B, 4 calibration lines, "
+             "minutes). REQUIRES RESIDUE_CAMPAIGN_SMOKE_BASE=<a small "
+             "unquantised model>; without it this exits 3 after creating a "
+             "temp directory, which reads as a failure rather than a "
+             "missing input.",
+        description="Rehearse the whole export chain at nano scale: 0.6B, "
+                    "four calibration lines, two arms, then verify. Minutes, "
+                    "and it exercises the real code paths rather than a "
+                    "simplified copy.\n\n"
+                    "REQUIRED: RESIDUE_CAMPAIGN_SMOKE_BASE=<path to a small "
+                    "unquantised model>. RESIDUE_CAMPAIGN_DATASET is used if "
+                    "set, otherwise four synthetic lines are generated.\n\n"
+                    "Run this before anything expensive. Every defect this "
+                    "chain has shipped was control flow, and control flow "
+                    "runs at any scale.",
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    k.add_argument("--out", default=None,
+                   help="where to put the rehearsal; a temp dir by default")
+    a = p.parse_args()
+    if a.cmd == "preflight":
+        return preflight(a.spec)
+    if a.cmd == "verify":
+        return verify(Path(a.out))
+    if a.cmd == "smoke":
+        return cmd_smoke(a)
+    return cmd_run(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

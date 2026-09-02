@@ -1,0 +1,4 @@
+# Copy to configs/datasets.local.yaml and edit for your machine.
+
+cache:
+  root: /path/to/huggingface/cache

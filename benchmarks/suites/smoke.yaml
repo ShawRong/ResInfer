@@ -1,0 +1,44 @@
+# Acceptance smoke for the kit itself, not for any model.
+#
+#   python -m benchmarks.evalkit suite \
+#       --manifest benchmarks/suites/smoke.yaml \
+#       --models-root <exports> --data-dir data --out smoke_out
+#
+# What it proves: env-check runs, the gate runs and passes, every arm runs,
+# analyze produces a table, and the exit code is 0. Roughly 15 minutes.
+#
+# Run this after ANY change to the kit and before any table you intend to
+# publish. The reason is not tidiness: a fix applied midway through a table
+# gives the arms before it and the arms after it different execution configs,
+# and the resulting table looks completely normal. Validate the tool first,
+# then produce the table, and never in the other order.
+name: smoke
+tasks: 2wikimqa
+max_model_len: 32768
+max_num_seqs: 8
+limit: 40             # smoke only -- the real suites run every item
+
+reference: bf16
+baseline: plain
+
+gate:
+  model_a: anchor
+  model_b: uniform_r0125
+  task: 2wikimqa
+  limit: 40
+
+arms:
+  # bf16 is here because `reference` names it, and without it analyze has no
+  # venue conditioning -- it would print a scores table that reads like a
+  # result. The suite now refuses such a manifest before spending GPU time;
+  # this file is also the example people copy, so it has to be correct.
+  - id: bf16
+    path: base_bf16
+    flags: ["--bf16"]
+  - id: plain
+    path: uniform_r0125
+    flags: ["--residue-off"]
+  - id: uniform_r0125
+    path: uniform_r0125
+  - id: anchor
+    path: anchor

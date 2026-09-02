@@ -1,0 +1,74 @@
+# OSS-safe model registry.
+#
+# Values may be either Hugging Face repo IDs or local paths. The ids below
+# are the canonical names, not a recommendation to fetch them: each one
+# downloads on first use, and on a machine with no outbound network -- the
+# export pod, for one -- an id here is simply unusable.
+#
+# So point them at what you already have: copy configs/models.local.example.yaml
+# to configs/models.local.yaml and give local paths. Local entries override
+# these and are ignored by git, so an absolute path there is correct and
+# never ships.
+
+models:
+  llama3_8b:
+    path: meta-llama/Llama-3.1-8B
+
+  llama3_8b_instruct:
+    path: meta-llama/Llama-3.1-8B-Instruct
+
+  llama3_8b_base:
+    path: meta-llama/Meta-Llama-3-8B
+
+  llama31_nemotron_nano_8b:
+    path: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
+
+  qwen2_5_7b:
+    path: Qwen/Qwen2.5-7B
+
+  qwen2_5_coder_7b_instruct:
+    path: Qwen/Qwen2.5-Coder-7B-Instruct
+
+  qwen3_8b:
+    path: Qwen/Qwen3-8B
+
+  qwen3_4b:
+    path: Qwen/Qwen3-4B
+
+  qwen3_32b:
+    path: Qwen/Qwen3-32B
+
+  llama3_2_1b:
+    path: meta-llama/Llama-3.2-1B
+
+  llama3_2_1b_instruct:
+    path: meta-llama/Llama-3.2-1B-Instruct
+
+  llama3_2_1b_instruct_fpquant:
+    path: RedHatAI/Llama-3.2-1B-Instruct-FPQuant-QAT-NVFP4
+
+  llama3_2_3b_instruct_fpquant:
+    path: RedHatAI/Llama-3.2-3B-Instruct-FPQuant-QAT-NVFP4
+
+  llama3_8b_instruct_fpquant:
+    path: RedHatAI/Meta-Llama-3.1-8B-Instruct-FPQuant-QAT-NVFP4
+
+  qwen3_0_6b_fpquant:
+    path: RedHatAI/Qwen3-0.6B-FPQuant-QAT-NVFP4
+
+  qwen3_1_7b_fpquant:
+    path: RedHatAI/Qwen3-1.7B-FPQuant-QAT-NVFP4
+
+  qwen3_4b_fpquant:
+    path: RedHatAI/Qwen3-4B-FPQuant-QAT-NVFP4
+
+  qwen3_8b_fpquant:
+    path: RedHatAI/Qwen3-8B-FPQuant-QAT-NVFP4
+
+  llama3_8b_instruct_mr_gptq_nvfp:
+    path: RedHatAI/Meta-Llama-3.1-8B-Instruct-MR-GPTQ-nvfp
+
+  llama3_8b_instruct_mr_gptq_mxfp:
+    path: RedHatAI/Meta-Llama-3.1-8B-Instruct-MR-GPTQ-mxfp
+
+default_model: qwen3_8b

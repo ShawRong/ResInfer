@@ -1,0 +1,46 @@
+ResInfer
+Copyright (c) 2026 ResInfer contributors
+
+ResInfer is released under the Apache License 2.0 (see LICENSE), with the
+exception of the vendored and derived kernel sources listed below, which
+retain their upstream licenses and copyright notices in their file headers.
+
+================================================================================
+BSD-3-Clause (NVIDIA CORPORATION & AFFILIATES)
+================================================================================
+
+Derived from FlashInfer (https://github.com/flashinfer-ai/flashinfer),
+CuTeDSL attention kernels, with local modifications:
+
+  csrc/nvfp4/nvfp4/cute_attn/kernel_paged_decode.py
+  csrc/nvfp4/nvfp4/cute_attn/kernel_paged_prefill.py
+  csrc/nvfp4/nvfp4/cute_attn/_vendor_fmha_fwd.py
+  csrc/nvfp4/nvfp4/cute_attn/_vendor_fmha_helpers.py
+
+Derived from FlashInfer's CuTeDSL fold/GEMM kernels, with local
+modifications (the fork relationship and upstream deltas are documented in
+csrc/nvfp4/nvfp4/cute_fold/FORK.md):
+
+  csrc/nvfp4/nvfp4/cute_fold/kernel_sm100_fold.py
+  csrc/nvfp4/nvfp4/cute_fold/kernel_sm103_fold.py
+
+Vendored from the CUTLASS CuTeDSL example tree
+(https://github.com/NVIDIA/cutlass, examples/python/CuTeDSL):
+
+  csrc/nvfp4/nvfp4/cute_fold_sm120/_dsl_helpers.py
+
+Derived from FlashInfer's CuTeDSL grouped-GEMM kernels, with local
+modifications:
+
+  csrc/nvfp4/nvfp4/moe/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
+  csrc/nvfp4/nvfp4/moe/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
+
+================================================================================
+Apache-2.0 (NVIDIA CORPORATION & AFFILIATES)
+================================================================================
+
+Derived from FlashInfer utility/pipeline sources; same license as the
+project, NVIDIA copyright retained in the file headers:
+
+  csrc/nvfp4/nvfp4/moe/blackwell/custom_pipeline.py
+  csrc/nvfp4/nvfp4/moe/blackwell/utils.py

@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
+# SPDX-License-Identifier: Apache-2.0
+
+
+
+
+
+
+
+
+
+
+
+
+
+[project]
+name = "nvfp4"
+version = "0.1.0"
+description = "NVIDIA FP4 quantization kernels (CUDA extension + CuTeDSL)"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,37 @@
+# Perplexity sweep. An INSTRUMENT, not a verdict -- see benchmarks/README.md.
+# It is MLP-dominated, so a policy that spends its budget on attention can move
+# LongBench by z=+5.67 and this by z=+0.09. Use it to sweep budget and generate
+# hypotheses; never to decide where budget goes.
+name: ppl_4b
+venue: ppl
+corpus: wikitext2
+seq_len: 2048
+n_windows: 128
+max_num_seqs: 8
+
+reference: bf16
+baseline: plain
+
+gate:
+  model_a: anchor
+  model_b: uniform_r0125
+  task: 2wikimqa
+  limit: 100
+
+arms:
+  - id: bf16
+    path: base_bf16
+    flags: ["--bf16"]
+  - id: plain
+    path: uniform_r0125
+    flags: ["--residue-off"]
+  - id: uniform_r0125
+    path: uniform_r0125
+  - id: uniform_r025
+    path: uniform_r025
+  - id: uniform_r05
+    path: uniform_r05
+  - id: uniform_r10
+    path: uniform_r10
+  - id: anchor
+    path: anchor
