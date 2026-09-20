@@ -67,11 +67,13 @@ def test_mx_residue_respects_calibration_quant_disable(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     import modelopt.torch.quantization as mtq
-    import modelopt.torch.quantization.conversion as conversion
+    import modelopt.torch.quantization.plugins.custom as custom_plugins
     from quant.modelopt_integration.algo import inject_residue_salient_map
     # This unit uses a plain torch Linear. Avoid unrelated HF plugin discovery,
     # which is version-coupled to Transformers and is covered by export smokes.
-    monkeypatch.setattr(conversion,"register_custom_model_plugins_on_the_fly",
+    monkeypatch.setattr(custom_plugins,"register_custom_model_plugins_on_the_fly",
+                        lambda model: None)
+    monkeypatch.setattr(custom_plugins,"register_custom_post_conversion_plugins",
                         lambda model: None)
     torch.manual_seed(89)
     model = torch.nn.Sequential(torch.nn.Linear(256,128,bias=False)).cuda().bfloat16()
