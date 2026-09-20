@@ -242,12 +242,12 @@ class GroupedQueryAttentionDecodePagedFp4:
         if logical_grouped_heads is not None:
             assert 0 < logical_grouped_heads <= grouped_head_tile
         if single_softmax_wg:
-            assert v_mode == "qmul4_tmem" and grouped_head_tile == 16
+            assert v_mode == "qmul4_tmem" and grouped_head_tile in (8, 16)
         if smem_correction_broadcast:
             assert (
                 v_mode == "qmul4_tmem"
                 and single_softmax_wg
-                and grouped_head_tile == 16
+                and grouped_head_tile in (8, 16)
             )
         assert qmul4_skip in ("none", "conv", "mma"), qmul4_skip
         if residue_fold:
@@ -4179,10 +4179,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                 correction.fill(Float32(1))
                 if should_rescale:
                     if cutlass.const_expr(smem_correction_broadcast):
-                        # Each correction warp owns one contiguous 16-float
-                        # sL column. Lanes 0..15 publish one factor each; the
-                        # warp-local barrier makes those stores visible before
-                        # every lane reloads the vector as four 128-bit chunks.
+                        # Each correction warp owns one contiguous N-float sL
+                        # column (N=8/16). The first N lanes publish one factor
+                        # each; the warp-local barrier makes those stores
+                        # visible before every lane reloads the vectorized row.
                         if lane_store_max:
                             sL[lane_idx, warpgroup_widx] = correction_lane
                         cute.arch.sync_warp()

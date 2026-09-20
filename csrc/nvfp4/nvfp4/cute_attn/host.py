@@ -48,6 +48,7 @@ Qmul4GmemReductionWorkspace = Tuple[
 
 
 
+
 GQA_TILE_N = 16
 N_SUPPORTED = (16, 32)
 RESIDUE_GQA_GROUPS = (4, 6, 8)
@@ -60,6 +61,22 @@ def _npo2(x: int) -> int:
 def _padded_group_size(num_qo_heads: int, num_kv_heads: int) -> int:
     """每 KV 头实际送进 kernel 的 Q 行数(≥ 真实 GQA 比,取 2 的幂)。"""
     return max(GQA_TILE_N, min(32, _npo2(num_qo_heads // num_kv_heads)))
+
+
+def _residue_padded_group_size(
+    num_qo_heads: int, num_kv_heads: int
+) -> int:
+    """Physical base+residue rows per KV head for the residue tactic."""
+    if num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
+        raise ValueError("Q heads must be divisible by KV heads")
+    g = num_qo_heads // num_kv_heads
+    if g == 4:
+        return 8
+    if g in (6, 8):
+        return 16
+    raise NotImplementedError(
+        f"residue Q supports logical GQA ratios {RESIDUE_GQA_GROUPS}, got {g}"
+    )
 
 
 def _pick_tile_shape(group_size: int, prediction: int) -> Tuple[int, int]:
@@ -219,9 +236,15 @@ def _use_single_softmax_scheduler(
     v_mode: str,
     kv_splits: int,
 ) -> bool:
-    'Implementation details.'
+    """Select the one-softmax-WG scheduler for short Q8/Q16 CTAs.
+
+    Paired B200 A/B shows that one softmax WG preserves the direct-NVFP4 byte
+    contract and lowers single-call latency for no-split, split4, and split8.
+    Long split16/32 CTAs retain the second softmax WG: their longer per-CTA
+    loop can use it to overlap score consumption with the KQ/VP pipeline.
+    """
     return (
-        grouped_head_tile == 16
+        grouped_head_tile in (8, 16)
         and v_mode == "qmul4_tmem"
         and (
             (reduction == "none" and kv_splits == 1)
@@ -638,17 +661,18 @@ def _q_scratch(b: int, h_kv: int, g: int, d: int, device):
 def _q_residue_scratch(b: int, h_kv: int, g: int, d: int, device):
     """Persistent outputs for the grouped residue-Q producer.
 
-    Every logical group uses one physical 16-row tile: base rows [0,g), zero
-    padding [g,8), residue rows [8,8+g), then zero padding to row 16. Scale
+    GQA4 uses one physical Q8 tile; GQA6/8 use Q16. The first half contains
+    base rows and the second half residue rows, with per-half tail padding. Scale
     factors use one independently padded 128-row atom per group, matching the
     decode kernel's (batch, kv_head) outer mode. ``g`` is part of the cache key
     so untouched padding can never retain data from another geometry.
     """
-    key = (b, h_kv, g, d, str(device))
+    physical_g = _residue_padded_group_size(h_kv * g, h_kv)
+    key = (b, h_kv, g, physical_g, d, str(device))
     hit = _Q_RESIDUE_SCRATCH.get(key)
     if hit is None:
         q_pack = torch.zeros(
-            b, h_kv, GQA_TILE_N, d // 2, dtype=torch.uint8, device=device
+            b, h_kv, physical_g, d // 2, dtype=torch.uint8, device=device
         )
         q_sf = torch.zeros(
             b * h_kv * N_PAD * (d // SF_VEC),
@@ -696,7 +720,7 @@ def _quantize_q_cuda(
 
 
 def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
-    """GQA4/6/8 Q -> padded Q16 `[base; residue]` in one CUDA launch.
+    """GQA4/6/8 Q -> Q8/Q16 `[base; residue]` in one CUDA launch.
 
     GQA6 deliberately uses the same physical Q16 tile as GQA8: rows 0..5 are
     base, 6..7 are zero, 8..13 are residue, and 14..15 are zero. GQA4 follows
@@ -715,16 +739,21 @@ def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
     g = HQ // num_kv_heads
     if g not in RESIDUE_GQA_GROUPS:
         raise NotImplementedError(
-            "decode residue Q16 supports logical GQA ratios "
+            "decode residue Q8/Q16 supports logical GQA ratios "
             f"{RESIDUE_GQA_GROUPS}, got {g}"
         )
     q4 = q.reshape(B, num_kv_heads, g, D).contiguous()
     q_pack, q_sf = _q_residue_scratch(
         B, num_kv_heads, g, D, q.device
     )
+    physical_g = q_pack.shape[2]
     if hasattr(torch.ops.nvfp4, "nvfp4_quantize_q_residue"):
         torch.ops.nvfp4.nvfp4_quantize_q_residue(q4, q_pack, q_sf)
-    elif g == 8 and hasattr(torch.ops.nvfp4, "scaled_fp4_quant_mext_r1"):
+    elif (
+        g == 8
+        and physical_g == 16
+        and hasattr(torch.ops.nvfp4, "scaled_fp4_quant_mext_r1")
+    ):
         # Compatibility with an older extension. Flattened MExt attn_tile8 is
         # correct only when every logical group already contains eight rows.
         input_scale = torch.ones(1, dtype=torch.float32, device=q.device)
@@ -735,7 +764,7 @@ def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
     else:
         return None
     return (
-        q_pack.reshape(B, 1, num_kv_heads * GQA_TILE_N, D // 2),
+        q_pack.reshape(B, 1, num_kv_heads * physical_g, D // 2),
         q_sf.view(torch.float8_e4m3fn),
     )
 
@@ -878,13 +907,17 @@ def run_paged_fp4_decode_qmul4_v(
             f"{tuple(v_sf_bthd.shape)}"
         )
 
-    g_pad = _padded_group_size(HQ, H)
+    g_pad = (
+        _residue_padded_group_size(HQ, H)
+        if residue_fold
+        else _padded_group_size(HQ, H)
+    )
     if residue_fold and (
-        g not in RESIDUE_GQA_GROUPS or g_pad != GQA_TILE_N
+        g not in RESIDUE_GQA_GROUPS or g_pad not in (8, 16)
     ):
         raise NotImplementedError(
             "decode QK residue requires logical GQA ratio in "
-            f"{RESIDUE_GQA_GROUPS} and physical tile 16, got "
+            f"{RESIDUE_GQA_GROUPS} and physical tile 8/16, got "
             f"g={g}, g_pad={g_pad}"
         )
     if direct_output:
@@ -1072,7 +1105,11 @@ def plan_decode_compile_variants(
             "decode QK residue warmup requires logical GQA ratio in "
             f"{RESIDUE_GQA_GROUPS}"
         )
-    g_pad = _padded_group_size(num_qo_heads, num_kv_heads)
+    g_pad = (
+        _residue_padded_group_size(num_qo_heads, num_kv_heads)
+        if residue_fold
+        else _padded_group_size(num_qo_heads, num_kv_heads)
+    )
     seqs = sorted(
         {min(s, max_model_len)
          for s in (256, 4096, QMUL4_KERNEL_REDUCTION_MIN_SEQ, 65536)}
@@ -1130,7 +1167,11 @@ def plan_decode_nvfp4_compile_variants(
             "decode QK residue warmup requires logical GQA ratio in "
             f"{RESIDUE_GQA_GROUPS}"
         )
-    g_pad = _padded_group_size(num_qo_heads, num_kv_heads)
+    g_pad = (
+        _residue_padded_group_size(num_qo_heads, num_kv_heads)
+        if residue_fold
+        else _padded_group_size(num_qo_heads, num_kv_heads)
+    )
     seqs = sorted(
         {
             min(s, max_model_len)
@@ -1288,13 +1329,17 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         raise ValueError(f"H_q={HQ} must be divisible by H_kv={H}")
     check_shape_supported(HQ, H, D, prediction=1)
     g = HQ // H
-    g_pad = _padded_group_size(HQ, H)
+    g_pad = (
+        _residue_padded_group_size(HQ, H)
+        if residue_fold
+        else _padded_group_size(HQ, H)
+    )
     if residue_fold and (
-        g not in RESIDUE_GQA_GROUPS or g_pad != GQA_TILE_N
+        g not in RESIDUE_GQA_GROUPS or g_pad not in (8, 16)
     ):
         raise NotImplementedError(
             "decode QK residue requires logical GQA ratio in "
-            f"{RESIDUE_GQA_GROUPS} and physical tile 16, got "
+            f"{RESIDUE_GQA_GROUPS} and physical tile 8/16, got "
             f"g={g}, g_pad={g_pad}"
         )
     if k_sf_mode not in ("atom", "linear"):

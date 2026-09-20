@@ -97,9 +97,10 @@ class MExtAttnTile8Test(unittest.TestCase):
         )
 
     @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
-    def test_grouped_residue_q_pads_each_gqa_group_to_q16(self) -> None:
+    def test_grouped_residue_q_selects_q8_or_q16(self) -> None:
         import nvfp4
         from nvfp4.cute_attn import host
+        from nvfp4.cute_attn.kv_layout import sf_atom_gather, sf_atom_scatter
 
         if not hasattr(torch.ops.nvfp4, "nvfp4_quantize_q_residue"):
             self.skipTest("nvfp4 extension lacks grouped residue-Q producer")
@@ -130,11 +131,30 @@ class MExtAttnTile8Test(unittest.TestCase):
                     elts_mode=16,
                     layout_mode="attn_tile8",
                 )
+                physical_g = 8 if g == 4 else 16
+                if g == 4:
+                    groups = batch * h_kv
+                    ref_tiles = ref_data.reshape(groups, 16, d // 2)
+                    ref_data = torch.cat(
+                        (ref_tiles[:, :4], ref_tiles[:, 8:12]), dim=1
+                    ).reshape(groups * physical_g, d // 2)
+                    kg = d // 16
+                    ref_linear = sf_atom_gather(
+                        ref_sf.reshape(groups, -1), 128, kg
+                    )
+                    q8_linear = torch.zeros_like(ref_linear)
+                    q8_linear[:, :4] = ref_linear[:, :4]
+                    q8_linear[:, 4:8] = ref_linear[:, 8:12]
+                    ref_sf = sf_atom_scatter(q8_linear).reshape(-1).view(
+                        torch.float8_e4m3fn
+                    )
                 torch.cuda.synchronize()
 
                 self.assertTrue(
                     torch.equal(
-                        got_data.reshape(batch * h_kv * 16, d // 2),
+                        got_data.reshape(
+                            batch * h_kv * physical_g, d // 2
+                        ),
                         ref_data,
                     )
                 )

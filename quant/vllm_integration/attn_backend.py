@@ -146,7 +146,7 @@ _QK_RESIDUE = os.environ.get(
 
 
 def _qk_residue_for_geometry(num_qo_heads: int, num_kv_heads: int) -> bool:
-    """Use the default residue path exactly where its free Q16 mapping exists."""
+    """Use the default residue path where its Q8/Q16 mapping exists."""
     if num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
         return False
     return _QK_RESIDUE and num_qo_heads // num_kv_heads in (4, 6, 8)
@@ -1022,19 +1022,27 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         batch: int,
         device: torch.device,
         reduction: str = "kernel",
+        residue_fold: bool = False,
     ):
         # The CuTe kernel pads each GQA group to its supported N tile. Mirror
         # that effective head count here; using the model's unpadded HQ would
         # make the persistent workspace fail host validation for GQA < 16.
-        effective_heads = self.num_kv_heads * host._padded_group_size(
-            self.num_heads, self.num_kv_heads
+        group_size = (
+            host._residue_padded_group_size(
+                self.num_heads, self.num_kv_heads
+            )
+            if residue_fold
+            else host._padded_group_size(
+                self.num_heads, self.num_kv_heads
+            )
         )
+        effective_heads = self.num_kv_heads * group_size
         if reduction not in ("kernel", "gmem_fused"):
             raise ValueError(f"unsupported persistent reduction: {reduction}")
         # (reduction, splits, batch) plus the impl-fixed head/dim above are the
         # complete shape determinants, so a key hit is a shape match; the host
         # entry validates the tensors it receives anyway.
-        key = (reduction, splits, batch, str(device))
+        key = (reduction, splits, batch, effective_heads, str(device))
         workspace = self._decode_reduction_workspaces.get(key)
         if workspace is None:
             allocator = (
@@ -1224,6 +1232,9 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         n = md.num_decode_tokens
         q_dec = q_all if q_all.shape[0] == n else q_all[:n]
         splits, reduction = plan
+        qk_residue = _qk_residue_for_geometry(
+            self.num_heads, self.num_kv_heads
+        )
         reduction_workspace = None
         if reduction in ("kernel", "gmem_fused"):
             reduction_workspace = self._get_decode_reduction_workspace(
@@ -1232,6 +1243,7 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
                 n,
                 q_dec.device,
                 reduction=reduction,
+                residue_fold=qk_residue,
             )
         scale_rows = ((n + 127) // 128) * 128
         host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
@@ -1251,9 +1263,7 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
             plan=plan,
-            residue_fold=_qk_residue_for_geometry(
-                self.num_heads, self.num_kv_heads
-            ),
+            residue_fold=qk_residue,
         )
 
     def _append_trtllm_kv(self, layer, key, value, kv_cache, slot_mapping):
@@ -1327,6 +1337,9 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             else torch.empty_like(dec_out, dtype=torch.bfloat16)
         )
         reduction_workspace = None
+        qk_residue = _qk_residue_for_geometry(
+            self.num_heads, self.num_kv_heads
+        )
         
         
         
@@ -1343,7 +1356,11 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             splits, reduction = decode_plan
             if reduction == "kernel":
                 reduction_workspace = self._get_decode_reduction_workspace(
-                    host, splits, n, q_dec.device
+                    host,
+                    splits,
+                    n,
+                    q_dec.device,
+                    residue_fold=qk_residue,
                 )
         host.run_paged_fp4_decode_qmul4_tmem(
             q_dec,
@@ -1361,9 +1378,7 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             reduction_workspace=reduction_workspace,
             direct_output=direct_output,
             plan=decode_plan,
-            residue_fold=_qk_residue_for_geometry(
-                self.num_heads, self.num_kv_heads
-            ),
+            residue_fold=qk_residue,
         )
         if kern_out is not dec_out:
             dec_out.copy_(kern_out)

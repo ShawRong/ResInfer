@@ -65,13 +65,13 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,  // [B,H,
 
 // Residue Q producer for the decode Q16 tile.
 //
-// Input contains only the logical GQA heads (g = 4, 6, or 8).  Output keeps
-// the attention kernel's fixed 16-row contract per (batch, kv_head):
+// Input contains only the logical GQA heads (g = 4, 6, or 8). Output uses the
+// smallest supported residue tile per (batch, kv_head): Q8 for GQA4 and Q16
+// for GQA6/8.
 //
-//   rows [0, g)       base Q
-//   rows [g, 8)       zero padding
-//   rows [8, 8 + g)   residue Q
-//   rows [8 + g, 16)  zero padding
+//   rows [0, g)                 base Q
+//   rows [g, physical_rows/2)   zero padding
+//   rows [physical_rows/2, ...] residue Q, then zero padding
 //
 // q_pack/q_sf are persistent zero-initialized scratch buffers, so this kernel
 // writes only the live rows.  The scratch cache keys on g; untouched padding
@@ -79,17 +79,16 @@ __global__ void quantize_q_kernel(const __nv_bfloat16* __restrict__ q,  // [B,H,
 // padded BF16 Q tensor for GQA4/GQA6.
 __global__ void quantize_q_residue_kernel(
     const __nv_bfloat16* __restrict__ q,  // [B,H,g,D]
-    uint8_t* __restrict__ q_pack,         // [B,H,16,D/2]
+    uint8_t* __restrict__ q_pack,         // [B,H,physical_rows,D/2]
     uint8_t* __restrict__ q_sf,           // B*H independent 128-row atoms
-    int H, int g, int D) {
-  constexpr int kBaseRows = 8;
-  constexpr int kPhysicalRows = 16;
+    int H, int g, int physical_rows, int D) {
+  int base_rows = physical_rows / 2;
   int bh = blockIdx.x;
   int b = bh / H, h = bh % H;
   int KG = D / nvfp4_attn::kSfVec;
   long long q_base = ((long long)b * H + h) * g * D;
   long long p_base =
-      ((long long)b * H + h) * kPhysicalRows * (D / 2);
+      ((long long)b * H + h) * physical_rows * (D / 2);
   long long s_base =
       ((long long)b * H + h) * nvfp4_attn::kQSfRows * KG;
 
@@ -104,13 +103,13 @@ __global__ void quantize_q_residue_kernel(
     uint8_t* base_data =
         q_pack + p_base + (long long)r * (D / 2) + grp * 8;
     uint8_t* residue_data =
-        q_pack + p_base + (long long)(kBaseRows + r) * (D / 2) +
+        q_pack + p_base + (long long)(base_rows + r) * (D / 2) +
         grp * 8;
     uint8_t* base_sf =
         q_sf + s_base + nvfp4_attn::sf_atom_off(r, grp, KG);
     uint8_t* residue_sf =
         q_sf + s_base +
-        nvfp4_attn::sf_atom_off(kBaseRows + r, grp, KG);
+        nvfp4_attn::sf_atom_off(base_rows + r, grp, KG);
 
     vllm::u32x2 packed =
         vllm::cvt_warp_fp16_to_fp4_mext_r1_fast16<__nv_bfloat16, false>(
@@ -243,19 +242,31 @@ void nvfp4_quantize_q_residue(torch::Tensor const& q,
   TORCH_CHECK(q_pack.is_contiguous() && q_sf.is_contiguous(),
               "q_pack / q_sf must be contiguous persistent scratch");
   int B = q.size(0), H = q.size(1), g = q.size(2), D = q.size(3);
+  TORCH_CHECK(q_pack.dim() == 4 && q_pack.size(0) == B &&
+                  q_pack.size(1) == H && q_pack.size(3) == D / 2,
+              "q_pack must be [B, H_kv, physical_group, D/2]");
+  int physical_rows = q_pack.size(2);
   TORCH_CHECK(g == 4 || g == 6 || g == 8,
               "residue Q supports logical GQA group sizes 4, 6, or 8; got ",
               g);
   TORCH_CHECK(D % kSfVec == 0, "head_dim must be divisible by 16");
-  TORCH_CHECK(q_pack.numel() >= (int64_t)B * H * 16 * (D / 2),
-              "q_pack must contain B*H*16*(D/2) bytes");
+  TORCH_CHECK(physical_rows == 8 || physical_rows == 16,
+              "physical residue-Q group must be Q8 or Q16; got ",
+              physical_rows);
+  TORCH_CHECK(g <= physical_rows / 2,
+              "logical GQA group does not fit the base half: g=", g,
+              ", physical_rows=", physical_rows);
+  TORCH_CHECK(q_pack.numel() >=
+                  (int64_t)B * H * physical_rows * (D / 2),
+              "q_pack buffer too small");
   TORCH_CHECK(q_sf.numel() >= (int64_t)B * H * kQSfRows * (D / kSfVec),
               "q_sf buffer too small");
   if (B == 0) return;
   auto stream = at::cuda::getCurrentCUDAStream();
   quantize_q_residue_kernel<<<dim3(B * H), dim3(128), 0, stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
-      q_pack.data_ptr<uint8_t>(), q_sf.data_ptr<uint8_t>(), H, g, D);
+      q_pack.data_ptr<uint8_t>(), q_sf.data_ptr<uint8_t>(), H, g,
+      physical_rows, D);
 }
 
 void nvfp4_quantize_context_q(torch::Tensor const& q_source,
