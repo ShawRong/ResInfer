@@ -103,8 +103,8 @@ echo "[release-smoke] step 1/3: export residue checkpoint"
   --nvfp4_seq_len 64 \
   --search_calib_steps 1 \
   --search_score_steps 1 \
-  --ratios 0.25 \
-  --budget 5.0 \
+  --ratios 0.125 \
+  --budget 4.5 \
   --output_dir "$OUTPUT_DIR/export" \
   >"$EXPORT_LOG" 2>&1
 

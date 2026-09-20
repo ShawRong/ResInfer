@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
 
     residue = subparsers.add_parser("residue-arm")
     common_parser(residue)
-    residue.add_argument("--ratio", type=float, default=0.25)
+    residue.add_argument("--ratio", type=float, default=0.125)
     residue.add_argument("--calib-block-size", type=int, default=8)
     residue.add_argument(
         "--expected-extended-linear-dims-min",

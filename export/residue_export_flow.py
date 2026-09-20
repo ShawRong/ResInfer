@@ -112,13 +112,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--search_calib_steps", type=int, default=1)
     parser.add_argument("--search_score_steps", type=int, default=1)
     parser.add_argument("--search_method", default="gradient", choices=["gradient", "kl_div"])
-    parser.add_argument("--ratios", default="0.25")
+    parser.add_argument(
+        "--ratios",
+        default="0.125",
+        help=(
+            "Comma-separated residue candidates. The supported production "
+            "default is one uniform ratio, 0.125; pass multiple values only "
+            "for an explicit frontier experiment."
+        ),
+    )
     parser.add_argument(
         "--budget",
-        default="5.0",
+        default="4.5",
         help=(
-            "Effective-bit budget used for the synthetic smoke. With only "
-            "ratio=0.25 residue candidates, 5.0 is the stable feasible point."
+            "Effective-bit budget used for the synthetic smoke. With the "
+            "uniform ratio=0.125 production recipe, use 4.5 effective bits."
         ),
     )
     parser.add_argument("--calib_block_size", type=int, default=8)
