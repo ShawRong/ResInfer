@@ -19,7 +19,7 @@ import os
 from modelopt.torch.quantization.nn.modules.quant_linear import QuantLinearConvBase
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModuleRegistry
 from .tensor_quantizer import ResidueTensorQuantizer
-from modelopt.torch.quantization.qtensor import NVFP4QTensor
+from modelopt.torch.quantization.qtensor import NVFP4QTensor, MXFP4QTensor
 from .util import append_quant_residual_channels, swap_extension
 
 
@@ -56,6 +56,9 @@ class ResidueQuantLinear(QuantLinearConvBase):
         salient_indices: torch.Tensor,
     ) -> torch.Tensor:
         input_for_quant = self._apply_pre_quant_scale(input)
+        is_mx = self.input_quantizer.block_sizes.get("scale_bits") == (8, 0)
+        if is_mx:
+            input_for_quant = input_for_quant.float()
         salient_indices = salient_indices.to(device=input.device, dtype=torch.long)
 
         input_base = self._input_qdq_without_pre_quant_scale(input_for_quant)
@@ -64,7 +67,10 @@ class ResidueQuantLinear(QuantLinearConvBase):
         )
         input_residue_q = self._input_qdq_without_pre_quant_scale(input_residue)
 
-        return torch.cat([input_base, input_residue_q], dim=-1)
+        result = torch.cat([input_base, input_residue_q], dim=-1)
+        if is_mx and result.shape[-1] < self.weight.shape[-1]:
+            result = F.pad(result, (0, self.weight.shape[-1] - result.shape[-1]))
+        return result.to(input.dtype) if is_mx else result
 
     def _make_residue_weight(
         self,
@@ -117,7 +123,14 @@ class ResidueQuantLinear(QuantLinearConvBase):
         weight = self._apply_weight_pre_quant_scale(weight, salient_indices)
         with self.weight_quantizer.disable_pre_quant_scale():
             with self.weight_quantizer.allow_residue_linear_fake_quant():
-                weight_q = self.weight_quantizer(weight)
+                if (self.weight_quantizer.block_sizes.get("scale_bits") == (8, 0)
+                        and self.weight_quantizer.is_enabled
+                        and self.weight_quantizer.fake_quant
+                        and getattr(self.weight_quantizer, "_if_quant", True)):
+                    packed, scale = MXFP4QTensor.quantize(weight.contiguous(), 32)
+                    weight_q = packed.dequantize(scale=scale, block_sizes={-1: 32})
+                else:
+                    weight_q = self.weight_quantizer(weight)
 
         output = F.linear(input_ext_q, weight_q, self.bias)
         return self.output_quantizer(output) if hasattr(self, "output_quantizer") else output
@@ -159,6 +172,10 @@ class ResidueQuantLinear(QuantLinearConvBase):
                     and self.weight_quantizer.fake_quant
                 )
             )
+            if (active_fake_quant and
+                    (self.input_quantizer.block_sizes or {}).get("scale_bits") == (8, 0)):
+                with self.input_quantizer.allow_residue_linear_fake_quant(), self.weight_quantizer.allow_residue_linear_fake_quant():
+                    return super().forward(input, *args, **kwargs)
             if active_fake_quant:
                 raise RuntimeError(
                     "Residue fake-quant forward requires salient_indices. "
@@ -187,6 +204,11 @@ class ResidueQuantLinear(QuantLinearConvBase):
             self.input_quantizer._fake_quant = False
         if salient_indices is None:
             raise RuntimeError("Salient indices not loaded. Call load_salient_indices() before input_extension().")
+
+        if self.input_quantizer.block_sizes.get("scale_bits") == (8, 0):
+            if os.getenv("RESIDUE_SWAP", "0") == "1":
+                raise ValueError("MXFP4 runtime supports activation residue, not RESIDUE_SWAP")
+            return self.input_quantizer.residue_extension(input, salient_indices)
 
         # Dynamic quantizer - compute amax from input
         amax = input.abs().max()

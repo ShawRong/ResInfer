@@ -138,7 +138,8 @@ echo "[build] verifying import in $PY ..."
 "$PY" -c "
 import nvfp4, torch
 print(f'[build] OK — nvfp4 from {nvfp4.__file__}')
-expected = ['scaled_fp4_quant_mext_r1', 'scaled_fp4_quant', 'official_scaled_fp4_quant_pack8']
+expected = ['scaled_fp4_quant_mext_r1', 'scaled_fp4_quant',
+            'official_scaled_fp4_quant_pack8', 'mxfp4_residue_quant']
 missing = [op for op in expected if not hasattr(torch.ops.nvfp4, op)]
 if missing:
     raise SystemExit(f'[build] FAIL — missing torch.ops.nvfp4 ops: {missing}')

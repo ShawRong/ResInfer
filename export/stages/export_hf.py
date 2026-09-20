@@ -123,6 +123,9 @@ class ExportHFStage(Stage):
             int(params.get("calib_block_size", params.get("block_size", 8))),
             verbose,
             calibration=_calibration_record(ctx.get_meta("dataset_provenance")),
+            max_shard_size=params.get("max_shard_size", "10GB"),
+            source_checkpoint=params.get("source_checkpoint"),
+            processor=ctx.get_ref("processor"),
         )
 
         # Update context
@@ -143,6 +146,9 @@ class ExportHFStage(Stage):
         kernel_metadata_block_size: int = 8,
         verbose: bool = False,
         calibration: dict | None = None,
+        max_shard_size: str = "10GB",
+        source_checkpoint=None,
+        processor=None,
     ) -> Path:
         """Export model with HF save_pretrained and optional kernel metadata."""
         if model is None:
@@ -153,12 +159,6 @@ class ExportHFStage(Stage):
 
         export_path = Path(export_dir)
         export_path.mkdir(parents=True, exist_ok=True)
-
-        # Collect extended dimensions for vLLM residue metadata.
-        from quant.modelopt_integration.kernel_metadata import (
-            collect_extended_linear_dims,
-        )
-        extended_dims = collect_extended_linear_dims(model)
 
         if verbose:
             print_rank_0(f"  Saving model (safe_serialization={safe_serialization})...")
@@ -195,6 +195,25 @@ class ExportHFStage(Stage):
         model_dtype = _resolve_export_dtype(model)
         if verbose:
             print_rank_0(f"  Export dtype: {model_dtype}")
+
+        from quant.modelopt_integration.mxfp4_export import (
+            export_mxfp4_checkpoint,
+            has_mxfp4_weights,
+        )
+        if has_mxfp4_weights(model):
+            if export_target != "vllm":
+                raise ValueError("ResInfer MXFP4 export requires export_target='vllm'")
+            return export_mxfp4_checkpoint(
+                model, export_path, dtype=model_dtype, tokenizer=tokenizer,
+                calibration=calibration, max_shard_size=max_shard_size,
+                source_checkpoint=source_checkpoint, processor=processor,
+            )
+
+        # NVFP4 residue metadata; MXFP4 uses its explicit checkpoint contract.
+        from quant.modelopt_integration.kernel_metadata import (
+            collect_extended_linear_dims,
+        )
+        extended_dims = collect_extended_linear_dims(model)
 
         # Check if model has residue quantization
         from quant.modelopt_integration.export import is_residue_quantized

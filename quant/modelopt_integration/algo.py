@@ -31,6 +31,7 @@ from modelopt.torch.opt.conversion import ModeloptStateManager
 from modelopt.torch.quantization.model_calib import max_calibrate 
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.quantization.utils import enable_weight_access_and_writeback
+from quant.mxfp4_checkpoint import padded_k
 
 from .algo_helper import (
     ResidueHelper,
@@ -54,6 +55,17 @@ from modelopt.torch.quantization.conversion import restore_quantizer_state
 from modelopt.torch.opt.mode import RestoreEntrypoint, MetadataDict
 
 ResidueQuantModuleRegistry = _DMRegistryCls("ResidueQuant")
+
+
+def _materialized_residue_width(module: nn.Module, base: int, selected: int) -> int:
+    """Width stored in the ModelOpt model before official weight packing."""
+    width = base + selected
+    blocks = getattr(module.weight_quantizer, "block_sizes", None) or {}
+    if blocks.get("scale_bits") == (8, 0):
+        # SM100 MXFP4 GEMM consumes K in 128-value tiles. Padding the floating
+        # weight here keeps byte packing and zero-block scales owned by ModelOpt.
+        width = padded_k(base, selected)
+    return width
 
 
 # Right now we keep on using this replacement function while the residue_max_calibrate is called.
@@ -281,7 +293,12 @@ def _clone_quantizer_amax(quantizer):
 
 
 def _restore_quantizer_amax(quantizer, amax):
-    quantizer.amax = amax
+    # Dynamic MX scales have no static amax. ModelOpt rejects setting None.
+    if amax is None:
+        if hasattr(quantizer, "_amax"):
+            delattr(quantizer, "_amax")
+    else:
+        quantizer.amax = amax
 
 
 def _inject_residue_salient_map_direct(
@@ -334,7 +351,9 @@ def _inject_residue_salient_map_direct(
                 raise ValueError(
                     f"Layer '{name}' is already extended with different salient_indices."
                 )
-            expected_in_features = int(module._original_in_features) + int(salient_indices.numel())
+            expected_in_features = _materialized_residue_width(
+                module, int(module._original_in_features), int(salient_indices.numel())
+            )
             current_in_features = int(getattr(module, "in_features", module.weight.shape[1]))
             if current_in_features != expected_in_features:
                 raise RuntimeError(
@@ -945,6 +964,14 @@ def trigger_weight_extension(model: nn.Module, module: nn.Module, salient_indice
                 input=weight_data_copy,
                 salient_indices=salient_indices
             )
+            materialized_width = _materialized_residue_width(
+                module, int(extended_weight.shape[1] - salient_indices.numel()),
+                int(salient_indices.numel()),
+            )
+            if extended_weight.shape[1] < materialized_width:
+                extended_weight = torch.nn.functional.pad(
+                    extended_weight, (0, materialized_width - extended_weight.shape[1])
+                )
 
             # Free the temporary copy
             del weight_data_copy

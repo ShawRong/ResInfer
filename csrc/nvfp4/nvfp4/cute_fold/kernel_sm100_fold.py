@@ -984,7 +984,9 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
+        alpha_value = cutlass.Float32(1.0)
+        if cutlass.const_expr(alpha is not None):
+            alpha_value = alpha[0].to(cutlass.Float32)
         if cutlass.const_expr(self.dual_alpha):
             alpha_res_value = alpha[1].to(cutlass.Float32)
         else:

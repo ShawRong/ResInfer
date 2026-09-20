@@ -48,6 +48,9 @@ void official_scaled_fp4_quant_pack16(torch::Tensor& output,
                                        torch::Tensor const& input,
                                        torch::Tensor& output_sf,
                                        torch::Tensor const& input_sf);
+void mxfp4_residue_quant(torch::Tensor x, torch::Tensor q, torch::Tensor sf,
+                         c10::optional<torch::Tensor> masks, int64_t per8,
+                         bool residue, bool swizzle);
 
 // Register operator in the nvfp4 namespace
 TORCH_LIBRARY(nvfp4, m) {
@@ -85,6 +88,9 @@ TORCH_LIBRARY(nvfp4, m) {
   m.def(
       "nvfp4_quantize_context_q(Tensor q_source, Tensor query_indptr, "
       "Tensor(a!) q_pack, Tensor(b!) q_sf) -> ()");
+  m.def(
+      "mxfp4_residue_quant(Tensor x, Tensor(a!) q, Tensor(b!) sf, "
+      "Tensor? masks, int per8, bool residue, bool swizzle) -> ()");
 }
 
 // Register CUDA implementation
@@ -102,4 +108,5 @@ TORCH_LIBRARY_IMPL(nvfp4, CUDA, m) {
   m.impl("scaled_fp4_quant_mext_r1", &scaled_fp4_quant_mext_r1);
   m.impl("official_scaled_fp4_quant_pack8", &official_scaled_fp4_quant_pack8);
   m.impl("official_scaled_fp4_quant_pack16", &official_scaled_fp4_quant_pack16);
+  m.impl("mxfp4_residue_quant", &mxfp4_residue_quant);
 }
