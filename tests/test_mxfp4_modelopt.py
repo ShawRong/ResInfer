@@ -63,11 +63,16 @@ def test_nvfp4_residue_signature_preserved():
     assert calls == [(16,scale,double_scale,dict(keep_high_precision=False,try_tensorrt=True))]
 
 
-def test_mx_residue_respects_calibration_quant_disable():
+def test_mx_residue_respects_calibration_quant_disable(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     import modelopt.torch.quantization as mtq
+    import modelopt.torch.quantization.conversion as conversion
     from quant.modelopt_integration.algo import inject_residue_salient_map
+    # This unit uses a plain torch Linear. Avoid unrelated HF plugin discovery,
+    # which is version-coupled to Transformers and is covered by export smokes.
+    monkeypatch.setattr(conversion,"register_custom_model_plugins_on_the_fly",
+                        lambda model: None)
     torch.manual_seed(89)
     model = torch.nn.Sequential(torch.nn.Linear(256,128,bias=False)).cuda().bfloat16()
     original = model[0].weight.detach().clone()
