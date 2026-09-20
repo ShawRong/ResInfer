@@ -5,9 +5,9 @@ torch = pytest.importorskip("torch")
 if not torch.cuda.is_available():
     pytest.skip("CUDA required", allow_module_level=True)
 
-from nvfp4.mxfp4 import (prepare_indices, quantize_selective,
-                         prepare_selective_weight, unswizzle_scales, gemm)
-from quant.mxfp4_reference import dequantize
+from nvfp4.mxfp4 import prepare_indices, quantize, quantize_selective, gemm
+from mxfp4_reference import dequantize
+from mxfp4_scale_layout import unswizzle_scales
 from mxfp4_f32_oracle import quantize as ref_quant, structured_indices
 
 
@@ -18,8 +18,8 @@ def test_selective_quant_and_gemm(ratio, k):
     m, n, s = 7, 128, int(k * ratio)
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) * .1
-    idx = prepare_indices(structured_indices(k,ratio), k, x.device)
-    q, sf = quantize_selective(x, idx, layout="linear")
+    idx, masks = prepare_indices(structured_indices(k, ratio), k, x.device)
+    q, sf = quantize_selective(x, idx, masks, layout="linear")
     base_q, base_s = ref_quant(x.float().cpu().numpy())
     error = (x.float().cpu().numpy() - dequantize(base_q, base_s))[:, idx.cpu().numpy()]
     res_q, res_s = ref_quant(error)
@@ -28,11 +28,13 @@ def test_selective_quant_and_gemm(ratio, k):
     np.testing.assert_array_equal(sf[:, :k//32].cpu(), base_s)
     np.testing.assert_array_equal(sf[:, k//32:(k+s)//32].cpu(), res_s)
     assert (q[:, (k+s)//2:] == 0).all()
-    qs, ss = quantize_selective(x, idx)
+    qs, ss = quantize_selective(x, idx, masks)
     torch.testing.assert_close(qs, q, rtol=0, atol=0)
     kp = q.shape[1] * 2
     torch.testing.assert_close(unswizzle_scales(ss, m, kp), sf, rtol=0, atol=0)
-    wq, ws = prepare_selective_weight(w, idx)
+    wq, ws = quantize(torch.nn.functional.pad(
+        torch.cat((w, w.index_select(1, idx)), dim=1), (0, kp - k - s)
+    ))
     raw = np.concatenate((w.float().cpu().numpy(), w.float().cpu().numpy()[:, idx.cpu().numpy()]), axis=1)
     raw = np.pad(raw, ((0,0), (0,kp-k-s)))
     expected_wq, expected_ws = ref_quant(raw)

@@ -4,6 +4,12 @@ from quant.mxfp4_checkpoint import FORMAT, validate_format, validate_layer, fuse
 
 def test_format_rejects_nvfp4_and_missing_metadata():
     validate_format(FORMAT)
+    with pytest.raises(ValueError, match="checkpoint_format"):
+        validate_format(dict(FORMAT, checkpoint_format="residue_modelopt_mxfp4_v1"))
+    producers = FORMAT["activation_quantizers"]
+    assert producers["standard"] == "flashinfer_cute_dsl"
+    assert producers["selective"] == producers["mext_r1"]
+    assert producers["selective"] == "torch.ops.nvfp4.mxfp4_residue_quant"
     for key in FORMAT:
         bad = dict(FORMAT)
         del bad[key]

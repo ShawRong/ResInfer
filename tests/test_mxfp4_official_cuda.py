@@ -5,7 +5,7 @@ torch=pytest.importorskip('torch')
 if not torch.cuda.is_available():
     pytest.skip('CUDA required',allow_module_level=True)
 from nvfp4.mxfp4 import quantize,quantize_mext,quantize_selective,prepare_indices
-from quant.mxfp4_reference import dequantize
+from mxfp4_reference import dequantize
 from mxfp4_f32_oracle import quantize as native_quant, structured_indices
 
 
@@ -15,7 +15,7 @@ def test_reject_legacy_ocp():
         with pytest.raises(ValueError,match='legacy ocp'):
             fn(x,recipe='ocp')
     with pytest.raises(ValueError,match='legacy ocp'):
-        quantize_selective(x,prepare_indices(structured_indices(256,.125),256,'cuda'),recipe='ocp')
+        quantize_selective(x,*prepare_indices(structured_indices(256,.125),256,'cuda'),recipe='ocp')
 
 
 def test_calls_upstream_standard_and_fused_residue(monkeypatch):
@@ -43,14 +43,14 @@ def test_calls_upstream_standard_and_fused_residue(monkeypatch):
         return run(*args)
     monkeypatch.setattr(module,'_run',fused_spy)
     # Kernel inputs/outputs stay on GPU. No eager arithmetic/layout fallback.
-    idx=prepare_indices(structured_indices(256,.25),256,'cuda')
+    idx,masks=prepare_indices(structured_indices(256,.25),256,'cuda')
     def forbidden(*args,**kwargs):
         raise AssertionError('Torch residue/layout operation reached hot path')
     for name in ('stack','cat','where','exp','exp2','ldexp'):
         monkeypatch.setattr(torch,name,forbidden)
     calls.clear();quantize_mext(x)
     assert not calls and len(launches)==1
-    quantize_selective(x,idx)
+    quantize_selective(x,idx,masks)
     assert not calls and len(launches)==2
 
 
@@ -68,9 +68,9 @@ def test_quant_graph_on_nondefault_stream():
     stream=torch.cuda.Stream()
     with torch.cuda.stream(stream):
         x=torch.randn(7,256,device='cuda')
-        idx=prepare_indices(structured_indices(256,.25),256,'cuda')
+        idx,masks=prepare_indices(structured_indices(256,.25),256,'cuda')
         def forward():
-            return (*quantize_mext(x),*quantize_selective(x,idx))
+            return (*quantize_mext(x),*quantize_selective(x,idx,masks))
         for _ in range(3):expected=forward()
         graph=torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph,stream=stream):actual=forward()

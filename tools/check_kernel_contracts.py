@@ -139,7 +139,7 @@ def check_decorators() -> None:
 # ---------------------------------------------------------------------- 4. names
 def check_names() -> None:
     n0 = len(failures)
-    B = set(dir(builtins))
+    B = set(dir(builtins)) | {"__file__", "__name__", "__package__"}
     for f in FILES:
         tree = ast.parse((PKG / f).read_text())
         bound, loads = set(), {}

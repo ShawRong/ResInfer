@@ -9,6 +9,7 @@ from quant.mxfp4_checkpoint import FORMAT
 from export.stages.inspect_quant_export import InspectQuantExportStage
 from quant.modelopt_integration.mxfp4_export import (
     _collect_preserved_state,
+    _omit_private_export_buffers,
     _validate_modelopt_export,
 )
 from quant.mxfp4_checkpoint import runtime_layer_specs
@@ -60,38 +61,66 @@ def test_inspect_opens_actual_mxfp4_tensors(tmp_path,damage):
 
 
 @pytest.mark.parametrize("indexed", [False, True])
-def test_modelopt_export_bytes_are_not_repacked(tmp_path,indexed):
-    prefix="model.layers.0.self_attn.o_proj"
-    spec=dict(mode="selective",input_size=256,output_size=256,
-              indices=list(range(0,256,8)))
-    native={"quant_method":"modelopt","quant_algo":"MXFP4"}
-    (tmp_path/"config.json").write_text(json.dumps({"quantization_config":native}))
-    tensors={
-        prefix+".weight":torch.arange(256*192,dtype=torch.int64).to(torch.uint8).reshape(256,192),
-        prefix+".weight_scale":torch.zeros(256,12,dtype=torch.uint8),
-        prefix+".input_quantizer._salient_indices":torch.arange(0,256,8),
+def test_modelopt_export_validation_never_rewrites_shards(tmp_path, indexed):
+    import hashlib
+
+    prefix = "model.layers.0.self_attn.o_proj"
+    spec = dict(
+        mode="selective",
+        input_size=256,
+        output_size=256,
+        indices=list(range(0, 256, 8)),
+    )
+    native = {"quant_method": "modelopt", "quant_algo": "MXFP4"}
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": native}))
+    tensors = {
+        prefix + ".weight": torch.arange(256 * 192, dtype=torch.int64)
+        .to(torch.uint8)
+        .reshape(256, 192),
+        prefix + ".weight_scale": torch.zeros(256, 12, dtype=torch.uint8),
     }
-    shard=tmp_path/"model.safetensors"
-    save_file(tensors,shard,metadata={"format":"pt","producer":"modelopt"})
+    shard = tmp_path / "model.safetensors"
+    save_file(tensors, shard, metadata={"format": "pt", "producer": "modelopt"})
     if indexed:
-        (tmp_path/"model.safetensors.index.json").write_text(json.dumps({
-            "metadata":{"total_size":sum(t.numel()*t.element_size() for t in tensors.values())},
-            "weight_map":{name:shard.name for name in tensors},
+        (tmp_path / "model.safetensors.index.json").write_text(json.dumps({
+            "metadata": {"total_size": sum(
+                tensor.numel() * tensor.element_size() for tensor in tensors.values()
+            )},
+            "weight_map": {name: shard.name for name in tensors},
         }))
-    before=tensors[prefix+".weight"].clone()
-    _,actual_native,hashes=_validate_modelopt_export(tmp_path,{prefix:spec},{})
-    assert actual_native==native and set(hashes)=={prefix+".weight",prefix+".weight_scale"}
-    from safetensors import safe_open
-    with safe_open(shard,framework="pt") as handle:
-        assert handle.metadata()=={"format":"pt","producer":"modelopt"}
-        assert prefix+".input_quantizer._salient_indices" not in handle.keys()
-        torch.testing.assert_close(handle.get_tensor(prefix+".weight"),before,rtol=0,atol=0)
-    index_path=tmp_path/"model.safetensors.index.json"
-    if indexed:
-        index=json.loads(index_path.read_text())
-        assert prefix+".input_quantizer._salient_indices" not in index["weight_map"]
-    else:
-        assert not index_path.exists()
+    before = hashlib.sha256(shard.read_bytes()).hexdigest()
+    _, actual_native, hashes = _validate_modelopt_export(
+        tmp_path, {prefix: spec}, {}
+    )
+    after = hashlib.sha256(shard.read_bytes()).hexdigest()
+    assert before == after
+    assert actual_native == native
+    assert set(hashes) == {prefix + ".weight", prefix + ".weight_scale"}
+
+
+def test_modelopt_export_rejects_private_quantizer_state(tmp_path):
+    prefix = "model.layers.0.self_attn.o_proj"
+    spec = dict(mode="standard", input_size=256, output_size=256)
+    native = {"quant_method": "modelopt", "quant_algo": "MXFP4"}
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": native}))
+    save_file({
+        prefix + ".weight": torch.zeros(256, 128, dtype=torch.uint8),
+        prefix + ".weight_scale": torch.zeros(256, 8, dtype=torch.uint8),
+        prefix + ".input_quantizer._salient_indices": torch.arange(32),
+    }, tmp_path / "model.safetensors")
+    with pytest.raises(ValueError, match="calibration tensor"):
+        _validate_modelopt_export(tmp_path, {prefix: spec}, {})
+
+
+def test_private_salience_buffer_is_nonpersistent_only_during_export():
+    module = torch.nn.Module()
+    module.register_buffer("_salient_indices", torch.arange(8))
+    model = torch.nn.Sequential(module)
+    assert "0._salient_indices" in model.state_dict()
+    with _omit_private_export_buffers(model):
+        assert "0._salient_indices" not in model.state_dict()
+        torch.testing.assert_close(module._salient_indices, torch.arange(8))
+    assert "0._salient_indices" in model.state_dict()
 
 
 def test_unsharded_source_checkpoint_preservation(tmp_path):

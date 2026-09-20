@@ -1,4 +1,4 @@
-"""Actual vLLM ReplicatedLinear lifecycle + dummy MLP, no model downloads."""
+"""Actual vLLM packed MXFP4 linear lifecycle, without model downloads."""
 import numpy as np
 import pytest
 
@@ -10,9 +10,9 @@ pytest.importorskip("vllm")
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization import get_quantization_config
 from quant.vllm_integration.linear_method_mxfp4 import ResidueMxfp4Config
-from quant.mxfp4_reference import dequantize, quantize as weight_ref_quant
+from mxfp4_reference import dequantize, quantize as weight_ref_quant
+from mxfp4_scale_layout import unswizzle_scales
 from mxfp4_f32_oracle import quantize as ref_quant, structured_indices
-from nvfp4.mxfp4 import unswizzle_scales
 
 
 @pytest.fixture(autouse=True)
@@ -52,28 +52,41 @@ def reference(layer, x, mode, bias=None):
     return y.reshape(*shape[:-1],layer.weight.shape[0])
 
 
-def make_linear(k,n,mode,ratio=.25,prefix="proj",skip_bias_add=False):
-    spec = {"mode":mode}
+def make_linear(k, n, mode, ratio=.25, prefix="proj", skip_bias_add=False):
+    from quant.mxfp4_checkpoint import FORMAT, padded_k
+
+    spec = {"mode": mode, "input_size": k, "output_size": n}
     if mode == "selective":
-        # Uneven, deterministic distribution across source blocks.
-        spec["indices"] = structured_indices(k,ratio).tolist()
-    config = ResidueMxfp4Config({prefix:spec})
+        spec["indices"] = structured_indices(k, ratio).tolist()
+    config = ResidueMxfp4Config(layers={prefix: spec}, **FORMAT)
     with torch.device("cuda"):
-        layer = ReplicatedLinear(k,n,params_dtype=torch.bfloat16,quant_config=config,
-                                 prefix=prefix,disable_tp=True,skip_bias_add=skip_bias_add)
-    w = torch.randn(n,k,device="cuda",dtype=torch.bfloat16)*.1
-    bias = torch.randn(n,device="cuda",dtype=torch.bfloat16)*.01
-    layer.weight.weight_loader(layer.weight,w)
-    layer.bias.weight_loader(layer.bias,bias)
+        layer = ReplicatedLinear(
+            k,
+            n,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix=prefix,
+            disable_tp=True,
+            skip_bias_add=skip_bias_add,
+        )
+
+    weight = torch.randn(n, k, dtype=torch.float32).numpy() * .1
+    if mode == "selective":
+        weight = np.concatenate((weight, weight[:, spec["indices"]]), axis=1)
+    kp = padded_k(k, len(spec.get("indices", [])))
+    weight = np.pad(weight, ((0, 0), (0, kp - weight.shape[1])))
+    packed, scales = weight_ref_quant(weight, min_scale_exponent=-126)
+    layer.weight.weight_loader(layer.weight, torch.from_numpy(packed).cuda())
+    layer.weight_scale.weight_loader(layer.weight_scale, torch.from_numpy(scales).cuda())
+    bias = torch.randn(n, device="cuda", dtype=torch.bfloat16) * .01
+    layer.bias.weight_loader(layer.bias, bias)
     layer.quant_method.process_weights_after_loading(layer)
     before = layer.weight.data_ptr()
-    layer.quant_method.process_weights_after_loading(layer)  # idempotent
-    assert layer.weight.data_ptr()==before
-    assert layer.weight.dtype==torch.uint8
+    layer.quant_method.process_weights_after_loading(layer)
+    assert layer.weight.data_ptr() == before
+    assert layer.weight.dtype == torch.uint8
     if mode == "selective":
-        # Tensor Python attributes do not survive Module._apply. The runtime
-        # must use its separately registered mask buffer after such a move.
-        layer.salient_indices = layer.salient_indices.clone()
+        assert layer.salient_masks.numel() == k // 8
         assert not hasattr(layer.salient_indices, "_mxfp4_masks")
     return layer
 
@@ -107,7 +120,7 @@ def test_linear_lifecycle_compile_graph(mode,ratio):
     assert layer(torch.empty((0,256),device="cuda",dtype=torch.bfloat16))[0].shape==(0,128)
 
 
-def test_dummy_mlp_e2e():
+def test_packed_mlp_e2e():
     torch.manual_seed(67)
     first = make_linear(256,256,"selective",.125,prefix="up")
     second = make_linear(256,128,"selective",.5,prefix="down",skip_bias_add=True)
@@ -164,7 +177,7 @@ def test_packed_loader(mode, ratio):
     if mode == "selective":
         w = np.concatenate((w,w[:,spec["indices"]]),axis=1)
     w = np.pad(w,((0,0),(0,padded_k(256,len(spec.get("indices",[])))-w.shape[1])))
-    q,s = weight_ref_quant(w,recipe="ceil",min_scale_exponent=-126)
+    q,s = weight_ref_quant(w,min_scale_exponent=-126)
     q,s = torch.from_numpy(q).cuda(),torch.from_numpy(s).cuda()
     with pytest.raises(ValueError,match="incomplete"):
         layer.quant_method.process_weights_after_loading(layer)

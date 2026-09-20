@@ -31,33 +31,10 @@ def _validate(a, b, sa, sb, out_dtype):
     return m, n, k, "sm100"
 
 
-def _gemm_transposed(a, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
-         mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1)):
-    """D[M,N]=A[M,K]@B[N,K].T, with E8M0 scales and no global scale."""
-    m, n, k, arch = _validate(a, b, a_scale, b_scale, out_dtype)
-    with torch.cuda.device(a.device):
-        # The inherited plain epilogue writes [N,M] through TMA, whose row
-        # stride must be 16B aligned. Pad only the token tail; its scale
-        # tile allocation (128 rows) is already large enough.
-        padded_m = ((m + 7) // 8) * 8
-        if padded_m != m:
-            a = torch.nn.functional.pad(a, (0, 0, 0, padded_m - m))
-        compiled = _compile_fold_gemm(
-            tuple(mma_tiler_mn), tuple(cluster_shape_mn), out_dtype,
-            mode="plain_tma", kernel_arch=arch, fp4_format="mxfp4")
-        # Existing dense host maps weight to M and activation to N.
-        transposed = torch.empty((n, padded_m), dtype=out_dtype, device=a.device)
-        args = (b, a, transposed, (n + 127) // 128, (m + 127) // 128,
-                (k + 127) // 128, b_scale.data_ptr(), a_scale.data_ptr(), None)
-        compiled(*args, 0, 0)
-        return transposed.T[:m].contiguous()
-
-
 def gemm(a, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
          mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1)):
     """D[M,N]=A[M,K]@B[N,K].T, direct row-major output on SM100.
 
-    Keep the transposed implementation only for explicit benchmark comparison.
     M tails are handled by TMA bounds, without padding activation
     rows or launching a separate output-transpose copy.
     """

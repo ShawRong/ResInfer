@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Checkpoint contract shared by ModelOpt export and the SM100 vLLM loader."""
 FORMAT = {
-    "checkpoint_format": "residue_modelopt_mxfp4_v1",
+    "checkpoint_format": "residue_modelopt_mxfp4_v2",
     "block_size": 32,
     "weight_encoding": "e2m1_even_low_nibble",
     "scale_encoding": "e8m0_uint8",
@@ -9,7 +9,11 @@ FORMAT = {
     "activation_recipe": "ceil",
     "activation_rounding": "nearest_even",
     "activation_min_scale_exponent": -127,
-    "activation_quantizer": "flashinfer_cute_dsl",
+    "activation_quantizers": {
+        "standard": "flashinfer_cute_dsl",
+        "selective": "torch.ops.nvfp4.mxfp4_residue_quant",
+        "mext_r1": "torch.ops.nvfp4.mxfp4_residue_quant",
+    },
     # Stable producer contract. The exact ModelOpt package version belongs in
     # export provenance, not in the runtime ABI checked by the loader.
     "weight_quantizer": "modelopt_mxfp4",

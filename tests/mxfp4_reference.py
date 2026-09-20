@@ -1,12 +1,4 @@
-"""Historical CPU MXFP4 mathematical oracle; not the runtime quantizer.
-
-See docs/mxfp4-development.md for the format and conversion contract.
-NumPy float64 intermediates preserve subnormal scales without FTZ; decoded
-values and GEMM results are float32. This is not a performance backend.
-The historical OCP branch is retained for old experiment reproduction only.
-Current runtime tests use FlashInfer itself as the authoritative producer;
-this oracle's exact division/subnormal behavior does not model that kernel.
-"""
+"""CPU oracle for the current ceil-scale MXFP4 checkpoint contract."""
 
 from __future__ import annotations
 
@@ -17,20 +9,19 @@ _MAGNITUDES = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6], dtype=np.float64)
 _MIDPOINTS = (_MAGNITUDES[:-1] + _MAGNITUDES[1:]) / 2
 
 
-def quantize(x: np.ndarray, *, recipe: str = "ocp",
-             min_scale_exponent: int = -127) -> tuple[np.ndarray, np.ndarray]:
+def quantize(x: np.ndarray, *, min_scale_exponent: int = -127) -> tuple[np.ndarray, np.ndarray]:
     """Quantize finite float16/32 input [M,K], K a positive multiple of 32.
 
     Returns uint8 payload [M,K/2] and E8M0 scales [M,K/32]. The first
     element occupies the low nibble. Scale exponent is
-    clip(floor(log2(amax)) - 2, -127, 127), with code 0 for zero blocks.
+    clip(ceil(log2(amax / 6)), -127, 127), with code 0 for zero blocks.
     Elements use round-to-nearest, ties-to-even and saturate to +/-6.
     Signed zeros are retained. No tensor-level scale or implicit padding.
-    recipe="ceil" uses ceil(log2(amax/6)); min_scale_exponent=-126
-    selects the retired local GPU kernel's minimum-normal-scale policy.
+    Scales use ceil(log2(amax/6)); min_scale_exponent=-126 is retained
+    only for validating ModelOpt 0.45 weight-export bytes.
     """
-    if recipe not in ("ocp", "ceil") or min_scale_exponent not in (-127, -126):
-        raise ValueError("recipe must be ocp/ceil; minimum exponent must be -127/-126")
+    if min_scale_exponent not in (-127, -126):
+        raise ValueError("minimum exponent must be -127 or -126")
     x = np.asarray(x)
     if x.dtype not in (np.dtype(np.float16), np.dtype(np.float32)):
         raise TypeError("MXFP4 reference input must be float16 or float32")
@@ -42,10 +33,8 @@ def quantize(x: np.ndarray, *, recipe: str = "ocp",
     blocks = x.astype(np.float64).reshape(x.shape[0], x.shape[1] // BLOCK_SIZE, BLOCK_SIZE)
     amax = np.abs(blocks).max(axis=-1)
     # frexp avoids log2 rounding across exact power-of-two boundaries.
-    exponent = np.frexp(amax)[1] - 3
-    if recipe == "ceil":
-        fraction, power = np.frexp(amax / 6.0)
-        exponent = power - (fraction == 0.5)
+    fraction, power = np.frexp(amax / 6.0)
+    exponent = power - (fraction == 0.5)
     exponent = np.where(amax == 0, min_scale_exponent,
                         np.clip(exponent, min_scale_exponent, 127))
     scales = (exponent + 127).astype(np.uint8)

@@ -7,7 +7,7 @@ pytest.importorskip("modelopt")
 from quant.modelopt_integration.tensor_quantizer import ResidueTensorQuantizer
 from quant.modelopt_integration.registry import build_residue_cfg
 from quant.modelopt_integration.algo import _restore_quantizer_amax
-from quant.mxfp4_reference import quantize, dequantize
+from mxfp4_reference import quantize, dequantize
 
 
 def test_dynamic_amax_restore_and_format():
@@ -39,7 +39,7 @@ def test_mxfp4_activation_residue_matches_rne(dtype):
     idx=torch.arange(32,device="cuda")
     q=ResidueTensorQuantizer({"num_bits":(2,1),"block_sizes":{-1:32,"type":"dynamic","scale_bits":(8,0)}}).cuda()
     actual=q.residue_extension(x,idx)
-    packed,scale=quantize(x.float().cpu().numpy(),recipe="ceil",min_scale_exponent=-126)
+    packed,scale=quantize(x.float().cpu().numpy(),min_scale_exponent=-126)
     base=dequantize(packed,scale)
     expected=np.concatenate((x.float().cpu().numpy(),(x.float().cpu().numpy()-base)[:,:32]),axis=1)
     np.testing.assert_array_equal(actual.float().cpu().numpy(),expected)

@@ -1,6 +1,6 @@
 """Independent CPU FP32 MXFP4 arithmetic; native BF16 bytes checked separately."""
 import numpy as np
-from quant.mxfp4_reference import dequantize
+from mxfp4_reference import dequantize
 
 
 def quantize(source,*,recipe='ceil',dtype=None):

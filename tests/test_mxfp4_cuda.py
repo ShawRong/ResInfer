@@ -7,8 +7,9 @@ if not torch.cuda.is_available():
     pytest.skip("CUDA is required", allow_module_level=True)
 
 from nvfp4.mxfp4 import (quantize, quantize_mext,
-                         swizzle_scales, unswizzle_scales, gemm, fold_gemm)
-from quant.mxfp4_reference import dequantize
+                         swizzle_scales, gemm, fold_gemm)
+from mxfp4_reference import dequantize
+from mxfp4_scale_layout import unswizzle_scales
 from mxfp4_f32_oracle import quantize as ref_quant, structured_indices
 
 
@@ -101,15 +102,20 @@ def test_nvfp4_fold_cache_isolation():
     torch.testing.assert_close(nv,torch.full_like(nv,512),rtol=0,atol=0)
 
 
-@pytest.mark.parametrize("m", [1,7,128])
-@pytest.mark.parametrize("dtype", [torch.float16,torch.bfloat16])
-def test_direct_dense_against_transposed(m,dtype):
-    if torch.cuda.get_device_capability() != (10,0):
+@pytest.mark.parametrize("m", [1, 7, 128])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_direct_dense_against_decoded_reference(m, dtype):
+    if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("direct output is SM100-only")
-    from nvfp4.mxfp4.dense import _gemm_transposed
     torch.manual_seed(83)
-    a,sa = quantize(torch.randn(m,384,device="cuda",dtype=dtype))
-    b,sb = quantize(torch.randn(256,384,device="cuda",dtype=dtype))
-    direct = gemm(a,b,sa,sb,out_dtype=dtype)
-    baseline = _gemm_transposed(a,b,sa,sb,out_dtype=dtype)
-    torch.testing.assert_close(direct,baseline,rtol=0,atol=0)
+    a, sa = quantize(torch.randn(m, 384, device="cuda", dtype=dtype))
+    b, sb = quantize(torch.randn(256, 384, device="cuda", dtype=dtype))
+    ad = torch.from_numpy(dequantize(
+        a.cpu().numpy(), unswizzle_scales(sa, m, 384).cpu().numpy()
+    )).cuda()
+    bd = torch.from_numpy(dequantize(
+        b.cpu().numpy(), unswizzle_scales(sb, 256, 384).cpu().numpy()
+    )).cuda()
+    expected = ad @ bd.T
+    actual = gemm(a, b, sa, sb, out_dtype=dtype).float()
+    torch.testing.assert_close(actual, expected, rtol=.02, atol=.125)

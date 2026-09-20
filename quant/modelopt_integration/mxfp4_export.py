@@ -9,6 +9,7 @@ rejected.
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 import importlib.metadata
 import inspect
 import json
@@ -69,7 +70,9 @@ def collect_mxfp4_layers(model):
         mode = getattr(module, "_residue_runtime_mode", None)
         if mode == "mext_r1":
             k = module.weight.shape[1]
-            if indices is None or indices.tolist() != list(range(k)):
+            expected = (torch.arange(k, device=indices.device, dtype=indices.dtype)
+                        if indices is not None else None)
+            if indices is None or indices.numel() != k or not torch.equal(indices, expected):
                 raise ValueError(f"full residue requires all channels in order: {name}")
             indices = None
         elif indices is not None and indices.numel():
@@ -95,10 +98,27 @@ def collect_mxfp4_layers(model):
     return layers
 
 
+@contextmanager
+def _omit_private_export_buffers(model):
+    """Keep residue metadata live while excluding it from exported state_dicts."""
+    added = []
+    for module in model.modules():
+        if "_salient_indices" not in getattr(module, "_buffers", {}):
+            continue
+        non_persistent = module._non_persistent_buffers_set
+        if "_salient_indices" not in non_persistent:
+            non_persistent.add("_salient_indices")
+            added.append(module)
+    try:
+        yield
+    finally:
+        for module in added:
+            module._non_persistent_buffers_set.discard("_salient_indices")
+
+
 def _validate_modelopt_export(path, hf_layers, preserved):
-    """Validate official ModelOpt output and remove only private salience buffers."""
+    """Validate official ModelOpt output without rewriting its shards."""
     from safetensors import safe_open
-    from safetensors.torch import save_file
 
     config_path = path / "config.json"
     config = json.loads(config_path.read_text())
@@ -107,8 +127,8 @@ def _validate_modelopt_export(path, hf_layers, preserved):
             or native_config.get("quant_method") != "modelopt"
             or str(native_config.get("quant_algo", "")).lower() != "mxfp4"):
         raise ValueError(f"unexpected ModelOpt MXFP4 config: {native_config!r}")
-    seen, hashes, weight_map, total_size = set(), {}, {}, 0
-    removed_keys = set()
+
+    seen, hashes, weight_map = set(), {}, {}
     expected_quant = {
         f"{name}.{key}" for name in hf_layers for key in ("weight", "weight_scale")
     }
@@ -120,18 +140,12 @@ def _validate_modelopt_export(path, hf_layers, preserved):
     native_weight_map = (native_index or {}).get("weight_map", {})
 
     for shard in shards:
-        tensors, shard_removed = {}, False
         with safe_open(shard, framework="pt") as handle:
-            metadata = handle.metadata()
             for key in handle.keys():
                 if key in seen:
                     raise ValueError(f"duplicate exported tensor: {key}")
                 seen.add(key)
                 if "quantizer." in key:
-                    if key.endswith("._salient_indices"):
-                        removed_keys.add(key)
-                        shard_removed = True
-                        continue
                     raise ValueError(f"unexpected calibration tensor: {key}")
                 tensor = handle.get_tensor(key)
                 prefix, leaf = key.rsplit(".", 1)
@@ -142,7 +156,7 @@ def _validate_modelopt_export(path, hf_layers, preserved):
                     expected_shape = [spec["output_size"], width]
                     if tensor.dtype != torch.uint8 or list(tensor.shape) != expected_shape:
                         raise ValueError(
-                            f"unexpected native ModelOpt MXFP4 shape/dtype: "
+                            "unexpected native ModelOpt MXFP4 shape/dtype: "
                             f"{key} {tensor.shape} {tensor.dtype}"
                         )
                     if leaf == "weight_scale" and (tensor == 255).any().item():
@@ -154,30 +168,16 @@ def _validate_modelopt_export(path, hf_layers, preserved):
                     raise ValueError(f"nonfinite exported tensor: {key}")
                 if key in preserved and _hash(tensor) != preserved[key]:
                     raise ValueError(f"unquantized parameter changed during export: {key}")
-                tensors[key] = tensor.contiguous()
                 weight_map[key] = shard.name
-                total_size += tensor.numel() * tensor.element_size()
-        if shard_removed:
-            temporary = shard.with_suffix(".safetensors.tmp")
-            save_file(tensors, temporary, metadata=metadata)
-            temporary.replace(shard)
 
     if native_index is not None:
-        filtered_native_map = {
-            key: value for key, value in native_weight_map.items()
-            if key not in removed_keys
-        }
-        if filtered_native_map != weight_map:
+        if native_weight_map != weight_map:
             raise ValueError("ModelOpt shard index does not match exported tensors")
     elif len(shards) != 1:
         raise ValueError("multi-shard ModelOpt export is missing its safetensors index")
     missing = (expected_quant | set(preserved)) - set(weight_map)
     if missing:
         raise ValueError(f"missing exported tensors: {sorted(missing)}")
-    if native_index is not None and removed_keys:
-        native_index["weight_map"] = weight_map
-        native_index.setdefault("metadata", {})["total_size"] = total_size
-        index_path.write_text(json.dumps(native_index, indent=2) + "\n")
     return config, native_config, hashes
 
 
@@ -278,10 +278,15 @@ def export_mxfp4_checkpoint(model, export_dir, *, dtype=None, tokenizer=None,
     )
     # Collect before ModelOpt's exporter temporarily replaces quantized modules.
     path.mkdir(parents=True, exist_ok=True)
-    with torch.inference_mode():
-        export_hf_checkpoint(model, export_dir=path, dtype=dtype,
-                             save_modelopt_state=False, max_shard_size=max_shard_size,
-                             extra_state_dict=extra_tensors or None)
+    with torch.inference_mode(), _omit_private_export_buffers(model):
+        export_hf_checkpoint(
+            model,
+            export_dir=path,
+            dtype=dtype,
+            save_modelopt_state=False,
+            max_shard_size=max_shard_size,
+            extra_state_dict=extra_tensors or None,
+        )
     config, native_config, hashes = _validate_modelopt_export(path, hf_layers, preserved)
     config_path = path / "config.json"
     contract = {"quant_method": "residue_mxfp4", **FORMAT, "layers": runtime_layers}
@@ -308,7 +313,15 @@ def export_mxfp4_checkpoint(model, export_dir, *, dtype=None, tokenizer=None,
         "cuda_capability": (list(torch.cuda.get_device_capability(model_device))
                             if model_device.type == "cuda" else None),
         "max_shard_size": max_shard_size,
-        "files": {f.name: _file_hash(f) for f in sorted(path.iterdir()) if f.is_file()},
+        "metadata_file_sha256": {
+            file.name: _file_hash(file)
+            for file in sorted(path.iterdir())
+            if file.is_file() and file.suffix != ".safetensors"
+        },
+        "safetensor_shards": {
+            file.name: file.stat().st_size
+            for file in sorted(path.glob("*.safetensors"))
+        },
     }
     (path / "mxfp4_export_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return path
