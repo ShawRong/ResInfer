@@ -1223,7 +1223,7 @@ __device__ inline int64_t compute_tiled_sf_offset(
 __device__ __forceinline__ int32_t compute_mext_r1_base_row(
     int32_t rowIdx, int32_t numRows, int32_t layoutMode) {
   (void)numRows;
-  if (layoutMode == 2) {
+  if (layoutMode == 2 || layoutMode == 4) {
     constexpr int kTile8Rows = 8;
     int32_t chunk = rowIdx / kTile8Rows;
     int32_t local = rowIdx % kTile8Rows;
@@ -1238,7 +1238,7 @@ __device__ __forceinline__ int32_t compute_mext_r1_base_row(
 __device__ __forceinline__ int32_t compute_mext_r1_residue_row(int32_t rowIdx,
                                                                int32_t numRows,
                                                                int32_t layoutMode) {
-  if (layoutMode == 2) {
+  if (layoutMode == 2 || layoutMode == 4) {
     constexpr int kTile8Rows = 8;
     int32_t chunk = rowIdx / kTile8Rows;
     int32_t local = rowIdx % kTile8Rows;
@@ -1248,6 +1248,32 @@ __device__ __forceinline__ int32_t compute_mext_r1_residue_row(int32_t rowIdx,
     return rowIdx * 2 + 1;
   }
   return rowIdx + numRows;
+}
+
+// ResAttn launches one KQ CTA per (batch, kv_head). Its Q-scale descriptor
+// therefore gives every logical 8-head group an independent 128-row SF atom,
+// even though the packed Q data uses only 16 compact base+residue rows. Other
+// MExt layouts use the data row as the SF row.
+__device__ __forceinline__ int32_t compute_mext_r1_base_sf_row(
+    int32_t rowIdx, int32_t numRows, int32_t layoutMode) {
+  if (layoutMode != 4) {
+    return compute_mext_r1_base_row(rowIdx, numRows, layoutMode);
+  }
+  constexpr int kTile8Rows = 8;
+  int32_t chunk = rowIdx / kTile8Rows;
+  int32_t local = rowIdx % kTile8Rows;
+  return chunk * 128 + local;
+}
+
+__device__ __forceinline__ int32_t compute_mext_r1_residue_sf_row(
+    int32_t rowIdx, int32_t numRows, int32_t layoutMode) {
+  if (layoutMode != 4) {
+    return compute_mext_r1_residue_row(rowIdx, numRows, layoutMode);
+  }
+  constexpr int kTile8Rows = 8;
+  int32_t chunk = rowIdx / kTile8Rows;
+  int32_t local = rowIdx % kTile8Rows;
+  return chunk * 128 + kTile8Rows + local;
 }
 
 template <class SFType, int CVT_FP4_NUM_THREADS_PER_SF>

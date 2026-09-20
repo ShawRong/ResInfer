@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'正确性优先的 prefill kernel(简化版)—— 用来最快跑通 S1–S3 的数值门。'
+'DEPRECATED FOR PRODUCTION: historical prefill correctness prototype.'
 
 from __future__ import annotations
 

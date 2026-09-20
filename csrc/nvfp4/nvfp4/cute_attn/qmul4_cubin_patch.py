@@ -216,6 +216,9 @@ def patch_qmul4_cubin_file(source: str | os.PathLike, output: str | os.PathLike)
 
 
 def _patch_enabled() -> bool:
+    from .native_compile import native_qmul4_enabled
+    if native_qmul4_enabled():
+        return False
     return os.environ.get(_PATCH_ENV, "1") != "0"
 
 

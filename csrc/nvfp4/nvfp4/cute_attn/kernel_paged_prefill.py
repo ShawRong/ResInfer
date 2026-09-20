@@ -8,7 +8,7 @@
 # 分发保留原版权声明与条件,所以本文件**沿用 BSD-3**,与同样派生的
 # `kernel_paged_decode.py` 一致 —— 此前它标的是 Apache-2.0 且没有 NVIDIA
 # 版权行,那是从 BSD-3 派生物单方面改标,开源前修正。
-'ResAttn 分页 NVFP4 **prefill(context)** attention kernel(warp 特化性能版)。'
+'DEPRECATED FOR PRODUCTION: historical in-house context attention kernel.'
 
 from __future__ import annotations
 

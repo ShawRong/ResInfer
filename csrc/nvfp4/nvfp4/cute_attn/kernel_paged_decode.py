@@ -85,6 +85,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         *,
         page_size=128,
         tma_mask=False,
+        # Experimental decode-only R1. Production host.py does not currently
+        # enable this flag; RESIDUE_ATTN=1 selects the backend, not this tactic.
+        # It is structurally compatible with the active qmul4_tmem path, whose
+        # converted V and P use the ordinary FP8 VP MMA.  Only the retired
+        # native_token path needs a separate FP4 P/VP fragment fold.
         residue_fold=False,
         perf_probe=0,
         blocks_per_sm=1,
@@ -96,6 +101,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         reg_reconfig_q16: bool = False,
         single_softmax_wg: bool = False,
         smem_correction_broadcast: bool = False,
+        qmul4_interleave: int = 0,
         # 诊断用 qmul4 分段消融:"none" 全量 / "conv" 跳过转换 /
         # "mma" 跳过 VP MMA。每级只摘掉**一个**嫌疑、保持流水线握手完整,
         # 所以 trap 是否消失能直接归因。生产路径恒为 "none";
@@ -144,8 +150,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         self.do_cga_red = reduction_mode == "cga_sharded"
         self.do_none_red = reduction_mode == "none" or reduction_mode is None
         self.tma_mask = tma_mask
-        # Residue fold(R1):Q 按 [base 块; res 块] concat 打包(每 kv 组行数 2×),
-        # softmax 前把 S 的两半相加(S_b+S_r)。v0 = 折叠后复制回两半,下游形状零改动。
+        # Residue fold(R1, NOT production-wired):Q 按 [base 块; res 块]
+        # concat 打包(每 kv 组行数 2×),softmax 前把 S 的两半相加(S_b+S_r)。
+        # v0 把折叠后结果复制回两半，只验证过早期几何。active qmul4_tmem
+        # 后半程是 FP8 P/VP，结构上不受下面的 native-token 断言限制；但 host
+        # 尚未生成该 Q 布局，也未把此 flag 放入编译键，因此 serving 并未启用。
         self.residue_fold = residue_fold
         # perf 分解:1=跳过 P 字节写(保留转换);2=跳过整个 P 量化+写
         self.perf_probe = perf_probe
@@ -184,6 +193,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         # 16-float warp-local carrier, then issues four 128-bit shared loads.
         # Arithmetic, TMEM ownership, and the final sL reduction stay fixed.
         self.smem_correction_broadcast = smem_correction_broadcast
+        self.qmul4_interleave = qmul4_interleave
+        if qmul4_interleave not in (0, 1, 2, 4, 8):
+            raise ValueError("qmul4_interleave must be 0, 1, 2, 4 or 8")
+        if qmul4_interleave and v_mode != "qmul4_tmem":
+            raise ValueError("atom-level interleave requires qmul4_tmem")
         self.qmul4_skip = qmul4_skip
         # The direct-to-TMEM path needs a conversion warpgroup in addition to
         # the historical MMA/TMA, 2x softmax, and correction warpgroups.
@@ -2836,14 +2850,14 @@ class GroupedQueryAttentionDecodePagedFp4:
                 # paired with this VP MMA operand in the reference pipeline.
                 tmem_store_atom_v = cute.make_copy_atom(
                     tcgen05.St16x128bOp(
-                        tcgen05.Repetition(mma_k_bits // 128)
+                        tcgen05.Repetition(self.qmul4_interleave or mma_k_bits // 128)
                     ),
                     vp_dtype,
                 )
                 smem_load_atom_v = cute.make_copy_atom(
                     cute.nvgpu.warp.LdMatrix16x16x8bOp(
                         transpose=True,
-                        num_matrices=2,
+                        num_matrices=1 if self.qmul4_interleave else 2,
                         unpack_bits=4,
                     ),
                     cutlass.Int8,
@@ -2916,6 +2930,19 @@ class GroupedQueryAttentionDecodePagedFp4:
                 )
                 tAsVS = thrblk_mma_vp.partition_A(sVS_mma)
                 tVsVS = thr_load_v.partition_D(tAsVS)
+                if cutlass.const_expr(self.qmul4_interleave):
+                    # Derive both partitions from NEW x1 atoms. Slicing the
+                    # old x8 store/x2 LDSM partitions changes their ownership.
+                    tVsV_atoms = cute.group_modes(tVsV, 1, cute.rank(tVsV) - 1)
+                    tVsVS_atoms = cute.group_modes(tVsVS, 1, cute.rank(tVsVS) - 1)
+                    tVtV_atoms = cute.group_modes(tVtV_cvt, 1, cute.rank(tVtV_cvt) - 1)
+                    print(f"[cvt-atoms-preflight] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout} src_size={cute.size(tVsV_atoms, mode=[0])}", flush=True)
+                    # Memory-side CPY modes describe warp-wide tiles, not
+                    # per-lane register counts. Allocate from RF partitions.
+                    assert cute.size(tVrV_shape[0]) == 8 * self.qmul4_interleave
+                    assert cute.size(tVrV_cvt_shape[0]) == cute.size(tVrV_shape[0])
+                    assert cute.size(tVsV_atoms, mode=[1]) == cute.size(tVtV_atoms, mode=[1])
+                    print(f"[cvt-atoms] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout}", flush=True)
                 if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
                     print(
                         f"[cvt] tVsVS={tVsVS.layout} "
@@ -2941,77 +2968,107 @@ class GroupedQueryAttentionDecodePagedFp4:
                             )
                             phase_mark(6, 1 + _cvt_flat)
 
-                            tVrVS = cute.make_rmem_tensor_like(
-                                tVsVS[cpy_dice + (None, 0)]
-                            )
-                            cute.autovec_copy(
-                                tVsVS[cpy_dice + (None, v_handle.index)],
-                                tVrVS,
-                            )
-                            tVrV = cute.make_rmem_tensor(
-                                tVrV_shape, cutlass.Int8
-                            )
-                            tVrV_cvt = cute.make_rmem_tensor(
-                                tVrV_cvt_shape, vp_dtype
-                            )
-                            # The scale partition contains zero-stride
-                            # broadcasts.  Materialize it into the compact
-                            # register shape paired with the LDSM fragment
-                            # before slicing eight-value QMUL4 vectors.
-                            tVrVS_expanded = cute.make_rmem_tensor(
-                                tVrV_shape, sf_dtype
-                            )
-                            cute.autovec_copy(tVrVS, tVrVS_expanded)
-                            cute.copy(
-                                thr_load_v,
-                                tVsV[cpy_dice + (v_handle.index,)],
-                                tVrV,
-                            )
-                            cute.arch.fence_view_async_shared()
-                            v_handle.release()
-
-                            if cutlass.const_expr(self.qmul4_skip != "conv"):
-                                _frag_values = cute.size(tVrV_shape)
-                                assert _frag_values % 8 == 0
-                                _src_flat = cute.make_tensor(
-                                    tVrV.iterator,
-                                    cute.make_layout(_frag_values),
-                                )
-                                _sf_flat = cute.make_tensor(
-                                    tVrVS_expanded.iterator,
-                                    cute.make_layout(_frag_values),
-                                )
-                                _dst_flat = cute.make_tensor(
-                                    tVrV_cvt.iterator,
-                                    cute.make_layout(_frag_values),
-                                )
-                                for _block in cutlass.range_constexpr(
-                                    _frag_values // 8
-                                ):
-                                    _src8 = cute.local_tile(
-                                        _src_flat, (8,), (_block,)
-                                    )
-                                    _sf8 = cute.local_tile(
-                                        _sf_flat, (8,), (_block,)
-                                    )
-                                    _dst8 = cute.local_tile(
-                                        _dst_flat, (8,), (_block,)
-                                    )
-                                    _dst8.store(
-                                        dequantize_nvfp4x8_ldsm(_src8, _sf8)
-                                    )
+                            if cutlass.const_expr(self.qmul4_interleave):
+                                atom_count = cute.size(tVsV_atoms, mode=[1])
+                                for atom_idx in cutlass.range_constexpr(atom_count):
+                                    src_atom = cute.make_rmem_tensor((tVrV_shape[0],), cutlass.Int8)
+                                    scale_atom = cute.make_rmem_tensor((tVsVS_atoms.shape[0],), sf_dtype)
+                                    dst_atom = cute.make_rmem_tensor((tVrV_cvt_shape[0],), vp_dtype)
+                                    cute.autovec_copy(tVsVS_atoms[None, atom_idx, v_handle.index], scale_atom)
+                                    cute.copy(thr_load_v, tVsV_atoms[None, atom_idx, v_handle.index], src_atom)
+                                    if cutlass.const_expr(atom_idx == atom_count - 1):
+                                        cute.arch.fence_view_async_shared()
+                                        v_handle.release()
+                                    if cutlass.const_expr(self.qmul4_skip != "conv"):
+                                        values = cute.size(tVrV_shape[0])
+                                        src_flat = cute.make_tensor(src_atom.iterator, cute.make_layout(values))
+                                        sf_flat = cute.make_tensor(scale_atom.iterator, cute.make_layout(values))
+                                        dst_flat = cute.make_tensor(dst_atom.iterator, cute.make_layout(values))
+                                        for part in cutlass.range_constexpr(values // 8):
+                                            src8 = cute.local_tile(src_flat, (8,), (part,))
+                                            sf8 = cute.local_tile(sf_flat, (8,), (part,))
+                                            dst8 = cute.local_tile(dst_flat, (8,), (part,))
+                                            dst8.store(dequantize_nvfp4x8_ldsm(src8, sf8))
+                                    else:
+                                        dst_atom.fill(0)
+                                    cute.copy(thr_store_v, dst_atom, tVtV_atoms[None, atom_idx, cvt_handle.index])
+                                cute.arch.fence_view_async_tmem_store()
+                                cvt_handle.commit()
+                                phase_mark(7, 1 + _cvt_flat)
+                                v_token = v_raw_consumer.try_wait()
+                                cvt_token = v_ready_producer.try_acquire()
                             else:
-                                tVrV_cvt.fill(0)
-                            cute.copy(
-                                thr_store_v,
-                                tVrV_cvt,
-                                tVtV_cvt[cpy_dice + (cvt_handle.index,)],
-                            )
-                            cute.arch.fence_view_async_tmem_store()
-                            cvt_handle.commit()
-                            phase_mark(7, 1 + _cvt_flat)
-                            v_token = v_raw_consumer.try_wait()
-                            cvt_token = v_ready_producer.try_acquire()
+                                tVrVS = cute.make_rmem_tensor_like(
+                                    tVsVS[cpy_dice + (None, 0)]
+                                )
+                                cute.autovec_copy(
+                                    tVsVS[cpy_dice + (None, v_handle.index)],
+                                    tVrVS,
+                                )
+                                tVrV = cute.make_rmem_tensor(
+                                    tVrV_shape, cutlass.Int8
+                                )
+                                tVrV_cvt = cute.make_rmem_tensor(
+                                    tVrV_cvt_shape, vp_dtype
+                                )
+                                # The scale partition contains zero-stride
+                                # broadcasts.  Materialize it into the compact
+                                # register shape paired with the LDSM fragment
+                                # before slicing eight-value QMUL4 vectors.
+                                tVrVS_expanded = cute.make_rmem_tensor(
+                                    tVrV_shape, sf_dtype
+                                )
+                                cute.autovec_copy(tVrVS, tVrVS_expanded)
+                                cute.copy(
+                                    thr_load_v,
+                                    tVsV[cpy_dice + (v_handle.index,)],
+                                    tVrV,
+                                )
+                                cute.arch.fence_view_async_shared()
+                                v_handle.release()
+
+                                if cutlass.const_expr(self.qmul4_skip != "conv"):
+                                    _frag_values = cute.size(tVrV_shape)
+                                    assert _frag_values % 8 == 0
+                                    _src_flat = cute.make_tensor(
+                                        tVrV.iterator,
+                                        cute.make_layout(_frag_values),
+                                    )
+                                    _sf_flat = cute.make_tensor(
+                                        tVrVS_expanded.iterator,
+                                        cute.make_layout(_frag_values),
+                                    )
+                                    _dst_flat = cute.make_tensor(
+                                        tVrV_cvt.iterator,
+                                        cute.make_layout(_frag_values),
+                                    )
+                                    for _block in cutlass.range_constexpr(
+                                        _frag_values // 8
+                                    ):
+                                        _src8 = cute.local_tile(
+                                            _src_flat, (8,), (_block,)
+                                        )
+                                        _sf8 = cute.local_tile(
+                                            _sf_flat, (8,), (_block,)
+                                        )
+                                        _dst8 = cute.local_tile(
+                                            _dst_flat, (8,), (_block,)
+                                        )
+                                        _dst8.store(
+                                            dequantize_nvfp4x8_ldsm(_src8, _sf8)
+                                        )
+                                else:
+                                    tVrV_cvt.fill(0)
+                                cute.copy(
+                                    thr_store_v,
+                                    tVrV_cvt,
+                                    tVtV_cvt[cpy_dice + (cvt_handle.index,)],
+                                )
+                                cute.arch.fence_view_async_tmem_store()
+                                cvt_handle.commit()
+                                phase_mark(7, 1 + _cvt_flat)
+                                v_token = v_raw_consumer.try_wait()
+                                cvt_token = v_ready_producer.try_acquire()
 
         ##############################
         # MMA KQ (BMM1) Dispatch
@@ -3671,6 +3728,10 @@ class GroupedQueryAttentionDecodePagedFp4:
 
             # Sequence loop
             num_loops = 2 if not tma_mask else 1
+            # A single softmax WG owns consecutive tiles. Carry the previous
+            # published maximum in registers: reloading sM while other warps
+            # atomically update it makes the rescale threshold order-dependent.
+            previous_max_lane = -Float32.inf
             for loop in cutlass.range_constexpr(num_loops):
                 is_masked_loop = loop == 1
                 for s in cutlass.range(
@@ -3767,7 +3828,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                     # 为 base 的副本,host 侧只读 base 半。mask 为加性 {0,-inf},与
                     # 折叠可交换(已在插入点之前施加)。
                     if cutlass.const_expr(self.residue_fold):
-                        assert not use_nvfp4_vp, "R1+fp4P 折叠待 R2 接线(v2 几何:v2 子模高半)"
+                        assert not use_nvfp4_vp, "native_token FP4 P/VP needs a separate residue fragment fold"
                         _nf = blk_tile_n // 2
                         _s3 = scores.reshape((_nf, 2, tiles_sm))
                         _fold = _s3[None, 0, None] + _s3[None, 1, None]
@@ -3872,20 +3933,24 @@ class GroupedQueryAttentionDecodePagedFp4:
                         phase_mark(softmax_phase, 30 + s)
                         sM_consumer_nbar.arrive_and_wait()
                         if lane_store_max:
-                            if cutlass.const_expr(use_qmul4_v_tmem):
+                            if cutlass.const_expr(
+                                use_qmul4_v_tmem and softmax_warpgroups == 1
+                            ):
                                 # TRT-style FP8-P rescale suppression.  Keep
                                 # the old normalization origin while the new
                                 # tile max is at most 8 log2 units higher.
                                 # exp2(delta) <= 256 remains below E4M3 max
                                 # 448, so numerator and denominator retain a
                                 # common scale without saturating P.
-                                old_max = sM[lane_idx]
-                                if rM_lane - old_max > Float32(8):
+                                if rM_lane - previous_max_lane > Float32(8):
                                     smem_fmax(
                                         sM.iterator + sM.layout(lane_idx),
                                         rM_lane,
                                     )
                             else:
+                                # Alternating WGs cannot use a WG-local prior
+                                # maximum. Use ordinary atomic max until a
+                                # collective suppression protocol is available.
                                 smem_fmax(
                                     sM.iterator + sM.layout(lane_idx), rM_lane
                                 )
@@ -3893,6 +3958,11 @@ class GroupedQueryAttentionDecodePagedFp4:
                         # Wait for colmax and load
                         sM_producer_nbar.arrive_and_wait()
                         colmax = sM.load()
+                        if cutlass.const_expr(
+                            use_qmul4_v_tmem and softmax_warpgroups == 1
+                        ):
+                            if lane_store_max:
+                                previous_max_lane = sM[lane_idx]
                         if cutlass.const_expr(softmax_warpgroups > 1):
                             sM_release_nbar.arrive()
 

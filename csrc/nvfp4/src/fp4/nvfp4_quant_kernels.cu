@@ -145,6 +145,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
     int32_t residueRow =
         compute_mext_r1_residue_row(rowIdx, outputRows, layoutMode);
+    int32_t baseSfRow =
+        compute_mext_r1_base_sf_row(rowIdx, outputRows, layoutMode);
+    int32_t residueSfRow =
+        compute_mext_r1_residue_sf_row(rowIdx, outputRows, layoutMode);
 
     PackedVec8 in_vec{};
     if (validRow) {
@@ -171,7 +175,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                   rowIdx, colIdx, 2 * numCols, SFout)
             : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                                  CVT_FP4_NUM_THREADS_PER_SF>(
-                  baseRow, colIdx, numCols, SFout);
+                  baseSfRow, colIdx, numCols, SFout);
 
     int64_t residueOutOffset =
         kConcatK
@@ -186,7 +190,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                   rowIdx, colIdx + colsPerRow, 2 * numCols, SFout)
             : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                                  CVT_FP4_NUM_THREADS_PER_SF>(
-                  residueRow, colIdx, numCols, SFout);
+                  residueSfRow, colIdx, numCols, SFout);
 
     out_pos = cvt_warp_fp16_to_fp4_mext_r1_fast<Type, UE8M0_SF>(
         in_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out, residue_sf_out);
@@ -217,6 +221,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
     int32_t residueRow =
         compute_mext_r1_residue_row(rowIdx, outputRows, layoutMode);
+    int32_t baseSfRow =
+        compute_mext_r1_base_sf_row(rowIdx, outputRows, layoutMode);
+    int32_t residueSfRow =
+        compute_mext_r1_residue_sf_row(rowIdx, outputRows, layoutMode);
 
     PackedVec8 lo_vec{};
     PackedVec8 hi_vec{};
@@ -234,7 +242,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     auto sf_out =
         cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                            CVT_FP4_NUM_THREADS_PER_SF>(
-            baseRow, colIdx, numCols, SFout);
+            baseSfRow, colIdx, numCols, SFout);
 
     int64_t residueOutOffset =
         residueRow * (numCols / CVT_FP4_ELTS_PER_UINT32) + colIdx * 2;
@@ -243,7 +251,7 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     auto residue_sf_out =
         cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
                                            CVT_FP4_NUM_THREADS_PER_SF>(
-            residueRow, colIdx, numCols, SFout);
+            residueSfRow, colIdx, numCols, SFout);
 
     u32x2 packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<Type, UE8M0_SF>(
         lo_vec, hi_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out,
@@ -346,6 +354,10 @@ enum class MExtR1LayoutMode : int {
   // doubled-K activation as a perfectly ordinary operand (the wrapped-K-loop
   // kernel's input; see implementation constraints).
   kConcatK = 3,
+  // Same compact data rows as kTile8, but every input 8-row chunk writes its
+  // scale factors into a separate 128-row atom. This is ResAttn's
+  // (batch, kv_head) Q-scale outer stride.
+  kAttnTile8 = 4,
 };
 
 inline bool use_pack16_for_mode(int elts_mode, int cc_major) {
@@ -369,6 +381,8 @@ inline bool use_pack16_for_mode(int elts_mode, int cc_major) {
 
 inline int normalize_mext_r1_layout_mode(int layout_mode) {
   switch (static_cast<MExtR1LayoutMode>(layout_mode)) {
+    case MExtR1LayoutMode::kAttnTile8:
+      return static_cast<int>(MExtR1LayoutMode::kAttnTile8);
     case MExtR1LayoutMode::kTile8:
       return static_cast<int>(MExtR1LayoutMode::kTile8);
     case MExtR1LayoutMode::kRowPair:
@@ -526,9 +540,13 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
   // Deriving it from input.size(0) keeps it in lockstep with that buffer
   // (which the caller also sizes from M). tile8 needs an 8-multiple row count;
   // other layouts use M directly.
+  bool tile8_layout =
+      static_cast<int>(layout_mode) ==
+          static_cast<int>(vllm::MExtR1LayoutMode::kTile8) ||
+      static_cast<int>(layout_mode) ==
+          static_cast<int>(vllm::MExtR1LayoutMode::kAttnTile8);
   int64_t output_m =
-      (static_cast<int>(layout_mode) ==
-       static_cast<int>(vllm::MExtR1LayoutMode::kTile8))
+      tile8_layout
           ? ((static_cast<int64_t>(m) + 7) / 8) * 8
           : static_cast<int64_t>(m);
 
@@ -540,6 +558,24 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
   TORCH_CHECK(output.numel() >= 2 * output_m * n / 2,
               "M-extension output tensor is too small for the derived "
               "output_m (caller buffer undersized for the padded row count).");
+  int64_t sf_m_tiles;
+  int64_t sf_k_tiles;
+  if (static_cast<int>(layout_mode) ==
+      static_cast<int>(vllm::MExtR1LayoutMode::kConcatK)) {
+    sf_m_tiles = (output_m + 127) / 128;
+    sf_k_tiles = (2 * static_cast<int64_t>(n) + 63) / 64;
+  } else if (static_cast<int>(layout_mode) ==
+             static_cast<int>(vllm::MExtR1LayoutMode::kAttnTile8)) {
+    sf_m_tiles = output_m / 8;
+    sf_k_tiles = (static_cast<int64_t>(n) + 63) / 64;
+  } else {
+    sf_m_tiles = (2 * output_m + 127) / 128;
+    sf_k_tiles = (static_cast<int64_t>(n) + 63) / 64;
+  }
+  TORCH_CHECK(output_sf.numel() >= sf_m_tiles * sf_k_tiles * 512,
+              "M-extension output scale tensor is too small for layout mode ",
+              layout_mode, ": need ", sf_m_tiles * sf_k_tiles * 512,
+              " bytes, got ", output_sf.numel());
 
   int multiProcessorCount =
       get_device_attribute(cudaDevAttrMultiProcessorCount, -1);

@@ -27,6 +27,7 @@ from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir import ir
 from cutlass._mlir.dialects import arith, llvm, vector
 from cutlass.cute.typing import Float32, Int8, Int32
+from .native_compile import native_qmul4_enabled
 
 
 if (
@@ -89,7 +90,7 @@ def mul_nvfp4x8_e4m3_scale(
     )
     scale_i32 = arith.extui(Int32.mlir_type, scale_i8, loc=loc, ip=ip)
 
-    if cutlass_dsl.target_version(min_version="13.4"):
+    if cutlass_dsl.target_version(min_version="13.4") or native_qmul4_enabled():
         # Native public PTX ISA 9.4 path.  The scale byte is replicated four
         # times because the packed multiply has one E4M3 scale per lane while
         # NVFP4 has one scale for the whole 16-value block.
@@ -195,30 +196,13 @@ def mul_nvfp4x4_ldsm_e4m3_scales(
     src_i32 = llvm.bitcast(Int32.mlir_type, src_vec4, loc=loc, ip=ip)
     scales_i32 = llvm.bitcast(Int32.mlir_type, scales_vec4, loc=loc, ip=ip)
 
-    if cutlass_dsl.target_version(min_version="13.4"):
-        # Public PTX exposes packed QMUL4 but not the SASS-only N6420 source
-        # selector.  Pack the four even nibbles into a legal f4x4 operand;
-        # the current DSL-4.6 path below is the exact one-instruction TRT
-        # form, while this branch is the forward-compatible correctness path.
+    if cutlass_dsl.target_version(min_version="13.4") or native_qmul4_enabled():
+        # e2m1p4x4 is byte-padded FP4, exactly LDSM.U4's N6420 layout.
+        # Unlike compact e2m1x4, it consumes a b32 without nibble repacking.
         result_i32 = llvm.inline_asm(
             T.i32(),
             [src_i32, scales_i32],
-            """{\n\t
-                .reg .b16 f4, pad;\n\t
-                .reg .b32 p0, p1, p2, p3, packed;\n\t
-                and.b32 p0, $1, 0x0000000f;\n\t
-                and.b32 p1, $1, 0x00000f00;\n\t
-                and.b32 p2, $1, 0x000f0000;\n\t
-                and.b32 p3, $1, 0x0f000000;\n\t
-                shr.u32 p1, p1, 4;\n\t
-                shr.u32 p2, p2, 8;\n\t
-                shr.u32 p3, p3, 12;\n\t
-                or.b32 packed, p0, p1;\n\t
-                or.b32 packed, packed, p2;\n\t
-                or.b32 packed, packed, p3;\n\t
-                mov.b32 {f4, pad}, packed;\n\t
-                mul.rn.e4m3x4.e2m1x4.e4m3x4.satfinite $0, f4, $2;\n\t
-            }""",
+            "mul.rn.satfinite.e4m3x4.e2m1p4x4.e4m3x4 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
