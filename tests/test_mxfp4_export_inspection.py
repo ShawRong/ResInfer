@@ -7,7 +7,10 @@ pytest.importorskip("safetensors")
 from safetensors.torch import save_file
 from quant.mxfp4_checkpoint import FORMAT
 from export.stages.inspect_quant_export import InspectQuantExportStage
-from quant.modelopt_integration.mxfp4_export import _validate_modelopt_export
+from quant.modelopt_integration.mxfp4_export import (
+    _collect_preserved_state,
+    _validate_modelopt_export,
+)
 
 
 @pytest.mark.parametrize("damage", [None,"width","nan_scale","index","unsharded"])
@@ -68,3 +71,38 @@ def test_modelopt_export_bytes_are_not_repacked(tmp_path,indexed):
         assert prefix+".input_quantizer._salient_indices" not in index["weight_map"]
     else:
         assert not index_path.exists()
+
+
+def test_unsharded_source_checkpoint_preservation(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "config.json").write_text("{}")
+    tensors = {
+        "model.layers.0.self_attn.q_proj.weight": torch.ones(128, 256),
+        "model.embed_tokens.weight": torch.arange(512, dtype=torch.float32).reshape(2, 256),
+        "mtp.proj.weight": torch.full((128, 256), 2.0),
+    }
+    save_file(tensors, source / "model.safetensors")
+
+    model = torch.nn.Module()
+    model.register_parameter(
+        "placeholder", torch.nn.Parameter(torch.zeros(1)),
+    )
+    model.state_dict = lambda: {
+        "model.layers.0.self_attn.q_proj.weight": tensors[
+            "model.layers.0.self_attn.q_proj.weight"
+        ],
+        "model.embed_tokens.weight": tensors["model.embed_tokens.weight"],
+    }
+    extra, hashes, record = _collect_preserved_state(
+        model,
+        source,
+        {"model.layers.0.self_attn.q_proj": {}},
+        ("mtp.",),
+    )
+    assert set(extra) == {"mtp.proj.weight"}
+    assert set(hashes) == {"model.embed_tokens.weight", "mtp.proj.weight"}
+    assert record["weight_inventory"] == {
+        "kind": "single_safetensors",
+        "filename": "model.safetensors",
+    }

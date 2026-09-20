@@ -195,8 +195,31 @@ def _collect_preserved_state(model, source_checkpoint, hf_layers,
     from safetensors import safe_open
 
     source = Path(source_checkpoint).resolve()
+    if not source.is_dir():
+        raise ValueError(f"source checkpoint is not a directory: {source}")
     source_index = source / "model.safetensors.index.json"
-    source_map = json.loads(source_index.read_text())["weight_map"]
+    if source_index.is_file():
+        index = json.loads(source_index.read_text())
+        source_map = index.get("weight_map")
+        if not isinstance(source_map, dict) or not source_map:
+            raise ValueError(f"invalid source safetensors index: {source_index}")
+        inventory = {
+            "kind": "sharded_safetensors",
+            "index_sha256": _file_hash(source_index),
+        }
+    else:
+        source_file = source / "model.safetensors"
+        if not source_file.is_file():
+            raise ValueError(
+                "source checkpoint must contain model.safetensors or "
+                "model.safetensors.index.json"
+            )
+        with safe_open(source_file, framework="pt") as handle:
+            source_map = {name: source_file.name for name in handle.keys()}
+        inventory = {"kind": "single_safetensors", "filename": source_file.name}
+    if any(not str(filename).endswith(".safetensors")
+           for filename in source_map.values()):
+        raise ValueError("source checkpoint index must reference safetensors shards")
     loaded_keys = set(model.state_dict())
     excluded = set(source_map) - loaded_keys
     if any(not name.startswith(tuple(preserve_unloaded_prefixes)) for name in excluded):
@@ -219,7 +242,7 @@ def _collect_preserved_state(model, source_checkpoint, hf_layers,
         raise ValueError("source preservation inventory mismatch")
     record = {
         "checkpoint_name": source.name,
-        "index_sha256": _file_hash(source_index),
+        "weight_inventory": inventory,
         "config_sha256": _file_hash(source / "config.json"),
         "source_tensor_count": len(source_map),
         "preserved_unloaded_tensors": sorted(excluded),
