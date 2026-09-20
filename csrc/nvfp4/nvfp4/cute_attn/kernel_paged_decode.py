@@ -193,6 +193,16 @@ class GroupedQueryAttentionDecodePagedFp4:
         # 16-float warp-local carrier, then issues four 128-bit shared loads.
         # Arithmetic, TMEM ownership, and the final sL reduction stay fixed.
         self.smem_correction_broadcast = smem_correction_broadcast
+        # TRT-LLM's generation Q8 tactic keeps the skinny head dimension on
+        # MMA-N but changes the FP8 P operand to K-major. SM100 permits N=8
+        # for a K-major B operand; the MN-major form requires N>=16. Limit
+        # this specialization to the compact GQA4 residue geometry first.
+        self.swap_ab_for_gen = (
+            v_mode == "qmul4_tmem"
+            and residue_fold
+            and grouped_head_tile == 8
+            and prediction_tile == 1
+        )
         self.qmul4_interleave = qmul4_interleave
         if qmul4_interleave not in (0, 1, 2, 4, 8):
             raise ValueError("qmul4_interleave must be 0, 1, 2, 4 or 8")
@@ -528,8 +538,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         mma_tile_m = 128
         # KQ 的收缩深度按 head_dim 封顶(fp4 时 128*8/4=256 会超出 D=128)
         mma_tile_k = min(128 * 8 // mma_dtype.width, self.headdim)
-        # N-major 8b B in smem requires N multiple of 16
-        min_mma_tile_n = 16 if mma_dtype.width == 8 else 8
+        # N-major 8b B in SMEM requires N multiple of 16. The generation
+        # swap tactic stores P K-major instead, for which SM100 supports N8.
+        min_mma_tile_n = (
+            8 if self.swap_ab_for_gen or mma_dtype.width < 8 else 16
+        )
         blk_tile_n = blk_tile_h * blk_tile_p  # linearized tiler
         mma_tile_n = max(min_mma_tile_n, blk_tile_n)
         mma_tile_mnk = (mma_tile_m, mma_tile_n, mma_tile_k)
@@ -635,7 +648,11 @@ class GroupedQueryAttentionDecodePagedFp4:
                 mma_dtype,
                 mma_dtype,
                 OperandMajorMode.K,   # V:token 最内(收缩轴)
-                OperandMajorMode.MN,  # P
+                (
+                    OperandMajorMode.K
+                    if self.swap_ab_for_gen
+                    else OperandMajorMode.MN
+                ),  # P: generation Q8 uses K-major to make N8 legal
                 acc_dtype,
                 tcgen05.CtaGroup.ONE,
                 mma_tile_mnk[:2],
@@ -809,6 +826,13 @@ class GroupedQueryAttentionDecodePagedFp4:
             + kv_pipe_count * pipe_stage_bits
         )
         kv_stages = remaining_bits // kv_pair_bits
+        if cutlass.const_expr(self.swap_ab_for_gen):
+            
+            
+            
+            
+            
+            kv_stages = min(kv_stages, 7)
         if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
             # trace 期的 Python 值,免 GPU。qmul4_d 把每 stage 从
             # (K + ready-V) 变成 (K + raw-V + ready-V + V-SF),stage 数会被
@@ -2518,7 +2542,13 @@ class GroupedQueryAttentionDecodePagedFp4:
             # 页表直读(v0):每 tile 每子页一次 4B 均匀 ld.global(L2 驻留),
             # producer 流水线的超前量吸收其延迟;smem 环形预取留 M2.5。
             # 越界逻辑页 → phys=-1 → TMA OOB 填零(尾部掩码另行兜底)。
-            prefetch_tiles = prefetch_iters * kv_splits
+            # The compact generation-Q8 tactic has a dedicated conversion WG.
+            # Starting raw-V two tiles behind K leaves that WG waiting on its
+            # first TMA stage and becomes visible across multiple grid waves.
+            # Keep the KQ/softmax prefetch schedule unchanged, but interleave
+            # K0/V0 TMA issue from the first producer iteration.
+            v_prefetch_iters = 0 if self.swap_ab_for_gen else prefetch_iters
+            prefetch_tiles = v_prefetch_iters * kv_splits
             kv_token = True  # Producer always acquires first
             k_token_tma = True
             v_raw_token_tma = True
