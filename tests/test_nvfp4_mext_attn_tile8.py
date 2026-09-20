@@ -96,6 +96,54 @@ class MExtAttnTile8Test(unittest.TestCase):
             torch.equal(got_sf.view(torch.uint8), ref_sf.view(torch.uint8))
         )
 
+    @unittest.skipUnless(torch is not None and torch.cuda.is_available(), "requires CUDA")
+    def test_grouped_residue_q_pads_each_gqa_group_to_q16(self) -> None:
+        import nvfp4
+        from nvfp4.cute_attn import host
+
+        if not hasattr(torch.ops.nvfp4, "nvfp4_quantize_q_residue"):
+            self.skipTest("nvfp4 extension lacks grouped residue-Q producer")
+
+        torch.manual_seed(20260920)
+        batch, h_kv, d = 2, 3, 128
+        for g in (4, 6, 8):
+            with self.subTest(gqa=g):
+                q = torch.randn(
+                    batch, h_kv * g, d,
+                    dtype=torch.bfloat16, device="cuda",
+                )
+                got = host._quantize_q_residue_cuda(q, h_kv)
+                self.assertIsNotNone(got)
+                assert got is not None
+                got_data, got_sf = got
+
+                # The established MExt GQA8 layout is the byte reference:
+                # pad each logical group independently, then quantize it.
+                padded = torch.zeros(
+                    batch, h_kv, 8, d,
+                    dtype=torch.bfloat16, device="cuda",
+                )
+                padded[:, :, :g] = q.view(batch, h_kv, g, d)
+                ref_data, ref_sf = nvfp4.scaled_fp4_quant_mext_r1(
+                    padded.reshape(batch * h_kv * 8, d),
+                    torch.ones(1, dtype=torch.float32, device="cuda"),
+                    elts_mode=16,
+                    layout_mode="attn_tile8",
+                )
+                torch.cuda.synchronize()
+
+                self.assertTrue(
+                    torch.equal(
+                        got_data.reshape(batch * h_kv * 16, d // 2),
+                        ref_data,
+                    )
+                )
+                self.assertTrue(
+                    torch.equal(
+                        got_sf.view(torch.uint8), ref_sf.view(torch.uint8)
+                    )
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

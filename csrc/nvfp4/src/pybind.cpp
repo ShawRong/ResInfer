@@ -35,6 +35,9 @@ void nvfp4_quantize_q_and_zero(torch::Tensor const& q,
                                torch::Tensor& q_pack,
                                torch::Tensor& q_sf,
                                torch::Tensor& out);
+void nvfp4_quantize_q_residue(torch::Tensor const& q,
+                              torch::Tensor& q_pack,
+                              torch::Tensor& q_sf);
 void nvfp4_quantize_context_q(torch::Tensor const& q_source,
                               torch::Tensor const& query_indptr,
                               torch::Tensor& q_pack,
@@ -83,6 +86,9 @@ TORCH_LIBRARY(nvfp4, m) {
       "nvfp4_quantize_q_and_zero(Tensor q, Tensor(a!) q_pack, "
       "Tensor(b!) q_sf, Tensor(c!) out) -> ()");
   m.def(
+      "nvfp4_quantize_q_residue(Tensor q, Tensor(a!) q_pack, "
+      "Tensor(b!) q_sf) -> ()");
+  m.def(
       "nvfp4_quantize_context_q(Tensor q_source, Tensor query_indptr, "
       "Tensor(a!) q_pack, Tensor(b!) q_sf) -> ()");
 }
@@ -92,6 +98,7 @@ TORCH_LIBRARY_IMPL(nvfp4, CUDA, m) {
   m.impl("scaled_fp4_quant", &scaled_fp4_quant);
   m.impl("nvfp4_quantize_q", &nvfp4_quantize_q);
   m.impl("nvfp4_quantize_q_and_zero", &nvfp4_quantize_q_and_zero);
+  m.impl("nvfp4_quantize_q_residue", &nvfp4_quantize_q_residue);
   m.impl("nvfp4_quantize_context_q", &nvfp4_quantize_context_q);
   m.impl("scaled_fp4_quant_pack8_r0125_no_swap",
          &scaled_fp4_quant_pack8_r0125_no_swap);

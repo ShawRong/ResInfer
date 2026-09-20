@@ -136,7 +136,7 @@ except Exception as _e:  # pragma: no cover - environment without nvfp4 pkg
 
 _DECODE_KERNEL_HOST = None
 _DECODE_KERNEL_CHECKED = False
-# QK residue is part of the normal GQA=8 ResAttn decode implementation, not a
+# QK residue is part of the normal GQA4/6/8 ResAttn decode implementation, not a
 # second feature to enable after selecting the backend.  Keep only a negative
 # escape hatch so differential debugging can reproduce the base-only internal
 # kernel control.  That control is not the external TRT-LLM decode baseline.
@@ -147,7 +147,9 @@ _QK_RESIDUE = os.environ.get(
 
 def _qk_residue_for_geometry(num_qo_heads: int, num_kv_heads: int) -> bool:
     """Use the default residue path exactly where its free Q16 mapping exists."""
-    return _QK_RESIDUE and num_qo_heads == 8 * num_kv_heads
+    if num_kv_heads <= 0 or num_qo_heads % num_kv_heads:
+        return False
+    return _QK_RESIDUE and num_qo_heads // num_kv_heads in (4, 6, 8)
 
 #: trtllm-gen context scratch, ONE buffer for the whole process.
 #:

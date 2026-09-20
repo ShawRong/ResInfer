@@ -109,7 +109,7 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_ATTN_DISABLE_QK_RESIDUE": (
         "one",
         None,
-        "debug ablation: disable the default GQA=8 decode QK residue and "
+        "debug ablation: disable the default GQA4/6/8 decode QK residue and "
         "run the base-only ResAttn kernel; does not affect vendor "
         "context/prefill",
     ),
