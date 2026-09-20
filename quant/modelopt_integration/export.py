@@ -55,6 +55,11 @@ def export_residue_checkpoint(
     Returns:
         Path to exported checkpoint directory
     """
+    from .mxfp4_export import has_mxfp4_weights, export_mxfp4_checkpoint
+    if has_mxfp4_weights(model):
+        export_kwargs.pop("save_modelopt_state", None)
+        return export_mxfp4_checkpoint(model, export_dir, dtype=dtype, **export_kwargs)
+
     from modelopt.torch.export import export_hf_checkpoint
 
     export_path = Path(export_dir)

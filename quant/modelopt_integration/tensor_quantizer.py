@@ -115,8 +115,13 @@ class ResidueTensorQuantizer(TensorQuantizer):
             # NVFP4 default quantization
             quantizer = NVFP4QTensor
 
+        if quantizer is None:
+            raise ValueError("unsupported residue quantizer format")
+
         # Get amax: use self.amax if available (static), otherwise compute from input (dynamic)
-        if hasattr(self, "amax") and self.amax is not None:
+        if quantizer is MXFP4QTensor:
+            weight_scaling_factor_2 = None
+        elif hasattr(self, "amax") and self.amax is not None:
             # Static quantizer - use pre-computed amax
             weight_scaling_factor_2 = self.amax.float() / (448.0 * 6.0)
         else:

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import torch
-from modelopt.torch.quantization.qtensor import BaseQuantizedTensor
+from modelopt.torch.quantization.qtensor import BaseQuantizedTensor, MXFP4QTensor
 
 def _select_salient(
     tensor: torch.Tensor,
@@ -49,21 +49,24 @@ def append_quant_residual_channels(
         print(f"[append_quant_residual_channels] Output last dim will be: {tensor.shape[-1] + salient_indices.numel()}")
 
     # Quantize and dequantize to get base on last dimension
-    base_qtensor, base_scale, base_double_scale = quantizer.quantize(
-        tensor,
-        block_size,
-        weight_scaling_factor,
-        weight_scaling_factor_2,
-        keep_high_precision=False,
-        try_tensorrt=True,
-    )
-
-    base_dense = base_qtensor.dequantize(
-        scale=base_scale,
-        double_scale=base_double_scale,
-        block_sizes={-1: block_size},
-        fast=True,
-    )
+    if quantizer is MXFP4QTensor:
+        if block_size != 32:
+            raise ValueError("MXFP4 residue requires block size 32")
+        # Activation QDQ uses RNE; MXFP4QTensor is the weight exporter and
+        # uses ties toward zero in ModelOpt 0.45. Do not use it for A residue.
+        from modelopt.torch.quantization.tensor_quant import dynamic_block_quant
+        base_dense = dynamic_block_quant(tensor.float().contiguous(), block_size,
+                                         None, None, (2, 1), (8, 0))
+        base_qtensor = base_scale = base_double_scale = None
+    else:
+        base_qtensor, base_scale, base_double_scale = quantizer.quantize(
+            tensor, block_size, weight_scaling_factor, weight_scaling_factor_2,
+            keep_high_precision=False, try_tensorrt=True,
+        )
+        base_dense = base_qtensor.dequantize(
+            scale=base_scale, double_scale=base_double_scale,
+            block_sizes={-1: block_size}, fast=True,
+        )
 
     residue_source = tensor - base_dense
     residue = _select_salient(residue_source, salient_indices)

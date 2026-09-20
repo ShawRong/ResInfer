@@ -112,9 +112,10 @@ def build_residue_cfg(
     CUSTOM_CFG = None
     if fmt == "nvfp4":
         CUSTOM_CFG = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG )
-    else:
-        #TODO: kernel support and integration of MXFP4 will be done later
+    elif fmt == "mxfp4":
         CUSTOM_CFG = copy.deepcopy(mtq.MXFP4_DEFAULT_CFG)
+    else:
+        raise ValueError(f"Unsupported residue format: {fmt}")
     _disable_lm_head(CUSTOM_CFG)
     apply_quant_scope(CUSTOM_CFG, quant_scope)
 
