@@ -70,6 +70,7 @@ def _compile_fold_gemm(
     splitk_ablate: int = 0,
     dsmem_split: bool = False,
     strided_weight: bool = False,
+    fp4_format: str = "nvfp4",
 ):
     """Compile a fold-GEMM kernel variant:
 
@@ -77,19 +78,20 @@ def _compile_fold_gemm(
     - "fold_tma_mext":    M-ext fold (A4), compact-smem alias + TMA store
     - "fold_mext_direct": M-ext fold (A6), pi alias + 128-bit direct stores
     - "plain_tma":        stock kernel/epilogue baseline (no fold)
+    - "plain_mn":         SM100 plain GEMM, activation on M, row-major output
 
     (The former "fold_direct" tiny-m mode was removed: dominated at every
     m_tok after the transposed-staging fold_tma optimization -- see
     fold_vs_plain_latency_results.md.)
     """
     assert mode in ("fold_tma", "plain_tma", "fold_tma_mext",
-                    "fold_mext_direct", "kloop_tma"), mode
+                    "fold_mext_direct", "kloop_tma", "plain_mn"), mode
     assert kernel_arch in ("sm100", "sm103"), kernel_arch
     # sm100 kernel supports the TMA fold paths (N-ext + M-ext), plain, and
     # the wrapped-K-loop.
     assert kernel_arch == "sm103" or mode in (
         "fold_tma", "fold_tma_mext", "plain_tma", "fold_mext_direct",
-        "kloop_tma")
+        "kloop_tma", "plain_mn")
     # M-ext (fold_on_m) is implemented on the sm100 kernel only for now.
     assert mode not in ("fold_tma_mext", "fold_mext_direct") or kernel_arch == "sm100", (
         "M-ext modes are sm100-only")
@@ -103,14 +105,19 @@ def _compile_fold_gemm(
     assert kernel_arch == "sm100" or ab_stage_override is None, (
         "ab_stage_override is sm100-only")
     # dual_alpha only makes sense for fold modes (plain has no (base,res) pairs).
-    assert not dual_alpha or mode != "plain_tma", "dual_alpha requires a fold mode"
+    assert not dual_alpha or mode not in ("plain_tma", "plain_mn"), "dual_alpha requires a fold mode"
     # StreamK-lite: N-ext fold on sm100 only (r2g owner/follower reduction).
     assert split_k == 1 or (kernel_arch == "sm100" and mode == "fold_tma"), (
         "split_k>1 requires sm100 fold_tma")
     # The owner defers alpha to after the K-reduction (bit-exactness); the
     # dual-alpha fold is a different linear form -- combine later if needed.
     assert not (split_k > 1 and dual_alpha), "split_k>1 is single-alpha for now"
-    key = (mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
+    if fp4_format not in ("nvfp4", "mxfp4"):
+        raise ValueError(f"unknown FP4 format: {fp4_format}")
+    if mode == "plain_mn" and kernel_arch != "sm100":
+        raise ValueError("plain_mn is currently SM100-only")
+    sf_vec_size = 32 if fp4_format == "mxfp4" else SF_VEC_SIZE
+    key = (fp4_format, mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
            ab_stage_override, dual_alpha, pi_via_layout, split_k,
            splitk_ablate, dsmem_split, strided_weight)
     if key in _KERNEL_CACHE:
@@ -127,7 +134,7 @@ def _compile_fold_gemm(
     if kernel_arch == "sm100":
         # sm100 kernel always TMA-stores; no use_tma_store knob.
         gemm = kernel_cls(
-            sf_vec_size=SF_VEC_SIZE,
+            sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             enable_pdl=True,
@@ -145,7 +152,7 @@ def _compile_fold_gemm(
         )
     else:
         gemm = kernel_cls(
-            sf_vec_size=SF_VEC_SIZE,
+            sf_vec_size=sf_vec_size,
             mma_tiler_mn=mma_tiler_mn,
             cluster_shape_mn=cluster_shape_mn,
             use_tma_store=True,
@@ -167,7 +174,7 @@ def _compile_fold_gemm(
     # constraint ties the output's n_w dim to the weight operand, not the act.
     _a_rows, _b_rows = (
         (sym_n, sym_m)
-        if mode in ("fold_tma_mext", "fold_mext_direct", "kloop_tma")
+        if mode in ("fold_tma_mext", "fold_mext_direct", "kloop_tma", "plain_mn")
         else (sym_m, sym_n)
     )
     # `strided_weight` supports an ext-K residue layer WITHOUT materialising a
@@ -189,7 +196,7 @@ def _compile_fold_gemm(
     #
     # A compact tensor keeps its own cache entry (strided_weight=False), so the
     # validated contiguous path compiles to exactly the same binary as before.
-    _w_is_a = mode not in ("fold_tma_mext", "fold_mext_direct", "kloop_tma")
+    _w_is_a = mode not in ("fold_tma_mext", "fold_mext_direct", "kloop_tma", "plain_mn")
 
     def _operand(rows, is_weight):
         if strided_weight and is_weight:
@@ -211,7 +218,7 @@ def _compile_fold_gemm(
             cutlass.Uint8, (_a_rows, cute.sym_int()), stride_order=(1, 0),
             assumed_align=32,
         )
-    if mode == "kloop_tma":
+    if mode in ("kloop_tma", "plain_mn"):
         # Plain epilogue, C = [act_rows(m_tok), n_w] row-major -- no fold,
         # no transpose: the operand swap already put tokens on GEMM-M.
         c_fake = cute.runtime.make_fake_compact_tensor(
@@ -232,9 +239,10 @@ def _compile_fold_gemm(
             c_cutlass_dtype, (sym_m, sym_n), stride_order=(1, 0),
             assumed_align=16,
         )
-    a_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
-    b_sf_ptr = make_ptr(cutlass.Float8E4M3FN, 16, cute.AddressSpace.gmem, 16)
-    alpha_fake = cute.runtime.make_fake_compact_tensor(
+    sf_dtype = cutlass.Float8E8M0FNU if fp4_format == "mxfp4" else cutlass.Float8E4M3FN
+    a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+    alpha_fake = None if fp4_format == "mxfp4" and kernel_arch == "sm100" else cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (2,) if dual_alpha else (1,), assumed_align=4
     )
     max_active_clusters = get_max_active_clusters(
@@ -338,6 +346,7 @@ def mext_fold_gemm_sm103(
     split_k: int = 1,
     splitk_ablate: int = 0,
     dsmem_split: bool = False,
+    fp4_format: str = "nvfp4",
 ) -> torch.Tensor:
     """Run the fold GEMM. Returns D[m_tok, n_w].
 
@@ -414,7 +423,10 @@ def mext_fold_gemm_sm103(
     # Dual-alpha hot path: pass alpha as a PRE-COMBINED (2,) f32 tensor
     # ([alpha_base, alpha_res]) -- zero per-call allocations. The alpha_res
     # convenience arg concatenates per call (extra kernel; init-time use only).
-    _dual = alpha_res is not None or alpha.numel() == 2
+    no_alpha = fp4_format == "mxfp4" and kernel_arch == "sm100"
+    if no_alpha and alpha_res is not None:
+        raise ValueError("MXFP4 has no global residue scale")
+    _dual = not no_alpha and (alpha_res is not None or alpha.numel() == 2)
 
     compiled = _compile_fold_gemm(
         mma_tiler_mn, cluster_shape_mn, out_dtype,
@@ -426,9 +438,12 @@ def mext_fold_gemm_sm103(
         dsmem_split=dsmem_split,
         dual_alpha=_dual,
         strided_weight=_strided_w,
+        fp4_format=fp4_format,
     )
 
-    if alpha_res is not None:
+    if no_alpha:
+        alpha_t = None
+    elif alpha_res is not None:
         alpha_t = torch.cat(
             [alpha.reshape(1), alpha_res.reshape(1)]).to(torch.float32)
     elif _dual:
@@ -437,7 +452,7 @@ def mext_fold_gemm_sm103(
         alpha_t = alpha.reshape(1).to(torch.float32)
     sf_m = _ceil_div(n_w, 128)   # weight scale-factor tiles
     sf_n = _ceil_div(m2, 128)    # activation scale-factor tiles
-    sf_k = _ceil_div(k, SF_VEC_SIZE * 4)
+    sf_k = _ceil_div(k, (32 if fp4_format == "mxfp4" else SF_VEC_SIZE) * 4)
 
     if store_mode in ("tma_mext", "direct_mext"):
         # direct_mext (A6) additionally requires the WEIGHT rows pre-permuted
