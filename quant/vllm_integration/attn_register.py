@@ -6,7 +6,9 @@ import inspect
 import os
 
 _INSTALLED_ATTR = "_residue_res_attn_registered"
-_BACKEND_CLASS_PATH = "quant.vllm_integration.attn_backend.ResAttnBackend"
+_BACKEND_CLASS_PATH = (
+    "quant.vllm_integration.attn_backend_direct_output.ResAttnDirectOutputBackend"
+)
 
 
 def _registry_shape_ok(reg) -> bool:
@@ -55,7 +57,7 @@ def _registry_shape_ok(reg) -> bool:
 
 
 def install(force: bool = False) -> bool:
-    """Register ResAttnBackend on AttentionBackendEnum.CUSTOM.
+    """Register the phase-separated ResAttn backend on CUSTOM.
 
     Idempotent; returns True iff the backend is (now) registered. Gated on
     ``RESIDUE_ATTN=1`` unless ``force=True``. Any structural mismatch refuses
@@ -99,10 +101,12 @@ def install(force: bool = False) -> bool:
     # subclasses have drifted, fail now with a real traceback message instead
     # of at first attention call inside the engine.
     try:
-        from quant.vllm_integration.attn_backend import ResAttnBackend
+        from quant.vllm_integration.attn_backend_direct_output import (
+            ResAttnDirectOutputBackend,
+        )
         from vllm.v1.attention.backend import AttentionBackend
 
-        assert issubclass(ResAttnBackend, AttentionBackend)
+        assert issubclass(ResAttnDirectOutputBackend, AttentionBackend)
     except Exception as e:
         print(
             f"[residue] ResAttn register: backend class failed to import/"
@@ -120,7 +124,7 @@ def install(force: bool = False) -> bool:
         "[residue] ResAttn backend REGISTERED on AttentionBackendEnum.CUSTOM "
         f"({_BACKEND_CLASS_PATH}). Select it with --attention-backend CUSTOM "
         "--kv-cache-dtype nvfp4 --block-size 128. Decode runs the fp4 kernel; "
-        "prefill goes through the v0 bridge (correct, not fast).",
+        "prefill and mixed steps use stock FlashInfer/TRT.",
         flush=True,
     )
     return True

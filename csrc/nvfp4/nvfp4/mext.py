@@ -25,6 +25,11 @@ _MEXT_R1_LAYOUT_TILE8 = 2
 # wrapped-K-loop GEMM's activation operand; a downstream GEMM cannot tell it
 # from a stock quantization of a 2K-wide input.
 _MEXT_R1_LAYOUT_CONCAT_K = 3
+# Attention tile8 keeps the same packed-data row order as tile8, but gives
+# every logical 8-row GQA group its own 128-row SF atom. ResAttn addresses Q
+# scales with (batch, kv_head) as an outer mode, so compactly sharing one atom
+# across groups would make the data bytes reusable but not their descriptor.
+_MEXT_R1_LAYOUT_ATTN_TILE8 = 4
 
 
 def _resolve_mext_r1_elts_mode(elts_mode=None) -> int:
@@ -70,11 +75,18 @@ def _resolve_mext_r1_layout_mode(layout_mode=None) -> int:
             return _MEXT_R1_LAYOUT_ROW_PAIR
         if normalized in {"tile8", "tile_8", "tile8_pair", "tile8_row_pair"}:
             return _MEXT_R1_LAYOUT_TILE8
+        if normalized in {
+            "attn_tile8",
+            "attention_tile8",
+            "qk_tile8",
+            "gqa_tile8",
+        }:
+            return _MEXT_R1_LAYOUT_ATTN_TILE8
         if normalized in {"concat_k", "kext", "k_concat", "kloop"}:
             return _MEXT_R1_LAYOUT_CONCAT_K
         raise ValueError(
             f"Unsupported mext_r1 layout_mode '{layout_mode}'. "
-            "Expected one of: concat, row_pair, tile8, concat_k."
+            "Expected one of: concat, row_pair, tile8, attn_tile8, concat_k."
         )
 
     if layout_mode in (
@@ -82,12 +94,13 @@ def _resolve_mext_r1_layout_mode(layout_mode=None) -> int:
         _MEXT_R1_LAYOUT_ROW_PAIR,
         _MEXT_R1_LAYOUT_TILE8,
         _MEXT_R1_LAYOUT_CONCAT_K,
+        _MEXT_R1_LAYOUT_ATTN_TILE8,
     ):
         return int(layout_mode)
 
     raise ValueError(
         f"Unsupported mext_r1 layout_mode {layout_mode!r}. "
-        "Expected one of: concat, row_pair, tile8, concat_k."
+        "Expected one of: concat, row_pair, tile8, attn_tile8, concat_k."
     )
 
 
@@ -108,16 +121,22 @@ def scaled_fp4_quant_mext_r1(
         raise ValueError(f"scaled_fp4_quant_mext_r1 requires K multiple of 16, got {k}")
 
     if m_pad_multiple is None:
-        if resolved_layout_mode == _MEXT_R1_LAYOUT_TILE8 and m % 8 != 0:
+        if resolved_layout_mode in (
+            _MEXT_R1_LAYOUT_TILE8,
+            _MEXT_R1_LAYOUT_ATTN_TILE8,
+        ) and m % 8 != 0:
             raise ValueError(
-                "layout_mode='tile8' requires M to be divisible by 8, "
+                "tile8 layouts require M to be divisible by 8, "
                 "or pass m_pad_multiple=8 to request padded row+8 output."
             )
         output_m = m
     else:
-        if resolved_layout_mode != _MEXT_R1_LAYOUT_TILE8:
+        if resolved_layout_mode not in (
+            _MEXT_R1_LAYOUT_TILE8,
+            _MEXT_R1_LAYOUT_ATTN_TILE8,
+        ):
             raise ValueError(
-                "m_pad_multiple is currently supported only with layout_mode='tile8'"
+                "m_pad_multiple is supported only with tile8 layouts"
             )
         m_pad_multiple = int(m_pad_multiple)
         if m_pad_multiple <= 0:
@@ -134,13 +153,20 @@ def scaled_fp4_quant_mext_r1(
         # output geometry, not the row-doubled one.
         num_m_tiles = (output_m + 127) // 128
         num_k_tiles = (2 * k + 63) // 64
+    elif resolved_layout_mode == _MEXT_R1_LAYOUT_ATTN_TILE8:
+        # One 128-row SF atom per logical 8-row GQA group. Data remains
+        # compact at 16 output rows per group; only the SF outer stride is
+        # attention-specific.
+        num_m_tiles = output_m // 8
+        num_k_tiles = (k + 63) // 64
     else:
         num_m_tiles = (2 * output_m + 127) // 128
         num_k_tiles = (k + 63) // 64
-    output_scale = torch.empty(
-        num_m_tiles * num_k_tiles * 512,
-        dtype=torch.uint8,
-        device=input_tensor.device,
+    scale_shape = (num_m_tiles * num_k_tiles * 512,)
+    output_scale = (
+        torch.zeros(*scale_shape, dtype=torch.uint8, device=input_tensor.device)
+        if resolved_layout_mode == _MEXT_R1_LAYOUT_ATTN_TILE8
+        else torch.empty(*scale_shape, dtype=torch.uint8, device=input_tensor.device)
     )
 
     # The module-level load above is SOFT (required=False): a missing or

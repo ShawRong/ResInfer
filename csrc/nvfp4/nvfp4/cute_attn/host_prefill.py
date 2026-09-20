@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'prefill kernel 的 host 入口。'
+'DEPRECATED FOR PRODUCTION: historical in-house prefill host.'
 
 from __future__ import annotations
 

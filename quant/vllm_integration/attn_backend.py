@@ -16,6 +16,10 @@ import triton
 import triton.language as tl
 
 from vllm.config import get_current_vllm_config_or_none
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    QuantKey,
+    kNvfp4Dynamic,
+)
 from vllm.v1.utils import CpuGpuBuffer
 from vllm.utils.torch_utils import nvfp4_kv_cache_full_dim
 
@@ -132,6 +136,18 @@ except Exception as _e:  # pragma: no cover - environment without nvfp4 pkg
 
 _DECODE_KERNEL_HOST = None
 _DECODE_KERNEL_CHECKED = False
+# QK residue is part of the normal GQA=8 ResAttn decode implementation, not a
+# second feature to enable after selecting the backend.  Keep only a negative
+# escape hatch so differential debugging can reproduce the base-only internal
+# kernel control.  That control is not the external TRT-LLM decode baseline.
+_QK_RESIDUE = os.environ.get(
+    "RESIDUE_ATTN_DISABLE_QK_RESIDUE", "0"
+) != "1"
+
+
+def _qk_residue_for_geometry(num_qo_heads: int, num_kv_heads: int) -> bool:
+    """Use the default residue path exactly where its free Q16 mapping exists."""
+    return _QK_RESIDUE and num_qo_heads == 8 * num_kv_heads
 
 #: trtllm-gen context scratch, ONE buffer for the whole process.
 #:
@@ -168,13 +184,16 @@ class _DecodeWarmupProvider:
     """
 
     def __init__(self):
-        self._geometries: dict[tuple[int, int, int], tuple[int, int]] = {}
+        self._geometries: dict[
+            tuple[int, int, int], tuple[int, int, bool]
+        ] = {}
 
     def add_geometry(self, num_qo_heads: int, num_kv_heads: int,
                      head_dim: int, max_model_len: int,
-                     max_num_seqs: int) -> None:
+                     max_num_seqs: int,
+                     fuse_attn_quant: bool) -> None:
         self._geometries[(num_qo_heads, num_kv_heads, head_dim)] = (
-            max_model_len, max_num_seqs
+            max_model_len, max_num_seqs, fuse_attn_quant
         )
 
     def get_cutedsl_warmup_compile_units(self):
@@ -187,10 +206,32 @@ class _DecodeWarmupProvider:
             return []
         device = torch.device("cuda", torch.cuda.current_device())
         units = []
-        for (hq, hkv, d), (mml, mns) in self._geometries.items():
-            for plan in host.plan_decode_compile_variants(
-                hq, hkv, d, mml, mns, device
-            ):
+        for (hq, hkv, d), (
+            mml,
+            mns,
+            fuse_attn_quant,
+        ) in self._geometries.items():
+            qk_residue = _qk_residue_for_geometry(hq, hkv)
+            plans = host.plan_decode_compile_variants(
+                hq,
+                hkv,
+                d,
+                mml,
+                mns,
+                device,
+                residue_fold=qk_residue,
+            )
+            if fuse_attn_quant:
+                plans += host.plan_decode_nvfp4_compile_variants(
+                    hq,
+                    hkv,
+                    d,
+                    mml,
+                    mns,
+                    device,
+                    residue_fold=qk_residue,
+                )
+            for plan in plans:
                 units.append(CuTeDSLCompileUnit(
                     name=f"resattn_decode[{plan['label']}]",
                     key=("resattn_decode", plan["args"],
@@ -224,10 +265,20 @@ def _register_decode_warmup(num_qo_heads: int, num_kv_heads: int,
         cfg.scheduler_config.max_num_seqs
         if cfg is not None and cfg.scheduler_config is not None else 64
     )
+    fuse_attn_quant = bool(
+        cfg is not None
+        and cfg.compilation_config is not None
+        and cfg.compilation_config.pass_config.fuse_attn_quant
+    )
     if _DECODE_WARMUP_PROVIDER is None:
         _DECODE_WARMUP_PROVIDER = _DecodeWarmupProvider()
     _DECODE_WARMUP_PROVIDER.add_geometry(
-        num_qo_heads, num_kv_heads, head_dim, max_model_len, max_num_seqs
+        num_qo_heads,
+        num_kv_heads,
+        head_dim,
+        max_model_len,
+        max_num_seqs,
+        fuse_attn_quant,
     )
     register_cutedsl_warmup_provider(_DECODE_WARMUP_PROVIDER)
 
@@ -833,6 +884,10 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
 
     supports_quant_query_input: bool = False
 
+    def fused_output_quant_supported(self, quant_key: QuantKey) -> bool:
+        """Advertise only the NVFP4 contract implemented by ResAttn."""
+        return self.kv_cache_dtype == "nvfp4" and quant_key == kNvfp4Dynamic
+
     def __init__(
         self,
         num_heads: int,
@@ -1004,18 +1059,19 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        
-        
-        
-        
-        
-        
-        
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError(
-                "[residue] ResAttn emits BF16; fused NVFP4 attention output "
-                "was retired. Declare fused_output_quant_supported() and let "
-                "vLLM's AttnQuantFusionPass rewrite the graph instead."
+        fused_nvfp4 = output_scale is not None
+        if fused_nvfp4:
+            if output is None or output.dtype != torch.uint8:
+                raise ValueError(
+                    "[residue] fused NVFP4 attention requires a uint8 output"
+                )
+            if output_block_scale is None:
+                raise ValueError(
+                    "[residue] fused NVFP4 attention requires block scales"
+                )
+        elif output_block_scale is not None:
+            raise ValueError(
+                "[residue] output_block_scale requires output_scale"
             )
         if output is None:
             output = torch.zeros(
@@ -1037,11 +1093,16 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         k_all = key[:num_all].view(num_all, self.num_kv_heads, self.head_size)
         v_all = value[:num_all].view(num_all, self.num_kv_heads, self.head_size)
 
-        out3 = (
-            output
-            if output.ndim == 3
-            else output.view(-1, self.num_heads, self.head_size)
-        )
+        # The fusion pass replaces attention's BF16 destination with packed
+        # uint8.  Keep a BF16 staging output only for plans the direct epilogue
+        # cannot serve (prefill/mixed batches or atomic split reduction).
+        out3 = None
+        if not fused_nvfp4:
+            out3 = (
+                output
+                if output.ndim == 3
+                else output.view(-1, self.num_heads, self.head_size)
+            )
 
         # vLLM owns the write. Its reshape_and_cache_flash quantizes and scatters
         # the new tokens; _trtllm_pool is then a zero-copy view of that result.
@@ -1067,19 +1128,131 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         # derives one on-device instead -- see _attend_context_requests.
         q_scale = float(getattr(layer, "_q_scale_float", 1.0) or 1.0)
 
-        if num_dec > 0:
-            self._decode_forward(
+        direct_nvfp4 = False
+        host = None
+        direct_plan = None
+        if fused_nvfp4 and md.num_prefill_tokens == 0 and num_dec > 0:
+            host = _load_decode_kernel()
+            if host is None:
+                raise RuntimeError(
+                    "[residue] ResAttn decode kernel unavailable for fused output"
+                )
+            direct_plan = host.plan_qmul4_decode_nvfp4(
+                num_dec,
+                self.num_heads,
+                self.num_kv_heads,
+                md.max_seq_len,
+                q_all.device,
+            )
+            direct_nvfp4 = direct_plan[1] in (
+                "none",
+                "kernel",
+                "gmem_fused",
+            )
+
+        if direct_nvfp4:
+            assert host is not None and direct_plan is not None
+            assert output_scale is not None and output_block_scale is not None
+            self._decode_forward_nvfp4(
                 q_all,
-                k_all,
-                v_all,
                 pool,
                 md,
-                out3,
+                output,
+                output_scale,
+                output_block_scale,
+                host,
+                direct_plan,
             )
-        if md.num_prefill_tokens > 0:
-            self._prefill_bridge(q_all, k_all, v_all, pool, md, out3,
-                                 q_scale=q_scale)
+        else:
+            if fused_nvfp4:
+                out3 = torch.empty(
+                    num_all,
+                    self.num_heads,
+                    self.head_size,
+                    dtype=torch.bfloat16,
+                    device=query.device,
+                )
+            assert out3 is not None
+            if num_dec > 0:
+                self._decode_forward(
+                    q_all,
+                    k_all,
+                    v_all,
+                    pool,
+                    md,
+                    out3,
+                )
+            if md.num_prefill_tokens > 0:
+                self._prefill_bridge(
+                    q_all,
+                    k_all,
+                    v_all,
+                    pool,
+                    md,
+                    out3,
+                    q_scale=q_scale,
+                )
+            if fused_nvfp4:
+                assert output_scale is not None and output_block_scale is not None
+                torch.ops._C.scaled_fp4_quant.out(
+                    input=out3[:num_all].view(
+                        num_all, self.num_heads * self.head_size
+                    ),
+                    input_scale=output_scale,
+                    is_sf_swizzled_layout=True,
+                    output=output[:num_all].view(
+                        num_all, self.num_heads * self.head_size // 2
+                    ),
+                    output_scale=output_block_scale.view(torch.int32),
+                )
         return output
+
+    def _decode_forward_nvfp4(
+        self,
+        q_all: torch.Tensor,
+        pool,
+        md: ResAttnMetadata,
+        output: torch.Tensor,
+        output_scale: torch.Tensor,
+        output_block_scale: torch.Tensor,
+        host,
+        plan: tuple[int, str],
+    ) -> None:
+        """Decode directly into vLLM's packed activation buffers."""
+        n = md.num_decode_tokens
+        q_dec = q_all if q_all.shape[0] == n else q_all[:n]
+        splits, reduction = plan
+        reduction_workspace = None
+        if reduction in ("kernel", "gmem_fused"):
+            reduction_workspace = self._get_decode_reduction_workspace(
+                host,
+                splits,
+                n,
+                q_dec.device,
+                reduction=reduction,
+            )
+        scale_rows = ((n + 127) // 128) * 128
+        host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
+            q_dec,
+            pool,
+            pool.v_data,
+            pool.v_sf,
+            md.kv_indices,
+            md.kv_indptr,
+            md.seq_lens[: md.num_decodes],
+            self.scale * pool.k_global_scale,
+            output_scale,
+            out=output[:n].view(n, self.num_heads * self.head_size // 2),
+            output_block_scale=output_block_scale[:scale_rows],
+            max_seq_len=md.max_seq_len,
+            k_sf_mode="linear",
+            value_scale=pool.v_global_scale,
+            reduction_workspace=reduction_workspace,
+            plan=plan,
+            residue_fold=_qk_residue_for_geometry(
+                self.num_heads, self.num_kv_heads
+            ),
+        )
 
     def _append_trtllm_kv(self, layer, key, value, kv_cache, slot_mapping):
         """Use vLLM's own production NVFP4 writer for the standard profile."""
@@ -1115,6 +1288,8 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         pool,
         md,
         out3,
+        *,
+        direct_output: bool = False,
     ) -> None:
         """One new token per request: append it, then run the paged fp4 kernel.
 
@@ -1153,13 +1328,17 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
         
         
         
-        if hasattr(host, "plan_qmul4_decode"):
-            splits, reduction = host.plan_qmul4_decode(
+        decode_plan = None
+        # With unknown length, leave the original length fallback/selection
+        # to the host rather than forwarding a plan chosen for length zero.
+        if md.max_seq_len and hasattr(host, "plan_qmul4_decode"):
+            decode_plan = host.plan_qmul4_decode(
                 n,
                 self.num_kv_heads,
                 md.max_seq_len,
                 q_dec.device,
             )
+            splits, reduction = decode_plan
             if reduction == "kernel":
                 reduction_workspace = self._get_decode_reduction_workspace(
                     host, splits, n, q_dec.device
@@ -1178,6 +1357,11 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
             k_sf_mode="linear",
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
+            direct_output=direct_output,
+            plan=decode_plan,
+            residue_fold=_qk_residue_for_geometry(
+                self.num_heads, self.num_kv_heads
+            ),
         )
         if kern_out is not dec_out:
             dec_out.copy_(kern_out)

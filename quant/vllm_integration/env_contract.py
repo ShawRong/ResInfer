@@ -101,7 +101,18 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_FOLD_TUNE_DUMP": ("free", None,
                                "write the fold tuner's decisions to this path"),
     # -- attention (experimental) -------------------------------------------
-    "RESIDUE_ATTN": ("one", None, "register the ResAttn backend"),
+    "RESIDUE_ATTN": (
+        "one", None,
+        "register phase-separated ResAttn: pure decode uses ResAttn; "
+        "prefill and mixed steps use stock FlashInfer/TRT",
+    ),
+    "RESIDUE_ATTN_DISABLE_QK_RESIDUE": (
+        "one",
+        None,
+        "debug ablation: disable the default GQA=8 decode QK residue and "
+        "run the base-only ResAttn kernel; does not affect vendor "
+        "context/prefill",
+    ),
     "RESIDUE_ATTN_CONTEXT_KERNEL": ("one", None,
                                     "0 disables the paged context kernel"),
     "RESIDUE_ATTN_PREFILL_EXACT": ("one", None,
