@@ -43,10 +43,13 @@ def apply() -> None:
     """Entry point for the ``vllm.general_plugins`` group."""
     patch_linear = bool(os.environ.get("RESIDUE_PATCH_VLLM"))
     resattn = os.environ.get("RESIDUE_ATTN") == "1"
-    if not (patch_linear or resattn):
+    mxfp4 = os.environ.get("RESIDUE_MXFP4") == "1"
+    if not (patch_linear or resattn or mxfp4):
         return
     pid = os.getpid()
     try:
+        if mxfp4:
+            from quant.vllm_integration import linear_method_mxfp4  # noqa: F401
         if patch_linear:
             from quant.vllm_integration.patch import (is_patched,
                                                       patch_vllm_modelopt)
