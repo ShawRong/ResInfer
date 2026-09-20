@@ -73,6 +73,6 @@ def runtime_layer_specs(layers, model_type):
             raise ValueError("Qwen3.5 MXFP4 scope must be language-model linears")
         return {"language_model.model." + name[len(source_prefix):]: spec
                 for name, spec in fused.items()}
-    if model_type != "llama":
+    if model_type not in ("llama", "qwen3"):
         raise ValueError(f"unsupported MXFP4 model_type: {model_type}")
     return fused

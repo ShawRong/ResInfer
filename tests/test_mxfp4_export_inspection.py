@@ -11,6 +11,27 @@ from quant.modelopt_integration.mxfp4_export import (
     _collect_preserved_state,
     _validate_modelopt_export,
 )
+from quant.mxfp4_checkpoint import runtime_layer_specs
+
+
+def test_dense_qwen3_uses_hf_layer_names_and_fusion_contract():
+    layers = {
+        "model.layers.0.self_attn.q_proj": {
+            "mode": "standard", "input_size": 256, "output_size": 256,
+        },
+        "model.layers.0.self_attn.k_proj": {
+            "mode": "standard", "input_size": 256, "output_size": 64,
+        },
+        "model.layers.0.self_attn.v_proj": {
+            "mode": "standard", "input_size": 256, "output_size": 64,
+        },
+    }
+    actual = runtime_layer_specs(layers, "qwen3")
+    assert actual == {
+        "model.layers.0.self_attn.qkv_proj": {
+            "mode": "standard", "input_size": 256, "output_size": 384,
+        }
+    }
 
 
 @pytest.mark.parametrize("damage", [None,"width","nan_scale","index","unsharded"])

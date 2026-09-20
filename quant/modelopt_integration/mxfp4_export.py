@@ -3,7 +3,8 @@
 
 Packing and zero-block padding remain ModelOpt's responsibility. This adapter
 describes residue/fusion contracts and validates the official export bytes.
-The initial runtime target is dense Llama, TP1. MoE export is rejected.
+The runtime targets are dense Llama/Qwen3 and Qwen3.5, TP1. MoE export is
+rejected.
 """
 from __future__ import annotations
 
@@ -257,8 +258,10 @@ def export_mxfp4_checkpoint(model, export_dir, *, dtype=None, tokenizer=None,
     from modelopt.torch.export import export_hf_checkpoint
     _require_modelopt_export_api(export_hf_checkpoint)
     model_type = getattr(model.config, "model_type", None)
-    if model_type not in ("llama", "qwen3_5"):
-        raise ValueError("MXFP4 packed export supports dense Llama and Qwen3.5 VL")
+    if model_type not in ("llama", "qwen3", "qwen3_5"):
+        raise ValueError(
+            "MXFP4 packed export supports dense Llama, Qwen3, and Qwen3.5 VL"
+        )
     if model_type == "qwen3_5" and source_checkpoint is None:
         raise ValueError("Qwen3.5 requires the source checkpoint to preserve vision/MTP")
     if preserve_unloaded_prefixes is None:
