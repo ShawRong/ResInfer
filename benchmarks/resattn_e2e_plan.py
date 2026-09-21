@@ -50,7 +50,7 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
     if eager:
         common.append("--enforce-eager")
     if kv_cache_bytes is not None:
-        common += ["--kv-cache-memory", str(kv_cache_bytes)]
+        common += ["--kv-cache-memory-bytes", str(kv_cache_bytes)]
     if attn_quant_fusion:
         common += ["--compilation-config", json.dumps(
             {"pass_config": {"fuse_attn_quant": True}})]

@@ -88,7 +88,8 @@ class ResAttnE2EPlanTests(unittest.TestCase):
         p = self.plan(kv_cache_bytes=85899345920, attn_quant_fusion=True)
         for arm in p["arms"].values():
             argv = arm["server_argv"]
-            self.assertEqual(argv[argv.index("--kv-cache-memory") + 1], "85899345920")
+            self.assertEqual(argv[argv.index("--kv-cache-memory-bytes") + 1],
+                             "85899345920")
             config = json.loads(argv[argv.index("--compilation-config") + 1])
             self.assertTrue(config["pass_config"]["fuse_attn_quant"])
         self.assertEqual(p["output_contract"], "nvfp4")
