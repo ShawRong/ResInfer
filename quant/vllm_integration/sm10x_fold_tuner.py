@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'FlashInfer-autotuned tactic selection for the sm10x CuTeDSL decode fold.'
+'FlashInfer-autotuned producer+family+tactic selection for SM100 Fold.'
 
 from __future__ import annotations
 
@@ -11,10 +11,12 @@ import torch
 from .fi_tuner_base import (bucket_of, make_runner_pair, make_tuning_config,
                             tuned_call, weight_geometry)
 
-FOLD_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+FOLD_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512)
 _FAMILY = ("row_pair", "std")
 _CUSTOM_OP = "residue_fold_tactic_sm10x"
 _LAYOUT_ROW_PAIR = 1
+_LAYOUT_TILE8 = 2
+_M_PAD_MULTIPLE = 8
 
 # warmup_fold_default compiled the row_pair candidates (symbolic shapes:
 # one compile set serves every (n_w, k, m), strided and contiguous).
@@ -69,27 +71,36 @@ def _tuning_config():
     return _TUNING_CONFIG
 
 
-def _candidates() -> list:
-    """Normalized (mode, tiler, cluster, ab) list, order = tactic index.
+def _families() -> tuple:
+    from nvfp4.fold import candidate_families
 
-    The order is FAMILY_TACTICS' order, which therefore becomes part of the
-    persisted cache contract -- candidates_hash() invalidates on any edit.
-    """
+    if _arch() != "sm100":
+        return (_FAMILY,)
+    return tuple(candidate_families())
+
+
+def _candidates() -> list:
+    """Normalized (family, mode, tiler, cluster, ab), index-stable."""
     global _CANDIDATES, _INDEX_BY_TACTIC
     if _CANDIDATES is None:
         from nvfp4.cute_fold.tactics import FAMILY_TACTICS, _norm_tactic
 
-        _CANDIDATES = [_norm_tactic(t) for t in FAMILY_TACTICS[_FAMILY]]
-        _INDEX_BY_TACTIC = {t: i for i, t in enumerate(_CANDIDATES)}
+        _CANDIDATES = [
+            (family, *_norm_tactic(tactic))
+            for family in _families()
+            for tactic in FAMILY_TACTICS[family]
+        ]
+        _INDEX_BY_TACTIC = {
+            (candidate[0], candidate[1:]): i
+            for i, candidate in enumerate(_CANDIDATES)
+        }
     return _CANDIDATES
 
 
 def candidates_hash() -> str:
     import hashlib
 
-    from nvfp4.cute_fold.tactics import FAMILY_TACTICS
-
-    return hashlib.md5(repr(FAMILY_TACTICS[_FAMILY]).encode()).hexdigest()[:12]
+    return hashlib.md5(repr(_candidates()).encode()).hexdigest()[:12]
 
 
 def _arch() -> str | None:
@@ -106,64 +117,93 @@ def _legal_indices(m_tok: int) -> list[int]:
     profiler measures everything offered); only membership matters."""
     from nvfp4.cute_fold.tactics import _rank_tactics
 
-    cands = _candidates()
-    ranked = _rank_tactics(_FAMILY, m_tok, _arch())
-    return sorted(_INDEX_BY_TACTIC[t] for t in ranked if t in _INDEX_BY_TACTIC)
+    _candidates()
+    legal = []
+    for family in _families():
+        ranked = _rank_tactics(family, m_tok, _arch())
+        legal.extend(
+            _INDEX_BY_TACTIC[(family, tactic)]
+            for tactic in ranked
+            if (family, tactic) in _INDEX_BY_TACTIC
+        )
+    return sorted(legal)
 
 
-def _quant_row_pair(inputs):
+def tile8_pad_multiple(mode: str, tiler: tuple) -> int:
+    # A6's direct store has no partial-tile clamp. Make real M legal even
+    # when its autotune bucket is a different multiple of tile_M / 2.
+    if mode == "direct_mext":
+        return max(_M_PAD_MULTIPLE, tiler[0] // 2)
+    return _M_PAD_MULTIPLE
+
+
+def _quant_for_family(inputs, family, pad_multiple: int = _M_PAD_MULTIPLE):
     import nvfp4
+    from nvfp4.cute_fold.tactics import FAMILY_ACT_LAYOUT
 
     x, _, gs_inv, _, _ = inputs
-    x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
-        x, gs_inv, layout_mode=_LAYOUT_ROW_PAIR)
+    if FAMILY_ACT_LAYOUT[family] == "tile8":
+        x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
+            x, gs_inv, layout_mode=_LAYOUT_TILE8,
+            m_pad_multiple=pad_multiple)
+    else:
+        x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
+            x, gs_inv, layout_mode=_LAYOUT_ROW_PAIR)
     return x_fp4, x_sf.view(torch.float8_e4m3fn)
 
 
 def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
     from nvfp4.cute_fold.host import mext_fold_gemm_sm103
+    from nvfp4.cute_fold.tactics import _needs_pi_layout
 
-    mode, tiler, cluster, ab = _candidates()[idx]
-    _LAST_TILE[0] = (mode, tiler, cluster, ab)
-    x_fp4, x_sf = _quant_row_pair(inputs)
+    family, mode, tiler, cluster, ab = _candidates()[idx]
+    _LAST_TILE[0] = (family, mode, tiler, cluster, ab)
+    x_fp4, x_sf = _quant_for_family(
+        inputs, family, pad_multiple=tile8_pad_multiple(mode, tiler))
     _, weight, _, wsb, alpha = inputs
     out = mext_fold_gemm_sm103(
         weight, x_fp4, wsb, x_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster, store_mode=mode,
-        kernel_arch=_arch(), ab_stage_override=ab, pi_via_layout=False,
+        kernel_arch=_arch(), ab_stage_override=ab,
+        pi_via_layout=_needs_pi_layout(family),
     )
     _EXECUTED.add(idx)
-    return out
+    return out[: inputs[0].shape[0]]
 
 
 def _run_fallback(inputs, out_dtype) -> torch.Tensor:
-    """The pre-existing sm10x serving path, family pinned to row_pair:
-    run_fold consults the in-process tuned cache, then the static table."""
-    from nvfp4.fold import run_fold
+    """Static row-pair fallback: never nest the old tuner inside FI tuning."""
+    from nvfp4.cute_fold.tactics import run_fold_default
 
     _LAST_TILE[0] = None      # legacy path picks internally and stays mute
-    x_fp4, x_sf = _quant_row_pair(inputs)
+    x_fp4, x_sf = _quant_for_family(inputs, _FAMILY)
     _, weight, _, wsb, alpha = inputs
     major, minor = torch.cuda.get_device_capability()
-    return run_fold(int(major), int(minor), weight, x_fp4, wsb, x_sf,
-                    alpha, out_dtype, family=_FAMILY)
+    return run_fold_default(
+        int(major), int(minor), weight, x_fp4, wsb, x_sf, alpha, out_dtype)
 
 
-def precompile_row_pair() -> bool:
-    """Compile the row_pair candidate set (symbolic shapes -- one set serves
-    every layer shape, contiguous and strided weights alike). Called at PWAL
-    when the tuner is enabled; the tuning window may also compile lazily."""
-    from nvfp4.cute_fold.tactics import warmup_fold_default
+def precompile_sm10x_families() -> bool:
+    """Compile all enabled family candidates with symbolic activation shapes."""
+    from nvfp4.cute_fold.tactics import warmup_fold_default, warmup_specs
 
     major, minor = torch.cuda.get_device_capability()
     torch.zeros(1, device="cuda")
     try:
-        warmup_fold_default(int(major), int(minor), families=(_FAMILY,))
-        _READY[0] = True
+        families = _families()
+        expected = len(warmup_specs(_arch(), families=families))
+        compiled = warmup_fold_default(
+            int(major), int(minor), families=families)
+        _READY[0] = compiled == expected
     except Exception as e:                                # noqa: BLE001
         print(f"[residue] sm10x fold tuner precompile failed: "
               f"{type(e).__name__}: {str(e)[:70]}", flush=True)
     return _READY[0]
+
+
+def precompile_row_pair() -> bool:
+    """Compatibility name for the existing PWAL warmup hook."""
+    return precompile_sm10x_families()
 
 
 def _make_runners(out_dtype):
@@ -183,12 +223,12 @@ def _make_runners(out_dtype):
 
     def _extras(inputs):
         _, _, a_ld = weight_geometry(inputs[1])
-        return ("row_pair", _arch(), candidates_hash(), a_ld, str(out_dtype))
+        return ("family_v2", _arch(), candidates_hash(), a_ld, str(out_dtype))
 
     return make_runner_pair(
         _CUSTOM_OP,
         fallback_forward=_fallback,
-        fallback_extras=("dict_or_table", 1),
+        fallback_extras=("row_pair_table", 2),
         valid_tactics=_valid,
         run_tactic=_run,
         candidate_extras=_extras,

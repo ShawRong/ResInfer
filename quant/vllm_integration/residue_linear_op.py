@@ -132,6 +132,11 @@ _FOLD_MAX_M_DEFAULT_SM10X = 128
 _FOLD_MAX_M_DEFAULT_OTHER = 64
 _FOLD_MAX_M_ENV = os.environ.get("RESIDUE_DECODE_MEXT_MAX_M")
 
+# Full-rank MExt can use the Fold families beyond the ordinary decode band.
+# Keep the two limits independent: plain/partial-residue routing is unchanged.
+_MEXT_FOLD_MAX_M_DEFAULT_SM10X = 512
+_MEXT_FOLD_MAX_M_ENV = os.environ.get("RESIDUE_MEXT_FOLD_MAX_M")
+
 
 def fold_max_m_for(arch: str | None) -> int:
     """The M at or below which a non-mext_r1 layer takes the fold.
@@ -149,6 +154,16 @@ def fold_max_m_for(arch: str | None) -> int:
         return int(_FOLD_MAX_M_ENV)
     return (_FOLD_MAX_M_DEFAULT_SM10X if arch is not None
             else _FOLD_MAX_M_DEFAULT_OTHER)
+
+
+def mext_fold_max_m_for(arch: str | None) -> int:
+    """Largest M routed through Fold for a full-rank mext_r1 layer."""
+    decode_max = fold_max_m_for(arch)
+    if arch is None:
+        return decode_max
+    if _MEXT_FOLD_MAX_M_ENV is not None:
+        return max(decode_max, int(_MEXT_FOLD_MAX_M_ENV))
+    return max(decode_max, _MEXT_FOLD_MAX_M_DEFAULT_SM10X)
 
 
 # Back-compat alias for the non-sm10x default. Prefer fold_max_m_for().
@@ -792,6 +807,7 @@ def nvfp4_linear(
     
     
     fold_max_m = fold_max_m_for(_sm10x_fold_arch())
+    mext_fold_max_m = mext_fold_max_m_for(_sm10x_fold_arch())
     
     
     
@@ -821,7 +837,7 @@ def nvfp4_linear(
         
         
         
-        if (is_mext_r1 and original_m > fold_max_m
+        if (is_mext_r1 and original_m > mext_fold_max_m
                 and _mext_prefill_two_gemm()):
             _w_view = _base_k_weight_view(weight, k_base)
             if _MEXT_PREFILL_PATH in ("auto", "k_loop"):
@@ -873,13 +889,11 @@ def nvfp4_linear(
 
             from .sm10x_fold_tuner import tuned_sm10x_fold, tuner_enabled
 
-            if tuner_enabled() and not ENABLE_MEXT_FAMILY:
-                
-                
-                
-                
-                
-                
+            if tuner_enabled():
+                # The candidate index includes producer layout and Fold
+                # family.  RESIDUE_FOLD_MEXT=1 admits A4/A6 to the same
+                # FlashInfer election as row-pair; cache miss still serves
+                # the safe static row-pair fallback.
                 out = tuned_sm10x_fold(
                     x,
                     _base_k_weight_view(weight, k_base),

@@ -243,8 +243,9 @@ def _maybe_dump_fold_tuning() -> None:
 
 
 
-# The fold band's bucket ladder (fold_max_m caps at 128 on sm10x).
+# The ordinary decode fold band's bucket ladder.
 _FOLD_DECODE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+_MEXT_BIGM_FOLD_BUCKETS = (192, 256, 384, 512)
 
 
 def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
@@ -279,7 +280,11 @@ def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
                 # the measurement under the bucket serving will look up.
                 return min(bucket, mnbt) if mnbt else bucket
 
-            sizes |= {_cap(b) for b in _FOLD_DECODE_BUCKETS}
+            buckets = set(_FOLD_DECODE_BUCKETS)
+            major, _minor = torch.cuda.get_device_capability()
+            if major == 10 and any(bool(shape[3]) for shape in _SM120_FOLD_SHAPES):
+                buckets.update(_MEXT_BIGM_FOLD_BUCKETS)
+            sizes |= {_cap(b) for b in buckets}
     except Exception as e:                                # noqa: BLE001
         print(f"[residue] fold bucket probe failed "
               f"({type(e).__name__}: {str(e)[:70]}); tuning the given decode "

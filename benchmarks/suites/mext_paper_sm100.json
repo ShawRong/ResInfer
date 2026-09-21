@@ -1,0 +1,87 @@
+{
+  "name": "mext_paper_sm100_v1",
+  "description": "Full online activation quantization plus GEMM; SM100 MExt paper matrix",
+  "m_values": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    192,
+    256,
+    384,
+    512
+  ],
+  "tp_values": [
+    1,
+    2,
+    4,
+    8
+  ],
+  "process_reps": 5,
+  "timing_repeats": 5,
+  "arms": [
+    "mext_r1",
+    "fi_nvfp4_cutlass",
+    "fi_nvfp4_cutedsl",
+    "fi_mxfp4_mxfp8_w4a8",
+    "trtllm_nvfp4_fp8_w4a8"
+  ],
+  "models": {
+    "qwen3_4b": {
+      "projections": [
+        "qkv",
+        "o",
+        "gate_up",
+        "down"
+      ],
+      "config": {
+        "model_type": "qwen3",
+        "hidden_size": 2560,
+        "intermediate_size": 9728,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128
+      }
+    },
+    "qwen3_8b": {
+      "projections": [
+        "qkv",
+        "o",
+        "gate_up",
+        "down"
+      ],
+      "config": {
+        "model_type": "qwen3",
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128
+      }
+    },
+    "qwen35_27b": {
+      "projections": [
+        "qkv",
+        "o",
+        "gate_up",
+        "down"
+      ],
+      "config": {
+        "model_type": "qwen3_5",
+        "text_config": {
+          "model_type": "qwen3_5_text",
+          "hidden_size": 5120,
+          "intermediate_size": 17408,
+          "num_attention_heads": 24,
+          "num_key_value_heads": 4,
+          "head_dim": 256,
+          "full_attention_interval": 4
+        }
+      }
+    }
+  }
+}
