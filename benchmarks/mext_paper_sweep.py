@@ -36,6 +36,7 @@ ARM_FORMAT = {
     "fi_nvfp4_cutedsl": ("NVFP4", "NVFP4", "FlashInfer CuTeDSL"),
     "resinfer_mxfp4_mext_r1": ("MXFP4", "MXFP4+residue", "ResInfer Fold"),
     "fi_mxfp4_mxfp4_stock": ("MXFP4", "MXFP4", "FlashInfer CuTeDSL"),
+    "fi_mxfp4_mxfp4_cutedsl_quant": ("MXFP4", "MXFP4", "FlashInfer CuTeDSL quant+GEMM"),
     "fi_mxfp4_mxfp8_w4a8": ("MXFP4", "MXFP8", "FlashInfer grouped"),
     "trtllm_nvfp4_fp8_w4a8": ("NVFP4", "FP8", "TensorRT-LLM"),
 }
@@ -412,6 +413,13 @@ def _worker(args: argparse.Namespace) -> int:
                         outputs["fi_mxfp4_mxfp4_stock"], block_size=32,
                         backend="cute-dsl", use_nvfp4=False)
 
+                def fi_mxfp4_cutedsl_quant(a, w, ws):
+                    aq, asc = mxfp4_quantize(a, backend="cute-dsl")
+                    return mm_fp4(
+                        aq, w.T, asc, ws.T, None, torch.bfloat16,
+                        outputs["fi_mxfp4_mxfp4_cutedsl_quant"], block_size=32,
+                        backend="cute-dsl", use_nvfp4=False)
+
                 def trtllm_w4a8(a, w, ws, input_scale, alpha):
                     return trtllm_w4a8_linear(a, w, ws, input_scale, alpha)
 
@@ -421,6 +429,8 @@ def _worker(args: argparse.Namespace) -> int:
                     "fi_nvfp4_cutedsl": (fi_cutedsl, (x, w_nv, ws_nv)),
                     "resinfer_mxfp4_mext_r1": (res_mxfp4_mext, (x, w_mx, ws_mx_flat)),
                     "fi_mxfp4_mxfp4_stock": (fi_mxfp4_stock, (x, w_mx, ws_mx)),
+                    "fi_mxfp4_mxfp4_cutedsl_quant": (
+                        fi_mxfp4_cutedsl_quant, (x, w_mx, ws_mx)),
                     "fi_mxfp4_mxfp8_w4a8": (fi_w4a8, (x, w_mx_batch, ws_mx_batch)),
                 }
                 if trtllm_fp4_utils is not None:

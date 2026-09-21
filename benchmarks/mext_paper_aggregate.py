@@ -108,7 +108,9 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                 ratios[f"mext_over_{arm}"] = ratio
                 macro[(arm, m)].append(ratio)
             mx_arm = "resinfer_mxfp4_mext_r1"
-            for arm in ("fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp8_w4a8"):
+            for arm in ("fi_mxfp4_mxfp4_stock",
+                        "fi_mxfp4_mxfp4_cutedsl_quant",
+                        "fi_mxfp4_mxfp8_w4a8"):
                 if mx_arm in latency and arm in latency:
                     ratio = latency[mx_arm] / latency[arm]
                     ratios[f"mxfp4_mext_over_{arm}"] = ratio

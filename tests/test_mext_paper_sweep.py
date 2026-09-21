@@ -143,6 +143,27 @@ def test_mxfp4_only_diagnostic_has_own_ratios(tmp_path: Path):
     assert got["mxfp4_by_m"][0]["macro_median_ratio"] == 12 / 11
 
 
+def test_cutedsl_quantizer_companion_has_separate_mxfp4_ratio(tmp_path: Path):
+    path = SUITE.with_name("mext_paper_sm100_v4_mxfp4_producer.json")
+    suite = load_suite(path)
+    alternate = "fi_mxfp4_mxfp4_cutedsl_quant"
+    assert alternate in suite["arms"] and alternate in suite["required_arms"]
+    shapes, _ = resolve(suite, {}, ["qwen3_4b"])
+    shape = shapes[0]
+    arms = ["resinfer_mxfp4_mext_r1", "fi_mxfp4_mxfp4_stock", alternate]
+    files = _sample_files(tmp_path, [shape])
+    for file in files:
+        rows = [json.loads(line) for line in file.read_text().splitlines()]
+        rows = [row for row in rows if row["arm"] in arms]
+        rows.append(dict(rows[0], arm=alternate, us=6.0))
+        file.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    got = aggregate(files, [shape], [8], arms, arms)
+    ratios = {row["arm"]: row["macro_median_ratio"]
+              for row in got["mxfp4_by_m"]}
+    assert ratios["fi_mxfp4_mxfp4_stock"] == 12 / 11
+    assert ratios[alternate] == 2.0
+
+
 def test_aggregate_rejects_duplicate_missing_and_required_failure(tmp_path: Path):
     suite = load_suite(SUITE)
     shapes, _ = resolve(suite, {}, ["qwen3_4b"])
