@@ -243,10 +243,13 @@ class GroupedQueryAttentionDecodePagedFp4:
         if self.do_cga_red and v_mode != "qmul4_tmem":
             raise ValueError("cga_sharded is implemented only for qmul4_tmem")
         if self.do_gmem_fused_red and (
-            v_mode != "qmul4_tmem" or grouped_head_tile != 16
+            v_mode != "qmul4_tmem"
+            or grouped_head_tile not in (8, 16)
+            or (grouped_head_tile == 8 and not residue_fold)
         ):
             raise ValueError(
-                "gmem_fused currently requires qmul4_tmem with a Q16 tile"
+                "gmem_fused requires qmul4_tmem with a Q16 tile or "
+                "residue-fold Q8 tile"
             )
         assert k_sf_mode in ("atom", "linear"), k_sf_mode
         if logical_grouped_heads is not None:
@@ -4658,10 +4661,11 @@ class GroupedQueryAttentionDecodePagedFp4:
             # All role-specific work is complete at this point. In
             # particular, the TMA warp has waited for partial-O's bulk store
             # and the reduction warp has synchronously stored max/sum. TRT's
-            # mode-1 protocol does not serialize the output on one CTA: the
-            # last four finishing CTAs split the four 32-thread output slices.
-            # The first three wait until the final CTA resets the completion
-            # word, which also acquires all published partials.
+            # Q16 uses the last four CTAs for four 32-thread output slices.
+            # Compact residue GQA4 has only four logical output heads (one
+            # 32-thread slice), so its last CTA alone performs the reduction.
+            # The final CTA resets the completion word before reading the
+            # acquired partials; this also makes the slab replay-safe.
             if (
                 warpgroup_idx == 0
                 or warpgroup_idx == correction_warpgroup_id
@@ -4670,6 +4674,9 @@ class GroupedQueryAttentionDecodePagedFp4:
 
                 completion_idx = (
                     coord_hb_linear * grid_tiles_hp + coord_hp_linear
+                )
+                last_reducer_ctas = cutlass.const_expr(
+                    1 if self.grouped_head_tile == 8 else 4
                 )
                 if tidx == 0:
                     cute.arch.fence_acq_rel_gpu()
@@ -4680,7 +4687,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                         scope="gpu",
                     )
                     sGmemLast[0] = Int32(0)
-                    if old_count >= kv_splits - Int32(4):
+                    if old_count >= kv_splits - Int32(last_reducer_ctas):
                         # Reducer rank + 1; zero remains the non-participant
                         # sentinel. Rank zero is the last CTA.
                         sGmemLast[0] = kv_splits - old_count
@@ -4692,7 +4699,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                             sem="release",
                             scope="gpu",
                         )
-                    elif old_count >= kv_splits - Int32(4):
+                    elif old_count >= kv_splits - Int32(last_reducer_ctas):
                         counter_value = Int32(-1)
                         while counter_value != Int32(0):
                             counter_value = cute.arch.atomic_add(
@@ -4756,8 +4763,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         """Merge split partials and emit one direct-NVFP4 output block/thread.
 
         This is the data-parallel half of TRT's mode-1 protocol. The caller
-        dynamically selects the last CTA; its 128 correction threads then map
-        exactly onto the 16 heads x 8 block16 D slices of a Q16/D128 tile.
+        dynamically selects the last reducer CTAs. Their 128 correction
+        threads map onto at most 16 heads x 8 block16 D slices of a D128 tile;
+        compact Q8/GQA4 uses one CTA and predicates the unused threads.
         Statistics are intentionally duplicated across the eight D slices of
         a head, matching TRT's choice to keep the final output loads/stores
         fully distributed rather than serializing on a tiny reducer warp.

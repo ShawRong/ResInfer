@@ -197,15 +197,30 @@ def plan_qmul4_decode_nvfp4(
     num_kv_heads: int,
     max_kv_len: int,
     device,
+    *,
+    residue_fold: bool = False,
 ) -> Tuple[int, str]:
     'Implementation details.'
-    grouped_head_tile = _padded_group_size(num_qo_heads, num_kv_heads)
+    grouped_head_tile = (
+        _residue_padded_group_size(num_qo_heads, num_kv_heads)
+        if residue_fold
+        else _padded_group_size(num_qo_heads, num_kv_heads)
+    )
     if grouped_head_tile == 8:
-        
-        
-        
-        
-        return 1, "none"
+        # Only the residue-fold Q8 specialization has a direct-output fused
+        # reducer. Its one-warp logical output needs at least four sequence
+        # CTAs to amortize the completion protocol, and the reducer accepts
+        # split counts of four or more (never split two).
+        if not residue_fold:
+            return 1, "none"
+        grid_yz = max(1, batch * num_kv_heads)
+        sequence_tiles = max(1, (max_kv_len + 255) // 256)
+        wave_splits = max(1, _sm_count(str(device)) // grid_yz)
+        useful_splits = sequence_tiles // 4
+        splits = min(wave_splits, useful_splits, 16)
+        if splits < 4:
+            return 1, "none"
+        return 1 << (splits.bit_length() - 1), "gmem_fused"
 
     conventional = _auto_splits_qmul4(
         batch, num_kv_heads, max_kv_len, device
@@ -233,7 +248,7 @@ def plan_qmul4_decode_nvfp4(
     splits = min(wave_splits, useful_splits, 16)
     if splits not in (1, 2, 4, 8, 16):
         splits = 1 << (splits.bit_length() - 1)
-    if splits == 1:
+    if splits < 4:
         return 1, "none"
     return splits, "gmem_fused"
 
@@ -308,8 +323,8 @@ def allocate_qmul4_gmem_reduction_workspace(
 ) -> Qmul4GmemReductionWorkspace:
     """Allocate TRT mode-1 partials plus a persistent completion slab.
 
-    The final four attention CTAs reset each used counter to zero before they
-    reduce their output slices, so this allocation is reusable across decode
+    The final CTA resets each used counter to zero before the selected reducer
+    CTAs read their output slices, so this allocation is reusable across decode
     steps without a memset launch.  ``batch * num_qo_heads`` intentionally
     over-allocates the current Q16 tile count while keeping indexing stable
     for padded GQA groups.
@@ -1200,6 +1215,7 @@ def plan_decode_nvfp4_compile_variants(
                 num_kv_heads,
                 seq,
                 device,
+                residue_fold=residue_fold,
             )
             if reduction not in ("none", "kernel", "gmem_fused"):
                 continue
@@ -1403,7 +1419,7 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
     max_len = max_seq_len or int(seq_lens.max().item())
     if plan is None:
         splits, reduction = plan_qmul4_decode_nvfp4(
-            B, HQ, H, max_len, q.device
+            B, HQ, H, max_len, q.device, residue_fold=residue_fold
         )
     else:
         splits, reduction = plan
