@@ -124,6 +124,11 @@ def _legal_indices(m_tok: int) -> list[int]:
         legal.extend(
             _INDEX_BY_TACTIC[(family, tactic)]
             for tactic in ranked
+            
+            
+            
+            if not (family == ("tile8", "std")
+                    and tactic[1] == (128, 32))
             if (family, tactic) in _INDEX_BY_TACTIC
         )
     return sorted(legal)
