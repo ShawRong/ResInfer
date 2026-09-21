@@ -31,6 +31,7 @@ if _FAKE_TORCH:
 
 
 FUSED = "model.language_model.layers.0.linear_attn.in_proj_qkvz"
+RUNTIME_FUSED = "language_model.model.layers.0.linear_attn.in_proj_qkvz"
 QKV = "model.language_model.layers.0.linear_attn.in_proj_qkv"
 Z = "model.language_model.layers.0.linear_attn.in_proj_z"
 
@@ -57,19 +58,25 @@ class _Config:
 
 
 def test_qwen35_fused_projection_uses_checkpoint_names():
-    assert get_residue_layer_candidates(FUSED) == [FUSED, QKV, Z]
+    candidates = get_residue_layer_candidates(FUSED)
+    assert candidates[0] == FUSED
+    assert QKV in candidates
+    assert Z in candidates
 
 
 def test_qwen35_fused_projection_recovers_extended_input_contract():
     config = _Config()
     assert get_extended_dim(config, FUSED) == 6400
     assert get_layer_metadata(config, FUSED) == config.layers[QKV]
+    assert QKV in get_residue_layer_candidates(RUNTIME_FUSED)
+    assert Z in get_residue_layer_candidates(RUNTIME_FUSED)
+    assert get_extended_dim(config, RUNTIME_FUSED) == 6400
+    assert get_layer_metadata(config, RUNTIME_FUSED) == config.layers[QKV]
 
 
 def test_qwen35_ignored_ba_projection_has_checkpoint_candidates():
     fused = "model.language_model.layers.0.linear_attn.in_proj_ba"
-    assert get_residue_layer_candidates(fused) == [
-        fused,
-        "model.language_model.layers.0.linear_attn.in_proj_b",
-        "model.language_model.layers.0.linear_attn.in_proj_a",
-    ]
+    candidates = get_residue_layer_candidates(fused)
+    assert candidates[0] == fused
+    assert "model.language_model.layers.0.linear_attn.in_proj_b" in candidates
+    assert "model.language_model.layers.0.linear_attn.in_proj_a" in candidates

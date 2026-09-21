@@ -24,6 +24,16 @@ def get_residue_layer_candidates(layer_name: str) -> list[str]:
     """Return metadata lookup candidates for possibly merged vLLM layers."""
 
     candidates = [layer_name]
+    # Qwen3.5's outer HF checkpoint and vLLM runtime use opposite nesting
+    # orders for the dense text trunk. Metadata is keyed by the HF spelling.
+    if layer_name.startswith("language_model.model."):
+        candidates.append(
+            "model.language_model." + layer_name[len("language_model.model.") :]
+        )
+    elif layer_name.startswith("model.language_model."):
+        candidates.append(
+            "language_model.model." + layer_name[len("model.language_model.") :]
+        )
     vllm_to_hf_suffixes = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -35,10 +45,11 @@ def get_residue_layer_candidates(layer_name: str) -> list[str]:
         "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
-    for vllm_suffix, hf_suffixes in vllm_to_hf_suffixes.items():
-        if layer_name.endswith(vllm_suffix):
-            base_name = layer_name[: -len(vllm_suffix)]
-            candidates.extend(base_name + hf_suffix for hf_suffix in hf_suffixes)
+    for candidate in list(candidates):
+        for vllm_suffix, hf_suffixes in vllm_to_hf_suffixes.items():
+            if candidate.endswith(vllm_suffix):
+                base_name = candidate[: -len(vllm_suffix)]
+                candidates.extend(base_name + hf_suffix for hf_suffix in hf_suffixes)
 
     deduped: list[str] = []
     seen = set()
