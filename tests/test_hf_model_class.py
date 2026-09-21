@@ -40,6 +40,15 @@ def test_auto_preserves_outer_multimodal_checkpoint_structure():
     )
 
 
+def test_causal_override_refuses_to_drop_multimodal_weights():
+    config = SimpleNamespace(vision_config=object(), audio_config=None)
+    with pytest.raises(ValueError, match="discard the outer multimodal"):
+        resolve_hf_auto_model_class(
+            config, model_loader="causal_lm",
+            transformers_module=fake_transformers(),
+        )
+
+
 def test_multimodal_loader_requires_new_enough_transformers():
     config = SimpleNamespace(vision_config=object(), audio_config=None)
     with pytest.raises(RuntimeError, match="AutoModelForMultimodalLM"):

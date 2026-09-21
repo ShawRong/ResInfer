@@ -31,13 +31,18 @@ def resolve_hf_auto_model_class(
     if transformers_module is None:
         import transformers as transformers_module
 
-    if model_loader == "causal_lm":
-        return transformers_module.AutoModelForCausalLM
-
     has_multimodal_config = any(
         getattr(config, name, None) is not None
         for name in ("vision_config", "audio_config")
     )
+    if model_loader == "causal_lm":
+        if has_multimodal_config:
+            raise ValueError(
+                "causal_lm would discard the outer multimodal checkpoint "
+                "structure; use model_loader='auto' or 'multimodal_lm'"
+            )
+        return transformers_module.AutoModelForCausalLM
+
     if model_loader == "multimodal_lm" or has_multimodal_config:
         auto_cls = getattr(transformers_module, "AutoModelForMultimodalLM", None)
         if auto_cls is None:
