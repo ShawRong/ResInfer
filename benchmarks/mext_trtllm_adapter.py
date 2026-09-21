@@ -61,14 +61,19 @@ def prepare_weight(weight, fp4_utils):
     global_scale = (448.0 / weight.float().abs().max()).reshape(1).float()
     blocks = weight.float().contiguous().reshape(n, k // 32, 32)
     scales = (blocks.abs().amax(dim=-1) * (global_scale / 6.0))
-    scales = scales.to(torch.float8_e4m3fn).contiguous()
+    scales = torch.where(scales == 0, 1.0, scales)
+    scales = scales.clamp(min=2**-9, max=448.0).to(torch.float8_e4m3fn).contiguous()
     scaled = (blocks * global_scale / scales.float().clamp_min(1e-12).unsqueeze(-1))
     # E2M1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. The midpoints give
     # nearest-value rounding. Sign occupies the high bit of each nibble.
     edges = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
                          device=weight.device, dtype=torch.float32)
-    nibble = (torch.bucketize(scaled.abs().clamp_max(6.0), edges)
-              + (scaled < 0).to(torch.int64) * 8).to(torch.uint8)
+    magnitude = scaled.abs()
+    ordinal = torch.bucketize(magnitude, edges)
+    # ModelOpt rounds exact odd-indexed midpoints to the even E2M1 code.
+    odd_midpoint = ((magnitude == 0.75) | (magnitude == 1.75) |
+                    (magnitude == 3.5)).to(torch.int64)
+    nibble = (ordinal + odd_midpoint + (scaled < 0).to(torch.int64) * 8).to(torch.uint8)
     pair = nibble.reshape(n, k // 2, 2)
     packed = (pair[..., 0] | (pair[..., 1] << 4)).contiguous()
     scales = scales.view(fp4_utils.float4_sf_dtype)
