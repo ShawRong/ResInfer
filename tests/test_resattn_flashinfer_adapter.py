@@ -44,14 +44,6 @@ class AdapterTests(unittest.TestCase):
         self.assertFalse(impl.supports_quant_query_input)
         self.assertFalse(impl.fused_output_quant_supported(None))
 
-    def test_qk_residue_geometry_gate(self):
-        for gqa in (4, 6, 8):
-            with self.subTest(gqa=gqa):
-                self.assertTrue(adapter._qk_residue_for_geometry(gqa * 8, 8))
-        self.assertFalse(adapter._qk_residue_for_geometry(40, 8))
-        self.assertFalse(adapter._qk_residue_for_geometry(47, 8))
-        self.assertFalse(adapter._qk_residue_for_geometry(48, 0))
-
     def test_constructor_accepts_supported_gqa_ratios(self):
         def fake_init(obj):
             obj.supports_quant_query_input = True
@@ -74,18 +66,21 @@ class AdapterTests(unittest.TestCase):
                 self.assertFalse(impl.supports_quant_query_input)
 
     def test_constructor_rejects_unsupported_gqa_ratio(self):
-        def fake_init(obj):
-            obj.supports_quant_query_input = True
-            obj.is_kvcache_nvfp4 = True
-            obj.head_size, obj.num_heads, obj.num_kv_heads = 128, 40, 8
-            obj.alibi_slopes = obj.sinks = obj.logits_soft_cap = None
-            obj.kv_sharing_target_layer_name = None
-            obj.window_left = -1
+        for num_heads, num_kv_heads in ((40, 8), (47, 8), (48, 0)):
+            with self.subTest(num_heads=num_heads, num_kv_heads=num_kv_heads):
+                def fake_init(obj):
+                    obj.supports_quant_query_input = True
+                    obj.is_kvcache_nvfp4 = True
+                    obj.head_size = 128
+                    obj.num_heads, obj.num_kv_heads = num_heads, num_kv_heads
+                    obj.alibi_slopes = obj.sinks = obj.logits_soft_cap = None
+                    obj.kv_sharing_target_layer_name = None
+                    obj.window_left = -1
 
-        with patch.object(adapter.FlashInferImpl, '__init__', fake_init), \
-             patch.object(adapter, '_register_decode_warmup'), \
-             self.assertRaisesRegex(NotImplementedError, 'GQA4/6/8'):
-            adapter.ResAttnFlashInferImpl()
+                with patch.object(adapter.FlashInferImpl, '__init__', fake_init), \
+                     patch.object(adapter, '_register_decode_warmup'), \
+                     self.assertRaisesRegex(NotImplementedError, 'GQA4/6/8'):
+                    adapter.ResAttnFlashInferImpl()
 
     def test_stock_owns_cache_contract_and_writer(self):
         backend = adapter.ResAttnFlashInferBackend
