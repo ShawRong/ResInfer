@@ -125,6 +125,22 @@ def test_aggregate_macro_uses_unique_physical_shapes(tmp_path: Path):
     assert got["unique_shapes"] == 2
     assert next(r for r in got["by_m"] if r["arm"] == "fi_nvfp4_cutlass")["n_unique_shapes"] == 2
     assert next(r for r in got["by_m"] if r["arm"] == "fi_nvfp4_cutlass")["macro_median_ratio"] == 0.8
+    assert next(r for r in got["mxfp4_by_m"]
+                if r["arm"] == "fi_mxfp4_mxfp4_stock")["macro_median_ratio"] == 12 / 11
+
+
+def test_mxfp4_only_diagnostic_has_own_ratios(tmp_path: Path):
+    suite = load_suite(SUITE)
+    shapes, _ = resolve(suite, {}, ["qwen3_4b"])
+    arms = ["resinfer_mxfp4_mext_r1", "fi_mxfp4_mxfp4_stock"]
+    files = _sample_files(tmp_path, shapes[:1])
+    for path in files:
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows
+                                if row["arm"] in arms))
+    got = aggregate(files, shapes[:1], [8], arms, arms)
+    assert got["by_m"] == []
+    assert got["mxfp4_by_m"][0]["macro_median_ratio"] == 12 / 11
 
 
 def test_aggregate_rejects_duplicate_missing_and_required_failure(tmp_path: Path):

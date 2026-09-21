@@ -102,7 +102,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                              for arm in latency}
             ratios = {}
             for arm in arms:
-                if arm == "mext_r1" or arm not in latency:
+                if arm == "mext_r1" or arm not in latency or "mext_r1" not in latency:
                     continue
                 ratio = latency["mext_r1"] / latency[arm]
                 ratios[f"mext_over_{arm}"] = ratio

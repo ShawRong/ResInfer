@@ -35,7 +35,7 @@ ARM_FORMAT = {
     "fi_nvfp4_cutlass": ("NVFP4", "NVFP4", "FlashInfer CUTLASS"),
     "fi_nvfp4_cutedsl": ("NVFP4", "NVFP4", "FlashInfer CuTeDSL"),
     "resinfer_mxfp4_mext_r1": ("MXFP4", "MXFP4+residue", "ResInfer Fold"),
-    "fi_mxfp4_mxfp4_stock": ("MXFP4", "MXFP4", "FlashInfer grouped"),
+    "fi_mxfp4_mxfp4_stock": ("MXFP4", "MXFP4", "FlashInfer CuTeDSL"),
     "fi_mxfp4_mxfp8_w4a8": ("MXFP4", "MXFP8", "FlashInfer grouped"),
     "trtllm_nvfp4_fp8_w4a8": ("NVFP4", "FP8", "TensorRT-LLM"),
 }
@@ -274,8 +274,7 @@ def _worker(args: argparse.Namespace) -> int:
     import torch
     from flashinfer import (SfLayout, mm_fp4, mxfp4_quantize, mxfp8_quantize,
                             nvfp4_quantize)
-    from flashinfer.gemm import (group_gemm_mxfp4_nt_groupwise,
-                                group_gemm_mxfp8_mxfp4_nt_groupwise)
+    from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
 
     # The legacy provenance module prepends its own source-tree csrc/nvfp4 to
     # sys.path. Load the explicitly selected nvfp4 build first, so that
@@ -373,8 +372,6 @@ def _worker(args: argparse.Namespace) -> int:
                 padded_m = max(4, m)
                 indptr = torch.tensor([0, padded_m], device=device, dtype=torch.int32)
                 mx_output = torch.empty(padded_m, n, device=device, dtype=torch.bfloat16)
-                mx_stock_output = torch.empty(padded_m, n, device=device,
-                                              dtype=torch.bfloat16)
 
                 def mext(a, w, ws):
                     return torch.ops.residue.nvfp4_linear(
@@ -409,14 +406,11 @@ def _worker(args: argparse.Namespace) -> int:
                                            out_dtype=torch.bfloat16)
 
                 def fi_mxfp4_stock(a, w, ws):
-                    if a.shape[0] < 4:
-                        padded = torch.zeros(4, a.shape[1], device=a.device, dtype=a.dtype)
-                        padded[:a.shape[0]].copy_(a)
-                        a = padded
                     aq, asc = mxfp4_quantize(a)
-                    return group_gemm_mxfp4_nt_groupwise(
-                        aq, w, asc, ws, indptr, out=mx_stock_output,
-                        out_dtype=torch.bfloat16)[:m]
+                    return mm_fp4(
+                        aq, w.T, asc, ws.T, None, torch.bfloat16,
+                        outputs["fi_mxfp4_mxfp4_stock"], block_size=32,
+                        backend="cute-dsl", use_nvfp4=False)
 
                 def trtllm_w4a8(a, w, ws, input_scale, alpha):
                     return trtllm_w4a8_linear(a, w, ws, input_scale, alpha)
@@ -426,7 +420,7 @@ def _worker(args: argparse.Namespace) -> int:
                     "fi_nvfp4_cutlass": (fi_cutlass, (x, w_nv, ws_nv)),
                     "fi_nvfp4_cutedsl": (fi_cutedsl, (x, w_nv, ws_nv)),
                     "resinfer_mxfp4_mext_r1": (res_mxfp4_mext, (x, w_mx, ws_mx_flat)),
-                    "fi_mxfp4_mxfp4_stock": (fi_mxfp4_stock, (x, w_mx_batch, ws_mx_batch)),
+                    "fi_mxfp4_mxfp4_stock": (fi_mxfp4_stock, (x, w_mx, ws_mx)),
                     "fi_mxfp4_mxfp8_w4a8": (fi_w4a8, (x, w_mx_batch, ws_mx_batch)),
                 }
                 if trtllm_fp4_utils is not None:
@@ -449,8 +443,7 @@ def _worker(args: argparse.Namespace) -> int:
                     fmt_w, fmt_a, provider = ARM_FORMAT[arm]
                     row = dict(base, arm=arm, weight_format=fmt_w,
                                activation_format=fmt_a, provider=provider,
-                               physical_m=padded_m if arm in {
-                                   "fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp8_w4a8"} else m)
+                               physical_m=padded_m if arm == "fi_mxfp4_mxfp8_w4a8" else m)
                     try:
                         assert_args_consumed(fn, fn_args, label=arm)
                         fi_autotuned(fn, fn_args, m_bucket=m)
