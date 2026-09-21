@@ -1,5 +1,5 @@
 {
-  "name": "mext_paper_sm100_v2",
+  "name": "mext_paper_sm100_v3",
   "description": "Full online activation quantization plus GEMM; SM100 MExt paper matrix",
   "m_values": [
     1,
@@ -21,6 +21,17 @@
     "mext_r1",
     "fi_nvfp4_cutlass",
     "fi_nvfp4_cutedsl",
+    "resinfer_mxfp4_mext_r1",
+    "fi_mxfp4_mxfp4_stock",
+    "fi_mxfp4_mxfp8_w4a8",
+    "trtllm_nvfp4_fp8_w4a8"
+  ],
+  "required_arms": [
+    "mext_r1",
+    "fi_nvfp4_cutlass",
+    "fi_nvfp4_cutedsl",
+    "resinfer_mxfp4_mext_r1",
+    "fi_mxfp4_mxfp4_stock",
     "fi_mxfp4_mxfp8_w4a8",
     "trtllm_nvfp4_fp8_w4a8"
   ],

@@ -96,6 +96,8 @@ def _sample_files(tmp_path: Path, shapes: list[dict], duplicate=False) -> list[P
         for shape in shapes:
             for arm, us in (("mext_r1", 8.0), ("fi_nvfp4_cutlass", 10.0),
                             ("fi_nvfp4_cutedsl", 7.0),
+                            ("resinfer_mxfp4_mext_r1", 12.0),
+                            ("fi_mxfp4_mxfp4_stock", 11.0),
                             ("fi_mxfp4_mxfp8_w4a8", 20.0),
                             ("trtllm_nvfp4_fp8_w4a8", None)):
                 rows.append({"schema": 1, "kind": "measure", "run_id": "run",
@@ -143,3 +145,11 @@ def test_aggregate_rejects_duplicate_missing_and_required_failure(tmp_path: Path
     files[0].write_text("".join(json.dumps(r) + "\n" for r in rows))
     with pytest.raises(ValueError, match="required arm did not pass"):
         aggregate(files, shapes, [8], suite["arms"])
+
+
+def test_formal_suite_requires_real_trtllm_measurement(tmp_path: Path):
+    suite = load_suite(SUITE)
+    shapes, _ = resolve(suite, {}, ["qwen3_4b"])
+    files = _sample_files(tmp_path, shapes[:1])
+    with pytest.raises(ValueError, match="required arm did not pass"):
+        aggregate(files, shapes[:1], [8], suite["arms"], suite["required_arms"])

@@ -11,6 +11,7 @@ prints the physical shapes without importing CUDA packages or writing files.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import pathlib
@@ -33,6 +34,8 @@ ARM_FORMAT = {
     "mext_r1": ("NVFP4", "NVFP4+residue", "residue Fold"),
     "fi_nvfp4_cutlass": ("NVFP4", "NVFP4", "FlashInfer CUTLASS"),
     "fi_nvfp4_cutedsl": ("NVFP4", "NVFP4", "FlashInfer CuTeDSL"),
+    "resinfer_mxfp4_mext_r1": ("MXFP4", "MXFP4+residue", "ResInfer Fold"),
+    "fi_mxfp4_mxfp4_stock": ("MXFP4", "MXFP4", "FlashInfer grouped"),
     "fi_mxfp4_mxfp8_w4a8": ("MXFP4", "MXFP8", "FlashInfer grouped"),
     "trtllm_nvfp4_fp8_w4a8": ("NVFP4", "FP8", "TensorRT-LLM"),
 }
@@ -46,14 +49,19 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--model-config", action="append", default=[], metavar="MODEL=PATH")
     parser.add_argument("--model-tp", action="append", default=[], metavar="MODEL=TP[,TP]",
                         help="required deployment TP for models marked tp_required in suite")
+    parser.add_argument("--source-commit", help="exact source commit for archive-based GPU runs")
     parser.add_argument("--models", help="comma-separated subset; non-canonical")
     parser.add_argument("--shape-id", help="one resolved physical shape; non-canonical")
     parser.add_argument("--m-values", help="comma-separated subset; non-canonical")
+    parser.add_argument("--arms", help="comma-separated backend subset; non-canonical")
     parser.add_argument("--reps", type=int, help="override process reps; non-canonical")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume only shards matching the frozen manifest")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--resolved", type=pathlib.Path, help=argparse.SUPPRESS)
     parser.add_argument("--rep", type=int, help=argparse.SUPPRESS)
+    parser.add_argument("--shard-stem", type=pathlib.Path, help=argparse.SUPPRESS)
     args = parser.parse_args()
     if not args.dry_run and args.outdir is None:
         parser.error("--outdir is required unless --dry-run")
@@ -76,16 +84,48 @@ def _prepare(args: argparse.Namespace) -> dict:
     reps = args.reps if args.reps is not None else suite["process_reps"]
     if reps < 1:
         raise ValueError("--reps must be positive")
-    canonical = not (args.models or args.shape_id or args.m_values or args.reps is not None)
+    arms = args.arms.split(",") if args.arms else suite["arms"]
+    if not arms or len(set(arms)) != len(arms) or set(arms) - set(suite["arms"]):
+        raise ValueError("--arms must be a nonempty unique subset of suite arms")
+    canonical = not (args.models or args.shape_id or args.m_values or args.arms
+                     or args.reps is not None)
+    source_commit = args.source_commit
+    source_root = pathlib.Path(__file__).resolve().parents[1]
+    git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_root,
+                         capture_output=True, text=True, check=False)
+    if git.returncode == 0:
+        live_commit = git.stdout.strip()
+        if source_commit and source_commit != live_commit:
+            raise ValueError("--source-commit does not match the source checkout")
+        source_commit = live_commit
+    if not args.dry_run and not source_commit:
+        raise ValueError("archive-based GPU runs require --source-commit")
+    required_arms = [arm for arm in suite.get("required_arms", suite["arms"])
+                     if arm in arms]
+    if len(set(required_arms)) != len(required_arms) or set(required_arms) - set(suite["arms"]):
+        raise ValueError("required_arms must be a unique subset of suite arms")
     return {"schema": 1, "run_id": uuid.uuid4().hex, "suite": suite["name"],
-            "suite_path": str(args.suite.resolve()), "canonical_matrix": canonical,
+            "suite_path": str(args.suite.resolve()),
+            "suite_sha256": hashlib.sha256(args.suite.read_bytes()).hexdigest(),
+            "source_commit": source_commit, "canonical_matrix": canonical,
             "config_sources": sources, "shapes": shapes, "m_values": m_values,
-            "arms": suite["arms"], "process_reps": reps,
+            "arms": arms, "required_arms": required_arms, "process_reps": reps,
             "timing_repeats": suite["timing_repeats"], "required_env": REQUIRED_ENV}
 
 
 def _driver(args: argparse.Namespace) -> int:
-    resolved = _prepare(args)
+    requested = _prepare(args)
+    output = args.outdir.resolve() if args.outdir else None
+    if args.resume:
+        if output is None:
+            raise ValueError("--resume requires --outdir")
+        resolved = json.loads((output / "resolved.json").read_text())
+        if {k: v for k, v in resolved.items() if k != "run_id"} != {
+            k: v for k, v in requested.items() if k != "run_id"
+        }:
+            raise ValueError("--resume arguments/source/config differ from frozen manifest")
+    else:
+        resolved = requested
     print(json.dumps({"suite": resolved["suite"], "unique_shapes": len(resolved["shapes"]),
                       "aliases": sum(len(s["aliases"]) for s in resolved["shapes"]),
                       "m_values": resolved["m_values"], "arms": resolved["arms"],
@@ -103,26 +143,72 @@ def _driver(args: argparse.Namespace) -> int:
     if "CUDA_VISIBLE_DEVICES" in env and env["CUDA_VISIBLE_DEVICES"] != str(args.gpu):
         raise ValueError("CUDA_VISIBLE_DEVICES conflicts with --gpu")
     env["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
-    output = args.outdir.resolve()
-    output.mkdir(parents=True, exist_ok=False)
+    if not args.resume:
+        output.mkdir(parents=True, exist_ok=False)
     frozen = output / "resolved.json"
-    frozen.write_text(json.dumps(resolved, indent=2) + "\n")
+    if not args.resume:
+        frozen.write_text(json.dumps(resolved, indent=2) + "\n")
+    shards_dir = output / "shards"
+    shards_dir.mkdir(exist_ok=args.resume)
     rep_files = []
+    all_provenance = []
     for rep in range(resolved["process_reps"]):
         rep_file = output / f"rep{rep}.jsonl"
         rep_files.append(rep_file)
-        command = [sys.executable, "-m", "benchmarks.mext_paper_sweep", "--worker",
-                   "--resolved", str(frozen), "--outdir", str(output), "--rep", str(rep)]
-        with (output / f"rep{rep}.log").open("x") as log:
-            result = subprocess.run(command, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                    cwd=pathlib.Path(__file__).resolve().parents[1], check=False)
-        if result.returncode:
-            (output / "status.json").write_text(json.dumps(
-                {"status": "incomplete", "failed_rep": rep, "exit_code": result.returncode}, indent=2) + "\n")
-            print(f"rep{rep} failed (exit={result.returncode}); see {output / f'rep{rep}.log'}", file=sys.stderr)
-            return result.returncode
+        selected_shards = []
+        for shape in resolved["shapes"]:
+            shape_dir = shards_dir / f"rep{rep}" / shape["shape_id"]
+            shape_dir.mkdir(parents=True, exist_ok=True)
+            attempts = sorted({int(p.name.split(".")[0].removeprefix("attempt"))
+                               for p in shape_dir.glob("attempt*.*")})
+            selected = None
+            for attempt in attempts:
+                stem = shape_dir / f"attempt{attempt}"
+                try:
+                    _validate_shard(stem, resolved, rep, shape)
+                except (ValueError, OSError):
+                    continue
+                selected = stem
+                break
+            if selected is None:
+                stem = shape_dir / f"attempt{max(attempts, default=-1) + 1}"
+                command = [sys.executable, "-m", "benchmarks.mext_paper_sweep",
+                           "--worker", "--resolved", str(frozen), "--outdir", str(output),
+                           "--rep", str(rep), "--shape-id", shape["shape_id"],
+                           "--shard-stem", str(stem)]
+                with pathlib.Path(f"{stem}.log").open("x") as log:
+                    result = subprocess.run(
+                        command, env=env, stdout=log, stderr=subprocess.STDOUT,
+                        cwd=pathlib.Path(__file__).resolve().parents[1], check=False)
+                if result.returncode:
+                    (output / "status.json").write_text(json.dumps(
+                        {"status": "incomplete", "failed_rep": rep,
+                         "shape_id": shape["shape_id"], "attempt": stem.name,
+                         "exit_code": result.returncode}, indent=2) + "\n")
+                    print(f"{stem} failed (exit={result.returncode}); see {stem}.log",
+                          file=sys.stderr)
+                    return result.returncode
+                _validate_shard(stem, resolved, rep, shape)
+                selected = stem
+            selected_shards.append(selected)
+            all_provenance.append(json.loads(pathlib.Path(f"{selected}.provenance.json").read_text()))
+        tmp = output / f"rep{rep}.jsonl.tmp"
+        with tmp.open("w") as stream:
+            for stem in selected_shards:
+                stream.write(pathlib.Path(f"{stem}.jsonl").read_text())
+        tmp.replace(rep_file)
+        (output / f"rep{rep}.provenance.json").write_text(json.dumps(
+            {"kind": "shard_manifest", "rep": rep,
+             "shards": [str(stem) for stem in selected_shards]}, indent=2) + "\n")
+    fingerprints = {_runtime_fingerprint(prov) for prov in all_provenance}
+    if len(fingerprints) != 1:
+        reason = "shards have mixed Runtime/binary/GPU fingerprints"
+        (output / "status.json").write_text(json.dumps(
+            {"status": "incomplete", "reason": reason}, indent=2) + "\n")
+        raise ValueError(reason)
     try:
-        summary = aggregate(rep_files, resolved["shapes"], resolved["m_values"], resolved["arms"])
+        summary = aggregate(rep_files, resolved["shapes"], resolved["m_values"],
+                            resolved["arms"], resolved["required_arms"])
     except ValueError as exc:
         (output / "status.json").write_text(json.dumps(
             {"status": "incomplete", "reason": str(exc)}, indent=2) + "\n")
@@ -135,21 +221,76 @@ def _driver(args: argparse.Namespace) -> int:
     return 0
 
 
+def _runtime_fingerprint(prov: dict) -> str:
+    return json.dumps({
+        "source_commit": prov.get("source_commit"),
+        "suite_sha256": prov.get("suite_sha256"),
+        "loaded_nvfp4_so_sha256": prov.get("loaded_nvfp4_so_sha256"),
+        "trtllm_version": prov.get("trtllm_version"),
+        "candidate_hash": prov.get("candidate_hash"),
+        "torch": prov.get("torch"), "flashinfer": prov.get("flashinfer"),
+        "cuda": prov.get("cuda"), "driver_version": prov.get("driver_version"),
+        "gpu_uuid": prov.get("gpu", {}).get("uuid"),
+    }, sort_keys=True)
+
+
+def _validate_shard(stem: pathlib.Path, resolved: dict, rep: int,
+                    shape: dict) -> None:
+    rows_path = pathlib.Path(f"{stem}.jsonl")
+    provenance_path = pathlib.Path(f"{stem}.provenance.json")
+    if not rows_path.exists() or not provenance_path.exists():
+        raise ValueError(f"incomplete shard {stem}")
+    prov = json.loads(provenance_path.read_text())
+    if (prov.get("run_id") != resolved["run_id"] or prov.get("rep") != rep or
+        prov.get("source_commit") != resolved["source_commit"] or
+        prov.get("suite_sha256") != resolved["suite_sha256"] or
+        not prov.get("loaded_nvfp4_so_sha256")):
+        raise ValueError(f"shard provenance mismatch: {stem}")
+    expected = {(m, arm) for m in resolved["m_values"] for arm in resolved["arms"]}
+    try:
+        rows = [json.loads(line) for line in rows_path.read_text().splitlines()]
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"malformed shard {stem}") from exc
+    keys = {(row.get("m"), row.get("arm")) for row in rows}
+    if len(rows) != len(expected) or keys != expected:
+        raise ValueError(f"missing or duplicate shard cells: {stem}")
+    for row in rows:
+        if (row.get("run_id") != resolved["run_id"] or row.get("rep") != rep or
+            row.get("shape_id") != shape["shape_id"] or
+            row.get("n") != shape["n"] or row.get("k") != shape["k"] or
+            row.get("aliases") != shape["aliases"] or
+            row.get("cold_l2_effective") is not True or
+            row.get("status") != "passed" or
+            not isinstance(row.get("us"), (int, float)) or row["us"] <= 0):
+            raise ValueError(f"invalid shard cell: {stem}")
+
+
 def _worker(args: argparse.Namespace) -> int:
     # Imports deliberately delayed: --dry-run and aggregation work on CPU-only hosts.
     import hashlib
     import importlib.util
+    import importlib.metadata
 
     import torch
     from flashinfer import (SfLayout, mm_fp4, mxfp4_quantize, mxfp8_quantize,
                             nvfp4_quantize)
-    from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
+    from flashinfer.gemm import (group_gemm_mxfp4_nt_groupwise,
+                                group_gemm_mxfp8_mxfp4_nt_groupwise)
 
     # The legacy provenance module prepends its own source-tree csrc/nvfp4 to
     # sys.path. Load the explicitly selected nvfp4 build first, so that
     # bookkeeping cannot shadow the compiled extension used for measurement.
     import nvfp4
     nvfp4.ensure_loaded()
+    from nvfp4.mxfp4 import fold_gemm as mxfp4_fold_gemm
+    from nvfp4.mxfp4 import quantize_mext as mxfp4_quantize_mext
+
+    from .mext_trtllm_adapter import linear as trtllm_w4a8_linear
+    from .mext_trtllm_adapter import prepare_weight as prepare_trtllm_weight
+    from .mext_trtllm_adapter import require_dense_ops
+    resolved = json.loads(args.resolved.read_text())
+    trtllm_fp4_utils = (require_dense_ops()
+                       if "trtllm_nvfp4_fp8_w4a8" in resolved["arms"] else None)
 
     from benchmarks._common import (assert_args_consumed, fi_autotuned,
                                     iters_for_cold_l2, l2_accounting,
@@ -159,7 +300,6 @@ def _worker(args: argparse.Namespace) -> int:
     from quant.vllm_integration import residue_linear_op  # noqa: F401
     from quant.vllm_integration import sm10x_fold_tuner
 
-    resolved = json.loads(args.resolved.read_text())
     if torch.cuda.get_device_capability(0) != (10, 0):
         raise RuntimeError("paper suite requires SM100 (B200/Blackwell)")
     for key, value in resolved["required_env"].items():
@@ -172,10 +312,14 @@ def _worker(args: argparse.Namespace) -> int:
     neighbors = assert_gpu_exclusive(0)
     prov = provenance(0, resolved["run_id"])
     prov.update({"rep": args.rep, "suite": resolved["suite"],
+                 "source_commit": resolved["source_commit"],
+                 "suite_sha256": resolved["suite_sha256"],
                  "pdl": os.environ["NVFP4_MEXT_R1_PDL"],
                  "fold_max_m": os.environ["RESIDUE_MEXT_FOLD_MAX_M"],
                  "fold_mext": os.environ["RESIDUE_FOLD_MEXT"],
                  "candidate_hash": sm10x_fold_tuner.candidates_hash()})
+    if trtllm_fp4_utils is not None:
+        prov["trtllm_version"] = importlib.metadata.version("tensorrt-llm")
     extension = importlib.util.find_spec("nvfp4._C")
     if extension is None or extension.origin is None:
         raise RuntimeError("nvfp4._C is not installed; build the patched extension first")
@@ -186,14 +330,19 @@ def _worker(args: argparse.Namespace) -> int:
                              "--query-gpu=driver_version", "--format=csv,noheader"],
                             capture_output=True, text=True, check=False)
     prov["driver_version"] = driver.stdout.strip() if driver.returncode == 0 else None
-    (args.outdir / f"rep{args.rep}.provenance.json").write_text(json.dumps(prov, indent=2) + "\n")
-    output = args.outdir / f"rep{args.rep}.jsonl"
+    stem = args.shard_stem or args.outdir / f"rep{args.rep}"
+    pathlib.Path(f"{stem}.provenance.json").write_text(json.dumps(prov, indent=2) + "\n")
+    output = pathlib.Path(f"{stem}.jsonl")
+    shapes = [shape for shape in resolved["shapes"]
+              if args.shape_id is None or shape["shape_id"] == args.shape_id]
+    if len(shapes) != 1:
+        raise RuntimeError("worker requires exactly one resolved physical shape")
     with output.open("x") as stream:
         def emit(row: dict) -> None:
             stream.write(json.dumps(row) + "\n")
             stream.flush()
 
-        for shape in resolved["shapes"]:
+        for shape in shapes:
             n, k = shape["n"], shape["k"]
             weight = torch.randn(n, k, device=device, dtype=torch.bfloat16) / (k ** 0.5)
             wgs = (448.0 * 6.0 / weight.float().abs().max()).reshape(())
@@ -202,20 +351,30 @@ def _worker(args: argparse.Namespace) -> int:
             # FlashInfer quantizers already return SM100-interleaved scale
             # factors. Re-interleaving them silently corrupts W4A8 output.
             w_mx, ws_mx = mxfp4_quantize(weight)
-            w_mx = w_mx.unsqueeze(0)
-            ws_mx = ws_mx.unsqueeze(0)
+            ws_mx_flat = ws_mx.flatten().contiguous()
+            w_mx_batch = w_mx.unsqueeze(0)
+            ws_mx_batch = ws_mx.unsqueeze(0)
+            if trtllm_fp4_utils is not None:
+                w_trt, ws_trt, wgs_trt = prepare_trtllm_weight(weight, trtllm_fp4_utils)
             mask = torch.empty(1, device=device, dtype=torch.uint8)
             for m in resolved["m_values"]:
                 assert_gpu_exclusive(0)
                 x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
                 xgs = (448.0 * 6.0 / x.float().abs().max()).reshape(())
                 alpha = (1.0 / (xgs * wgs)).reshape(1).float()
+                if trtllm_fp4_utils is not None:
+                    # TRT's static FP8 op takes the dequantization scale
+                    # (amax / 448); the FP4 weight producer takes its inverse.
+                    x_scale_trt = (x.float().abs().max() / 448.0).reshape(1).float()
+                    alpha_trt = (x_scale_trt / wgs_trt).reshape(1).float()
                 reference = x @ weight.T
                 outputs = {arm: torch.empty(m, n, device=device, dtype=torch.bfloat16)
                            for arm in resolved["arms"] if arm != "mext_r1"}
                 padded_m = max(4, m)
                 indptr = torch.tensor([0, padded_m], device=device, dtype=torch.int32)
                 mx_output = torch.empty(padded_m, n, device=device, dtype=torch.bfloat16)
+                mx_stock_output = torch.empty(padded_m, n, device=device,
+                                              dtype=torch.bfloat16)
 
                 def mext(a, w, ws):
                     return torch.ops.residue.nvfp4_linear(
@@ -244,12 +403,35 @@ def _worker(args: argparse.Namespace) -> int:
                         aq, w, asf, ws, indptr, out=mx_output,
                         out_dtype=torch.bfloat16)[:m]
 
+                def res_mxfp4_mext(a, w, ws):
+                    aq, asc = mxfp4_quantize_mext(a)
+                    return mxfp4_fold_gemm(aq, w, asc, ws,
+                                           out_dtype=torch.bfloat16)
+
+                def fi_mxfp4_stock(a, w, ws):
+                    if a.shape[0] < 4:
+                        padded = torch.zeros(4, a.shape[1], device=a.device, dtype=a.dtype)
+                        padded[:a.shape[0]].copy_(a)
+                        a = padded
+                    aq, asc = mxfp4_quantize(a)
+                    return group_gemm_mxfp4_nt_groupwise(
+                        aq, w, asc, ws, indptr, out=mx_stock_output,
+                        out_dtype=torch.bfloat16)[:m]
+
+                def trtllm_w4a8(a, w, ws, input_scale, alpha):
+                    return trtllm_w4a8_linear(a, w, ws, input_scale, alpha)
+
                 runners = {
                     "mext_r1": (mext, (x, w_nv, ws_mext)),
                     "fi_nvfp4_cutlass": (fi_cutlass, (x, w_nv, ws_nv)),
                     "fi_nvfp4_cutedsl": (fi_cutedsl, (x, w_nv, ws_nv)),
-                    "fi_mxfp4_mxfp8_w4a8": (fi_w4a8, (x, w_mx, ws_mx)),
+                    "resinfer_mxfp4_mext_r1": (res_mxfp4_mext, (x, w_mx, ws_mx_flat)),
+                    "fi_mxfp4_mxfp4_stock": (fi_mxfp4_stock, (x, w_mx_batch, ws_mx_batch)),
+                    "fi_mxfp4_mxfp8_w4a8": (fi_w4a8, (x, w_mx_batch, ws_mx_batch)),
                 }
+                if trtllm_fp4_utils is not None:
+                    runners["trtllm_nvfp4_fp8_w4a8"] = (
+                        trtllm_w4a8, (x, w_trt, ws_trt, x_scale_trt, alpha_trt))
                 niw = iters_for_cold_l2(runners["fi_nvfp4_cutlass"][1], device)
                 l2 = l2_accounting(runners["fi_nvfp4_cutlass"][1], device, niw)
                 if l2.get("cold_l2_effective") is not True:
@@ -267,7 +449,8 @@ def _worker(args: argparse.Namespace) -> int:
                     fmt_w, fmt_a, provider = ARM_FORMAT[arm]
                     row = dict(base, arm=arm, weight_format=fmt_w,
                                activation_format=fmt_a, provider=provider,
-                               physical_m=padded_m if arm == "fi_mxfp4_mxfp8_w4a8" else m)
+                               physical_m=padded_m if arm in {
+                                   "fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp8_w4a8"} else m)
                     try:
                         assert_args_consumed(fn, fn_args, label=arm)
                         fi_autotuned(fn, fn_args, m_bucket=m)
@@ -297,12 +480,6 @@ def _worker(args: argparse.Namespace) -> int:
                     emit(row)
                     if row["status"] != "passed":
                         raise RuntimeError(f"{shape['shape_id']} M={m} {arm}: {row['reason']}")
-                for arm in resolved["arms"]:
-                    if arm not in runners:
-                        fmt_w, fmt_a, provider = ARM_FORMAT[arm]
-                        emit(dict(base, arm=arm, weight_format=fmt_w,
-                                  activation_format=fmt_a, provider=provider,
-                                  status="skipped", reason="No validated TensorRT-LLM NVFP4xFP8 adapter in this runtime"))
                 assert_gpu_exclusive(0)
     return 0
 

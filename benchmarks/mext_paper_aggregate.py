@@ -32,7 +32,10 @@ def _rows(path: Path) -> list[dict]:
 
 
 def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
-              arms: list[str]) -> dict:
+              arms: list[str], required_arms: list[str] | None = None) -> dict:
+    required = set(REQUIRED_ARMS if required_arms is None else required_arms)
+    if required - set(arms):
+        raise ValueError(f"required arms missing from suite: {sorted(required - set(arms))}")
     expected_shape = {shape["shape_id"]: shape for shape in shapes}
     if len(expected_shape) != len(shapes):
         raise ValueError("duplicate physical shapes in frozen manifest")
@@ -68,14 +71,14 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
     if missing:
         raise ValueError(f"missing {len(missing)} cells; first: {sorted(missing)[:3]}")
     for key, row in observed.items():
-        if key[3] in REQUIRED_ARMS and row["status"] != "passed":
+        if key[3] in required and row["status"] != "passed":
             raise ValueError(f"required arm did not pass: {key}: {row.get('reason')}")
-        if key[3] in OPTIONAL_ARMS and row["status"] == "failed":
+        if key[3] not in required and row["status"] == "failed":
             raise ValueError(f"optional arm failed after engagement: {key}: {row.get('reason')}")
     for sid in expected_shape:
         for m in m_values:
-            for arm in OPTIONAL_ARMS:
-                if arm in arms:
+            for arm in arms:
+                if arm not in required:
                     states = {observed[(rep, sid, m, arm)]["status"]
                               for rep in range(len(files))}
                     if len(states) != 1:
@@ -83,6 +86,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
 
     points = []
     macro: dict[tuple[str, int], list[float]] = defaultdict(list)
+    mx_macro: dict[tuple[str, int], list[float]] = defaultdict(list)
     for sid, shape in expected_shape.items():
         for m in m_values:
             latency = {arm: statistics.median(
@@ -91,6 +95,11 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                 for arm in arms if all(
                     observed[(rep, sid, m, arm)]["status"] == "passed"
                     for rep in range(len(files)))}
+            process_range = {arm: [min(observed[(rep, sid, m, arm)]["us"]
+                                       for rep in range(len(files))),
+                                   max(observed[(rep, sid, m, arm)]["us"]
+                                       for rep in range(len(files)))]
+                             for arm in latency}
             ratios = {}
             for arm in arms:
                 if arm == "mext_r1" or arm not in latency:
@@ -98,15 +107,25 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                 ratio = latency["mext_r1"] / latency[arm]
                 ratios[f"mext_over_{arm}"] = ratio
                 macro[(arm, m)].append(ratio)
+            mx_arm = "resinfer_mxfp4_mext_r1"
+            for arm in ("fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp8_w4a8"):
+                if mx_arm in latency and arm in latency:
+                    ratio = latency[mx_arm] / latency[arm]
+                    ratios[f"mxfp4_mext_over_{arm}"] = ratio
+                    mx_macro[(arm, m)].append(ratio)
             points.append({"shape_id": sid, "n": shape["n"], "k": shape["k"],
                            "m": m, "aliases": shape["aliases"],
-                           "latency_us": latency, "ratios": ratios})
+                           "latency_us": latency, "process_range_us": process_range,
+                           "ratios": ratios})
     by_m = [{"arm": arm, "m": m, "n_unique_shapes": len(values),
              "macro_median_ratio": statistics.median(values)}
             for (arm, m), values in sorted(macro.items())]
+    mx_by_m = [{"arm": arm, "m": m, "n_unique_shapes": len(values),
+                "macro_median_ratio": statistics.median(values)}
+               for (arm, m), values in sorted(mx_macro.items())]
     return {"schema": SCHEMA, "status": "complete", "run_id": next(iter(run_ids)),
             "process_reps": len(files), "unique_shapes": len(shapes),
-            "points": points, "by_m": by_m}
+            "points": points, "by_m": by_m, "mxfp4_by_m": mx_by_m}
 
 
 def write_outputs(summary: dict, directory: Path) -> None:
@@ -114,7 +133,8 @@ def write_outputs(summary: dict, directory: Path) -> None:
     with (directory / "points.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=(
             "shape_id", "n", "k", "m", "models_projections_tp", "arm",
-            "latency_us", "mext_over_arm"))
+            "latency_us", "process_min_us", "process_max_us", "mext_over_arm",
+            "mxfp4_mext_over_arm"))
         writer.writeheader()
         for point in summary["points"]:
             aliases = ";".join(f"{a['model']}/{a['projection']}/tp{a['tp']}"
@@ -124,4 +144,8 @@ def write_outputs(summary: dict, directory: Path) -> None:
                                  "k": point["k"], "m": point["m"],
                                  "models_projections_tp": aliases, "arm": arm,
                                  "latency_us": us,
-                                 "mext_over_arm": point["ratios"].get(f"mext_over_{arm}")})
+                                 "process_min_us": point["process_range_us"][arm][0],
+                                 "process_max_us": point["process_range_us"][arm][1],
+                                 "mext_over_arm": point["ratios"].get(f"mext_over_{arm}"),
+                                 "mxfp4_mext_over_arm": point["ratios"].get(
+                                     f"mxfp4_mext_over_{arm}")})
