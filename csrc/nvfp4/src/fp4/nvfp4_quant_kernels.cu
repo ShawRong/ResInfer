@@ -125,7 +125,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                                   Type const* in, float const* SFScale,
                                   uint32_t* out, uint32_t* SFout,
                                   int32_t layoutMode,
-                                  int32_t numSFScales) {
+                                  int32_t numSFScales,
+                                  bool enablePDL) {
   using PackedVec8 = PackedVec<Type>;
   static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
       (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
@@ -138,8 +139,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
   int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
   int colGroups = numCols / CVT_FP4_ELTS_PER_THREAD;
-  if (colIdx >= colGroups) return;
 
+  if (colIdx < colGroups)
   for (int rowIdx = blockIdx.x; rowIdx < outputRows; rowIdx += gridDim.x) {
     bool validRow = rowIdx < inputRows;
     int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
@@ -195,6 +196,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     out_pos = cvt_warp_fp16_to_fp4_mext_r1_fast<Type, UE8M0_SF>(
         in_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out, residue_sf_out);
   }
+  __syncthreads();
+  if (enablePDL && threadIdx.x == 0) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
 template <class Type, bool UE8M0_SF = false>
@@ -204,7 +209,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                                    Type const* in, float const* SFScale,
                                    uint32_t* out, uint32_t* SFout,
                                    int32_t layoutMode,
-                                   int32_t numSFScales) {
+                                   int32_t numSFScales,
+                                   bool enablePDL) {
   using PackedVec8 = PackedVec<Type>;
   constexpr int CVT_FP4_NUM_THREADS_PER_SF = 1;
 
@@ -214,8 +220,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
 
   int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
   int colGroups = numCols / 16;
-  if (colIdx >= colGroups) return;
 
+  if (colIdx < colGroups)
   for (int rowIdx = blockIdx.x; rowIdx < outputRows; rowIdx += gridDim.x) {
     bool validRow = rowIdx < inputRows;
     int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
@@ -259,6 +265,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     // Single 64-bit store; outOffset is even because numCols % 16 == 0.
     *reinterpret_cast<uint2*>(out + outOffset) =
         make_uint2(packed.lo, packed.hi);
+  }
+  __syncthreads();
+  if (enablePDL && threadIdx.x == 0) {
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 }
 
@@ -403,7 +413,7 @@ void invokeFP4QuantizationMExtR1(int input_m, int output_m, int n,
                                  int elts_mode, int layout_mode,
                                  int numSFScales,
                                  int multiProcessorCount, int ccMajor,
-                                 cudaStream_t stream) {
+                                 cudaStream_t stream, bool enablePDL) {
   bool pack16 = use_pack16_for_mode(elts_mode, ccMajor);
   int normalized_layout_mode = normalize_mext_r1_layout_mode(layout_mode);
   // kConcatK is implemented in the pack8 kernel only; pack8 is correct on
@@ -428,29 +438,46 @@ void invokeFP4QuantizationMExtR1(int input_m, int output_m, int n,
   dim3 grid(std::min(int(output_m), multiProcessorCount * numBlocksPerSM),
             cuda_utils::ceil_div(colGroups, static_cast<int>(block.x)));
 
+  cudaLaunchConfig_t launchConfig{};
+  launchConfig.gridDim = grid;
+  launchConfig.blockDim = block;
+  launchConfig.dynamicSmemBytes = 0;
+  launchConfig.stream = stream;
+  cudaLaunchAttribute launchAttr{};
+  if (enablePDL) {
+    launchAttr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    launchAttr.val.programmaticStreamSerializationAllowed = 1;
+    launchConfig.attrs = &launchAttr;
+    launchConfig.numAttrs = 1;
+  }
+
   if (useUE8M0) {
     if (pack16) {
-      cvt_fp16_to_fp4_mext_r1_pack16<T, true><<<grid, block, 0, stream>>>(
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack16<T, true>,
           input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
           reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
-          numSFScales);
+          numSFScales, enablePDL);
     } else {
-      cvt_fp16_to_fp4_mext_r1_pack8<T, true><<<grid, block, 0, stream>>>(
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack8<T, true>,
           input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
           reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
-          numSFScales);
+          numSFScales, enablePDL);
     }
   } else {
     if (pack16) {
-      cvt_fp16_to_fp4_mext_r1_pack16<T, false><<<grid, block, 0, stream>>>(
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack16<T, false>,
           input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
           reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
-          numSFScales);
+          numSFScales, enablePDL);
     } else {
-      cvt_fp16_to_fp4_mext_r1_pack8<T, false><<<grid, block, 0, stream>>>(
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack8<T, false>,
           input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
           reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
-          numSFScales);
+          numSFScales, enablePDL);
     }
   }
 }
@@ -473,13 +500,14 @@ template void invokeFP4Quantization(int m, int n_ext, int n, __nv_bfloat16 const
 template void invokeFP4QuantizationMExtR1(
     int input_m, int output_m, int n, half const* input, float const* SFScale,
     int64_t* output, int32_t* SFOuput, bool useUE8M0, int elts_mode, int layout_mode,
-    int numSFScales, int multiProcessorCount, int ccMajor, cudaStream_t stream);
+    int numSFScales, int multiProcessorCount, int ccMajor, cudaStream_t stream,
+    bool enablePDL);
 
 template void invokeFP4QuantizationMExtR1(
     int input_m, int output_m, int n, __nv_bfloat16 const* input,
     float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0,
     int elts_mode, int layout_mode, int numSFScales, int multiProcessorCount,
-    int ccMajor, cudaStream_t stream);
+    int ccMajor, cudaStream_t stream, bool enablePDL);
 
 }  // namespace vllm
 
@@ -529,7 +557,8 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
                                    torch::Tensor const& output_sf,
                                    torch::Tensor const& input_sf,
                                    int64_t elts_mode,
-                                   int64_t layout_mode) {
+                                   int64_t layout_mode,
+                                   bool enable_pdl) {
   int32_t m = input.size(0);
   int32_t n = input.size(1);
 
@@ -608,6 +637,6 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
         m, static_cast<int>(output_m), n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0,
         static_cast<int>(elts_mode), static_cast<int>(layout_mode),
         static_cast<int>(input_sf.numel()), multiProcessorCount, ccMajor,
-        stream);
+        stream, enable_pdl);
   });
 }

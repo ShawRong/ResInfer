@@ -27,7 +27,8 @@ void scaled_fp4_quant_mext_r1(torch::Tensor& output, torch::Tensor const& input,
                               torch::Tensor& output_sf,
                               torch::Tensor const& input_sf,
                               int64_t elts_mode,
-                              int64_t layout_mode);
+                              int64_t layout_mode,
+                              bool enable_pdl);
 
 void nvfp4_quantize_q(torch::Tensor const& q, torch::Tensor& q_pack,
                       torch::Tensor& q_sf);
@@ -76,7 +77,8 @@ TORCH_LIBRARY(nvfp4, m) {
   m.def(
       "scaled_fp4_quant_mext_r1(Tensor(a!) output, Tensor input, "
       "                         Tensor(b!) output_scale, Tensor input_scale, "
-      "                         int elts_mode, int layout_mode) -> ()");
+      "                         int elts_mode, int layout_mode, "
+      "                         bool enable_pdl=True) -> ()");
   m.def(
       "official_scaled_fp4_quant_pack8(Tensor(a!) output, Tensor input, "
       "                                Tensor(b!) output_scale, Tensor input_scale) -> ()");

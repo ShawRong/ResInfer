@@ -75,6 +75,8 @@ KNOWN: dict[str, tuple] = {
                                   {"auto", "two_gemm", "k_loop"},
                                   'mext_r1 prefill route: auto selects FlashInfer-tuned two_gemm or k_loop; decode routing is independent.'),
     "RESIDUE_FOLD_MEXT": ("one", None, "enable A4/A6 tile8 families (sm10x)"),
+    "RESIDUE_MEXT_FOLD_MAX_M": ("int", None,
+                                 "largest SM10x MExt-r1 M routed to Fold; default 512"),
     "RESIDUE_FOLD_SILENCE_DEFAULT": ("one", None,
                                      "silence the static-tactic-table warning"),
     "RESIDUE_SM120_FOLD_TUNER": ("enum", {"0", "1"},

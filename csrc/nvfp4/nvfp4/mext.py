@@ -111,10 +111,25 @@ def scaled_fp4_quant_mext_r1(
     elts_mode=None,
     layout_mode=None,
     m_pad_multiple=None,
+    enable_pdl: bool | None = None,
 ):
     'Ratio=1.0 M-extension FP4 quantization entrypoint.'
     resolved_elts_mode = _resolve_mext_r1_elts_mode(elts_mode)
     resolved_layout_mode = _resolve_mext_r1_layout_mode(layout_mode)
+    if enable_pdl is None:
+        configured = os.getenv("NVFP4_MEXT_R1_PDL", "auto").strip().lower()
+        if configured in {"1", "true", "on", "yes"}:
+            enable_pdl = True
+        elif configured in {"0", "false", "off", "no"}:
+            enable_pdl = False
+        elif configured in {"", "auto", "default"}:
+            major, _ = torch.cuda.get_device_capability(input_tensor.device)
+            enable_pdl = major >= 9
+        else:
+            raise ValueError(
+                "NVFP4_MEXT_R1_PDL must be auto/on/off (or 1/0), got "
+                f"{configured!r}"
+            )
 
     m, k = input_tensor.shape
     if k % 16 != 0:
@@ -186,6 +201,7 @@ def scaled_fp4_quant_mext_r1(
         input_scale,
         resolved_elts_mode,
         resolved_layout_mode,
+        bool(enable_pdl),
     )
     if resolved_layout_mode == _MEXT_R1_LAYOUT_CONCAT_K:
         # [M, 2K] packed: K bytes per row (2 FP4 elements per byte).
