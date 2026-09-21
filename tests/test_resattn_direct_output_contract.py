@@ -57,6 +57,28 @@ class DirectOutputContractTests(unittest.TestCase):
                 exec(code, dict(direct_output=direct, reduction=reduction, out_eff=out))
                 self.assertEqual(out.zero_.call_count, int(direct and reduction == 'none'))
 
+    def test_compact_gqa4_auto_plan_stays_on_supported_no_split_path(self):
+        tree = ast.parse(HOST.read_text())
+        fn = next(
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == 'plan_qmul4_decode_nvfp4'
+        )
+        namespace = {
+            'Tuple': tuple,
+            '_padded_group_size': lambda qo, kv: 8 if qo // kv == 4 else 16,
+            '_auto_splits_qmul4': lambda *args: (_ for _ in ()).throw(
+                AssertionError('GQA4 must return before the Q16 planner')),
+            '_sm_count': lambda device: 132,
+            'QMUL4_KERNEL_REDUCTION_MIN_SEQ': 32768,
+        }
+        exec(compile(ast.Module(body=[fn], type_ignores=[]), '<planner>', 'exec'),
+             namespace)
+        plan = namespace['plan_qmul4_decode_nvfp4']
+        for batch, sequence in ((8, 1025), (8, 4103), (1, 32768)):
+            with self.subTest(batch=batch, sequence=sequence):
+                self.assertEqual(plan(batch, 32, 8, sequence, 'cuda'), (1, 'none'))
+
 
 if __name__ == '__main__':
     unittest.main()

@@ -199,10 +199,18 @@ def plan_qmul4_decode_nvfp4(
     device,
 ) -> Tuple[int, str]:
     'Implementation details.'
+    grouped_head_tile = _padded_group_size(num_qo_heads, num_kv_heads)
+    if grouped_head_tile == 8:
+        
+        
+        
+        
+        return 1, "none"
+
     conventional = _auto_splits_qmul4(
         batch, num_kv_heads, max_kv_len, device
     )
-    if _padded_group_size(num_qo_heads, num_kv_heads) != 16:
+    if grouped_head_tile != 16:
         return conventional
 
     grid_yz = max(1, batch * num_kv_heads)
