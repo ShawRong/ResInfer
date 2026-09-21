@@ -12,12 +12,31 @@ from __future__ import annotations
 
 
 def require_dense_ops():
+    import importlib.metadata
+    import importlib.util
+
+    import torch
+
     try:
-        import tensorrt_llm._torch  # noqa: F401 - registers torch.ops
-        import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-        import torch
-    except ImportError as exc:
+        package = importlib.metadata.distribution("tensorrt-llm")
+    except importlib.metadata.PackageNotFoundError as exc:
         raise RuntimeError("TensorRT-LLM dense W4A8 Runtime is unavailable") from exc
+    # The full tensorrt_llm package import eagerly loads its serving stack.
+    # The dense ops and this standalone layout utility only need Torch.
+    op_library = package.locate_file("tensorrt_llm/libs/libth_common.so")
+    utils_path = package.locate_file("tensorrt_llm/quantization/utils/fp4_utils.py")
+    if not op_library.is_file() or not utils_path.is_file():
+        raise RuntimeError("TensorRT-LLM dense W4A8 library or layout utility missing")
+    if not hasattr(torch.ops.trtllm, "fp4_fp8_gemm_trtllmgen"):
+        try:
+            torch.ops.load_library(str(op_library))
+        except OSError as exc:
+            raise RuntimeError("TensorRT-LLM dense W4A8 binary is incompatible") from exc
+    spec = importlib.util.spec_from_file_location("mext_trtllm_fp4_utils", utils_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load TensorRT-LLM FP4 layout utility")
+    fp4_utils = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(fp4_utils)
     for namespace, name in (("trtllm", "fp4_quantize"),
                             ("trtllm", "shuffle_matrix"),
                             ("trtllm", "fp4_fp8_gemm_trtllmgen"),
