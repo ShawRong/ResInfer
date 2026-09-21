@@ -87,7 +87,8 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
              "--num-prompts", str(max(32, concurrency * 8)),
              "--num-warmups", "8",
              "--max-concurrency", str(concurrency), "--request-rate", "inf",
-             "--ignore-eos", "--seed", "17", "--save-result", "--save-detailed",
+             "--ignore-eos", "--temperature", "0", "--seed", "17",
+             "--save-result", "--save-detailed",
              "--percentile-metrics", "ttft,tpot,itl,e2el"]
     return {
         "status": "PLAN_ONLY_NOT_RUN", "model": model,
@@ -101,6 +102,7 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
         "launch_requirements": [
             "Explicit model/task selection and freshly verified free GPU ownership",
             "Isolated validated Runtime, project plugin and hashed source snapshot",
+            "Confirm the residue-vllm-plugin entry point exists in spawned workers",
             "Unset all RESIDUE_*/NVFP4_* vars at execution time before env_set",
             "Inspect other inherited vLLM overrides; keep identical across arms",
             "Verify installed CLI flags before launch; this file does not execute",
