@@ -121,9 +121,20 @@ class ResAttnFlashInferImpl(FlashInferImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        if (not self.is_kvcache_nvfp4 or self.head_size != 128
-                or self.num_heads != 8 * self.num_kv_heads):
-            raise NotImplementedError("ResAttn candidate requires NVFP4, D128, GQA8")
+        gqa = (
+            self.num_heads // self.num_kv_heads
+            if self.num_kv_heads > 0
+            and self.num_heads % self.num_kv_heads == 0
+            else 0
+        )
+        if (
+            not self.is_kvcache_nvfp4
+            or self.head_size != 128
+            or gqa not in (4, 6, 8)
+        ):
+            raise NotImplementedError(
+                "ResAttn candidate requires NVFP4, D128, and GQA4/6/8"
+            )
         if (self.alibi_slopes is not None or self.window_left != -1
                 or self.logits_soft_cap not in (None, 0.0)
                 or self.sinks is not None
