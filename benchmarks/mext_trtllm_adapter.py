@@ -47,18 +47,31 @@ def require_dense_ops():
 
 
 def prepare_weight(weight, fp4_utils):
-    """Quantize a BF16 [N,K] weight once, as in checkpoint preparation."""
+    """Encode one synthetic BF16 [N,K] weight in the ModelOpt W4A8 layout."""
     import torch
 
     n, k = weight.shape
     if n % 128 or k % 128:
         raise ValueError(f"TensorRT-LLM W4A8 needs N,K multiples of 128: {n},{k}")
+    if weight.dtype not in (torch.bfloat16, torch.float16) or not weight.is_cuda:
+        raise ValueError("TensorRT-LLM W4A8 weight must be CUDA BF16/FP16")
+    # ModelOpt W4A8 uses E2M1 values and E4M3 scales per 32 elements. TRT's
+    # online fp4_quantize op supports E4M3 scales only at block 16, so prepare
+    # this checkpoint-format synthetic weight offline before any timing.
     global_scale = (448.0 / weight.float().abs().max()).reshape(1).float()
-    packed, scales = torch.ops.trtllm.fp4_quantize(
-        weight.contiguous(), global_scale, 32, False, False)
-    if packed.shape != (n, k // 2):
-        raise RuntimeError(f"unexpected TensorRT-LLM FP4 weight shape: {packed.shape}")
-    scales = scales.view(n, k // 32).view(fp4_utils.float4_sf_dtype)
+    blocks = weight.float().contiguous().reshape(n, k // 32, 32)
+    scales = (blocks.abs().amax(dim=-1) * (global_scale / 6.0))
+    scales = scales.to(torch.float8_e4m3fn).contiguous()
+    scaled = (blocks * global_scale / scales.float().clamp_min(1e-12).unsqueeze(-1))
+    # E2M1 magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. The midpoints give
+    # nearest-value rounding. Sign occupies the high bit of each nibble.
+    edges = torch.tensor((0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
+                         device=weight.device, dtype=torch.float32)
+    nibble = (torch.bucketize(scaled.abs().clamp_max(6.0), edges)
+              + (scaled < 0).to(torch.int64) * 8).to(torch.uint8)
+    pair = nibble.reshape(n, k // 2, 2)
+    packed = (pair[..., 0] | (pair[..., 1] << 4)).contiguous()
+    scales = scales.view(fp4_utils.float4_sf_dtype)
     packed = fp4_utils.shuffle_matrix_a(packed, 128)
     scales = fp4_utils.shuffle_matrix_sf_a(scales, 128, 32)
     return packed.contiguous(), scales.contiguous().view(torch.float8_e4m3fn), global_scale
