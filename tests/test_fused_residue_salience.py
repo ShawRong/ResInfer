@@ -26,9 +26,10 @@ class _Linear(nn.Module):
 class _Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.mlp = nn.Module()
-        self.mlp.gate_proj = _Linear([4, 3, 2, 1])
-        self.mlp.up_proj = _Linear([1, 2, 3, 4])
+        self.block = nn.Module()
+        self.block.mlp = nn.Module()
+        self.block.mlp.gate_proj = _Linear([4, 3, 2, 1])
+        self.block.mlp.up_proj = _Linear([1, 2, 3, 4])
 
 
 def test_align_runtime_fused_salience_uses_joint_energy() -> None:
@@ -39,13 +40,13 @@ def test_align_runtime_fused_salience_uses_joint_energy() -> None:
         block_size=4,
         salience_metric="nvfp4_error_weighted",
     )
-    gate = model.mlp.gate_proj.input_quantizer._salient_indices
-    up = model.mlp.up_proj.input_quantizer._salient_indices
+    gate = model.block.mlp.gate_proj.input_quantizer._salient_indices
+    up = model.block.mlp.up_proj.input_quantizer._salient_indices
     assert torch.equal(gate, up)
     assert gate.numel() == 2
     assert summary["aligned_groups"] == 1
     assert summary["aligned_layers"] == 2
-    assert not hasattr(model.mlp.gate_proj, "_residue_salience_score")
+    assert not hasattr(model.block.mlp.gate_proj, "_residue_salience_score")
 
 
 def test_qwen35_runtime_prefix_expands_to_hf_fused_members() -> None:
