@@ -93,7 +93,9 @@ def run(args: argparse.Namespace) -> dict:
     k_data, k_sf, v_data, v_sf, k_deq, v_deq = (
         quantize_paged_trtllm_format(
             k, v, seq_lens, kv_indices, kv_indptr, pages))
-    del k, v, k_deq, v_deq
+    del k, v
+    if not (args.reference_worst_head or args.reference_all_heads):
+        del k_deq, v_deq
     q = torch.randn(batch, heads, dim, dtype=torch.bfloat16, device=device)
     pool = NvFp4PagedKVPool(
         num_kv_heads=kv_heads, head_dim=dim, k_data=k_data, v_data=v_data,
@@ -164,7 +166,77 @@ def run(args: argparse.Namespace) -> dict:
     median_cos = float(cos.median())
     rms_error = float((stock_value.float() - res_value.float()).square().mean().sqrt())
     stock_rms = float(stock_value.float().square().mean().sqrt())
-    if not bool(torch.isfinite(res_value).all()) or min_cos < args.min_cosine:
+    reference_diagnostic = None
+    if args.reference_worst_head or args.reference_all_heads:
+        flat_index = int(cos.argmin())
+        batch_index, head_index = divmod(flat_index, heads)
+        kv_head = head_index // args.gqa
+        scores = torch.mv(k_deq[batch_index, :, kv_head],
+                          q[batch_index, head_index].float()) * (dim ** -.5)
+        reference = torch.softmax(scores, dim=0) @ v_deq[
+            batch_index, :, kv_head]
+        stock_head = stock_value[batch_index, head_index].float()
+        res_head = res_value[batch_index, head_index].float()
+        ref_norm = float(reference.square().mean().sqrt())
+        reference_diagnostic = {
+            "batch_index": batch_index, "head_index": head_index,
+            "kv_head_index": kv_head, "reference_rms": ref_norm,
+            "stock_cosine_to_reference": float(
+                torch.nn.functional.cosine_similarity(stock_head, reference,
+                                                      dim=0)),
+            "resattn_cosine_to_reference": float(
+                torch.nn.functional.cosine_similarity(res_head, reference,
+                                                      dim=0)),
+            "stock_rms_error_to_reference": float(
+                (stock_head - reference).square().mean().sqrt()),
+            "resattn_rms_error_to_reference": float(
+                (res_head - reference).square().mean().sqrt()),
+        }
+    if args.reference_all_heads:
+        q_groups = q.view(batch, kv_heads, args.gqa, dim).float()
+        full_reference = torch.empty(batch, kv_heads, args.gqa, dim,
+                                     dtype=torch.float32, device=device)
+        for kv_head in range(kv_heads):
+            scores = torch.bmm(
+                q_groups[:, kv_head],
+                k_deq[:, :, kv_head].transpose(1, 2)) * (dim ** -.5)
+            full_reference[:, kv_head] = torch.bmm(
+                torch.softmax(scores, dim=-1), v_deq[:, :, kv_head])
+        full_reference = full_reference.reshape(batch, heads, dim)
+        stock_to_ref = torch.nn.functional.cosine_similarity(
+            stock_value.float(), full_reference, dim=-1)
+        res_to_ref = torch.nn.functional.cosine_similarity(
+            res_value.float(), full_reference, dim=-1)
+        reference_diagnostic["all_heads"] = {
+            "stock_min_cosine": float(stock_to_ref.min()),
+            "stock_median_cosine": float(stock_to_ref.median()),
+            "resattn_min_cosine": float(res_to_ref.min()),
+            "resattn_median_cosine": float(res_to_ref.median()),
+            "stock_rms_error": float((stock_value.float() - full_reference)
+                                     .square().mean().sqrt()),
+            "resattn_rms_error": float((res_value.float() - full_reference)
+                                       .square().mean().sqrt()),
+            "reference_rms": float(full_reference.square().mean().sqrt()),
+        }
+    if args.reference_all_heads:
+        all_heads = reference_diagnostic["all_heads"]
+        correctness_gate = {
+            "kind": "both_arms_vs_dequantized_kv_reference",
+            "min_cosine": args.reference_min_cosine,
+        }
+        failed = min(all_heads["stock_min_cosine"],
+                     all_heads["resattn_min_cosine"]) < args.reference_min_cosine
+    else:
+        correctness_gate = {"kind": "cross_arm", "min_cosine": args.min_cosine}
+        failed = min_cos < args.min_cosine
+    if not bool(torch.isfinite(res_value).all()) or failed:
+        print(json.dumps({"status": "CORRECTNESS_FAILED",
+                          "min_cross_cosine": min_cos,
+                          "median_cross_cosine": median_cos,
+                          "rms_error": rms_error, "stock_rms": stock_rms,
+                          "reference_diagnostic": reference_diagnostic,
+                          "correctness_gate": correctness_gate},
+                         sort_keys=True), flush=True)
         raise RuntimeError(
             f"cross-arm correctness failed: min_cosine={min_cos} "
             f"median_cosine={median_cos} rms_error={rms_error} "
@@ -187,6 +259,8 @@ def run(args: argparse.Namespace) -> dict:
         "min_cross_cosine": min_cos,
         "median_cross_cosine": median_cos, "rms_error": rms_error,
         "stock_rms": stock_rms,
+        "reference_diagnostic": reference_diagnostic,
+        "correctness_gate": correctness_gate,
         "iterations": args.iterations, "repeats": args.repeats,
         "raw_us": raw, "median_us": medians,
         "stock_over_resattn": medians["stock0"] / medians["resattn"],
@@ -213,6 +287,12 @@ def main() -> None:
     ap.add_argument("--repeats", type=int, default=6)
     ap.add_argument("--warmups", type=int, default=3)
     ap.add_argument("--min-cosine", type=float, default=.97)
+    ap.add_argument("--reference-worst-head", action="store_true",
+                    help="compare the lowest cross-cosine head to dequantized-KV BF16-Q reference")
+    ap.add_argument("--reference-all-heads", action="store_true",
+                    help="compare every head to dequantized-KV BF16-Q reference")
+    ap.add_argument("--reference-min-cosine", type=float, default=.98,
+                    help="minimum per-head cosine for each arm against independent reference")
     ap.add_argument("--plan", choices=("auto", "1/none", "4/gmem_fused",
                                          "8/gmem_fused", "16/gmem_fused"),
                     default="auto")
