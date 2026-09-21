@@ -27,6 +27,12 @@ def get_residue_layer_candidates(layer_name: str) -> list[str]:
     vllm_to_hf_suffixes = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        # Qwen3.5 stores the GDN projections separately. vLLM maps the
+        # already-fused qkv tensor to shards 0..2 and z to shard 3 of one
+        # in_proj_qkvz module, so its shared input dimension and residue
+        # metadata must be recovered from the checkpoint-side names.
+        "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+        "in_proj_ba": ["in_proj_b", "in_proj_a"],
     }
 
     for vllm_suffix, hf_suffixes in vllm_to_hf_suffixes.items():
