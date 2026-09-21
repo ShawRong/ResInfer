@@ -23,6 +23,7 @@ import torch
 from modelopt.torch.utils.logging import print_rank_0
 
 from .base import Stage, StageContext
+from .hf_model_class import resolve_hf_auto_model_class
 
 
 class DumpCleanHFStage(Stage):
@@ -64,7 +65,7 @@ class DumpCleanHFStage(Stage):
             )
 
     def run(self, ctx: StageContext, params: Dict[str, Any]) -> StageContext:
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
 
         model_path = params.get("model_path") or ctx.get_artifact("model_path")
         export_dir_param = (
@@ -80,6 +81,7 @@ class DumpCleanHFStage(Stage):
 
         dtype = self._resolve_dtype(params.get("dtype", "bfloat16"))
         trust_remote_code = bool(params.get("trust_remote_code", False))
+        model_loader = params.get("model_loader", "auto")
         safe_serialization = params.get("safe_serialization", True)
         max_shard_size = params.get("max_shard_size", "10GB")
         free_source_model = params.get("free_source_model", True)
@@ -108,11 +110,18 @@ class DumpCleanHFStage(Stage):
         print_rank_0(f"  Source: {source_label}")
 
         config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        auto_model_cls = resolve_hf_auto_model_class(config, model_loader)
+        use_meta_init = bool(params.get(
+            "use_meta_init",
+            any(getattr(config, name, None) is not None
+                for name in ("vision_config", "audio_config")),
+        ))
         target_model = self._build_clean_model(
-            AutoModelForCausalLM,
+            auto_model_cls,
             config,
             dtype=dtype,
             trust_remote_code=trust_remote_code,
+            use_meta_init=use_meta_init,
         ).eval()
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=trust_remote_code)
         if tokenizer.pad_token is None:
@@ -128,9 +137,19 @@ class DumpCleanHFStage(Stage):
                 "This does not look like a usable clean-HF dump source."
             )
 
-        load_result = target_model.load_state_dict(filtered_state_dict, strict=False)
+        load_result = target_model.load_state_dict(
+            filtered_state_dict, strict=False, assign=use_meta_init
+        )
         stats["missing_keys"] = sorted(load_result.missing_keys)
         stats["unexpected_keys"] = sorted(load_result.unexpected_keys)
+        if use_meta_init and stats["missing_keys"]:
+            preview = ", ".join(stats["missing_keys"][:10])
+            raise RuntimeError(
+                "Meta-initialized clean-HF model has missing weights and cannot "
+                f"be serialized safely: {preview}"
+            )
+        if hasattr(target_model, "tie_weights"):
+            target_model.tie_weights()
 
         export_dir.mkdir(parents=True, exist_ok=True)
         target_model.save_pretrained(
@@ -139,6 +158,9 @@ class DumpCleanHFStage(Stage):
             max_shard_size=max_shard_size,
         )
         tokenizer.save_pretrained(export_dir)
+        from export.hf_runtime_assets import copy_hf_runtime_assets
+
+        runtime_assets = copy_hf_runtime_assets(model_path, export_dir)
 
         summary_path = export_dir / "clean_hf_dump_summary.json"
         summary = {
@@ -147,6 +169,9 @@ class DumpCleanHFStage(Stage):
             "base_model_path": str(model_path),
             "dtype": str(dtype),
             "apply_awq_scale_fusion": bool(apply_awq_scale_fusion),
+            "model_loader": auto_model_cls.__name__,
+            "meta_initialized": use_meta_init,
+            "runtime_assets": runtime_assets,
             **stats,
         }
         # Same record and reason as residue_kernel_metadata.json's: a dump
@@ -172,7 +197,7 @@ class DumpCleanHFStage(Stage):
         reloaded_model = None
         reloaded_tokenizer = None
         if validate_load:
-            reloaded_model = AutoModelForCausalLM.from_pretrained(
+            reloaded_model = auto_model_cls.from_pretrained(
                 export_dir,
                 torch_dtype=dtype,
                 device_map="cpu",
@@ -335,16 +360,27 @@ class DumpCleanHFStage(Stage):
         *,
         dtype: torch.dtype,
         trust_remote_code: bool,
+        use_meta_init: bool,
     ):
         kwargs: Dict[str, Any] = {"torch_dtype": dtype}
-        try:
-            return auto_model_cls.from_config(
-                config,
-                trust_remote_code=trust_remote_code,
-                **kwargs,
-            )
-        except TypeError:
-            return auto_model_cls.from_config(config, **kwargs)
+        if use_meta_init:
+            from accelerate import init_empty_weights
+
+            init_context = init_empty_weights(include_buffers=True)
+        else:
+            from contextlib import nullcontext
+
+            init_context = nullcontext()
+
+        with init_context:
+            try:
+                return auto_model_cls.from_config(
+                    config,
+                    trust_remote_code=trust_remote_code,
+                    **kwargs,
+                )
+            except TypeError:
+                return auto_model_cls.from_config(config, **kwargs)
 
     def _filter_state_dict(
         self,

@@ -20,6 +20,7 @@ from typing import Dict, Any, Optional
 from modelopt.torch.utils.logging import print_rank_0
 
 from .base import Stage, StageContext
+from .hf_model_class import resolve_hf_auto_model_class
 
 
 class LoadHFStage(Stage):
@@ -78,6 +79,7 @@ class LoadHFStage(Stage):
         trust_remote_code = bool(params.get("trust_remote_code", False))
         verbose = params.get("verbose", False)
         gpu_max_mem_percentage = params.get("gpu_max_mem_percentage")
+        model_loader = params.get("model_loader", "auto")
 
         # Load model
         print_rank_0(f"Loading model: {model_path}")
@@ -88,6 +90,7 @@ class LoadHFStage(Stage):
             trust_remote_code=trust_remote_code,
             verbose=verbose,
             gpu_max_mem_percentage=gpu_max_mem_percentage,
+            model_loader=model_loader,
         )
 
         # Update context
@@ -105,9 +108,14 @@ class LoadHFStage(Stage):
         trust_remote_code: bool = False,
         verbose: bool = False,
         gpu_max_mem_percentage: Optional[float] = None,
+        model_loader: str = "auto",
     ):
         'Load HuggingFace model and tokenizer.'
-        from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+        from transformers import AutoTokenizer, AutoConfig
+
+        cfg_kwargs = {"trust_remote_code": trust_remote_code} if trust_remote_code else {}
+        hf_config = AutoConfig.from_pretrained(model_path, **cfg_kwargs)
+        auto_model_cls = resolve_hf_auto_model_class(hf_config, model_loader)
 
         # Determine device
         if device is None:
@@ -135,12 +143,10 @@ class LoadHFStage(Stage):
             from accelerate import init_empty_weights, infer_auto_device_map
             from accelerate.utils import get_max_memory
 
-            cfg_kwargs = {"trust_remote_code": trust_remote_code} if trust_remote_code else {}
-            hf_config = AutoConfig.from_pretrained(model_path, **cfg_kwargs)
             torch_dtype = dtype if dtype is not None else getattr(hf_config, "torch_dtype", torch.bfloat16)
 
             with init_empty_weights(include_buffers=True):
-                empty_model = AutoModelForCausalLM.from_config(
+                empty_model = auto_model_cls.from_config(
                     hf_config, dtype=torch_dtype, trust_remote_code=trust_remote_code
                 )
 
@@ -164,7 +170,7 @@ class LoadHFStage(Stage):
                     f"Model fits in GPU(s); no max_memory constraint applied."
                 )
 
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        model = auto_model_cls.from_pretrained(model_path, **load_kwargs)
 
         # Load tokenizer
         tokenizer = AutoTokenizer.from_pretrained(
@@ -177,7 +183,10 @@ class LoadHFStage(Stage):
             tokenizer.pad_token = tokenizer.eos_token
 
         # Log info
-        model_info = f"{model.config.model_type} on {model.device} ({model.dtype})"
+        model_info = (
+            f"{model.config.model_type} via {auto_model_cls.__name__} "
+            f"on {model.device} ({model.dtype})"
+        )
         print_rank_0(f"  Loaded: {model_info}")
 
         if verbose:

@@ -107,6 +107,11 @@ class ExportHFStage(Stage):
         # Get model and tokenizer
         model = ctx.get_ref("model")
         tokenizer = ctx.get_ref("tokenizer")
+        runtime_asset_source = (
+            params.get("runtime_asset_source")
+            or ctx.get_artifact("model_path")
+            or params.get("source_checkpoint")
+        )
 
         # Export model
         print_rank_0(f"Exporting model to: {export_dir}")
@@ -126,6 +131,7 @@ class ExportHFStage(Stage):
             max_shard_size=params.get("max_shard_size", "10GB"),
             source_checkpoint=params.get("source_checkpoint"),
             processor=ctx.get_ref("processor"),
+            runtime_asset_source=runtime_asset_source,
         )
 
         # Update context
@@ -149,6 +155,7 @@ class ExportHFStage(Stage):
         max_shard_size: str = "10GB",
         source_checkpoint=None,
         processor=None,
+        runtime_asset_source: str | Path | None = None,
     ) -> Path:
         """Export model with HF save_pretrained and optional kernel metadata."""
         if model is None:
@@ -255,6 +262,14 @@ class ExportHFStage(Stage):
 
         # Save tokenizer
         tokenizer.save_pretrained(export_path)
+        if runtime_asset_source is not None:
+            from export.hf_runtime_assets import copy_hf_runtime_assets
+
+            runtime_assets = copy_hf_runtime_assets(
+                runtime_asset_source, export_path
+            )
+            if verbose and runtime_assets:
+                print_rank_0("  ✓ Runtime assets: " + ", ".join(runtime_assets))
 
         if verbose:
             print_rank_0(f"  ✓ Model saved to {export_path}")

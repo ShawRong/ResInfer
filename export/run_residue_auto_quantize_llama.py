@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         help="Trust remote model/tokenizer code when loading the search model.",
     )
     parser.add_argument(
+        "--model_loader",
+        choices=["auto", "causal_lm", "multimodal_lm"],
+        default="auto",
+    )
+    parser.add_argument(
         "--reference_residue_metadata_paths",
         default="",
         help=(
@@ -307,8 +312,9 @@ def _run_modelopt_search(args: argparse.Namespace) -> dict[str, Any]:
     import modelopt.torch.quantization as mtq
     import modelopt.torch.quantization.plugins.huggingface  # noqa: F401
     from modelopt.torch.quantization import model_quant
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoTokenizer
 
+    from export.stages.hf_model_class import resolve_hf_auto_model_class
     from quant.modelopt_integration import enable_residue_auto_quantize_support
 
     enable_residue_auto_quantize_support()
@@ -319,7 +325,11 @@ def _run_modelopt_search(args: argparse.Namespace) -> dict[str, Any]:
         raise AssertionError("residue_max was not added to auto_quantize allowlist")
 
     dtype = _torch_dtype(args.dtype)
-    model = AutoModelForCausalLM.from_pretrained(
+    config = AutoConfig.from_pretrained(
+        args.model_path, trust_remote_code=args.trust_remote_code
+    )
+    auto_model_cls = resolve_hf_auto_model_class(config, args.model_loader)
+    model = auto_model_cls.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
         device_map="auto",
@@ -445,6 +455,7 @@ def _build_summary(
         "num_calib_steps": args.num_calib_steps,
         "num_score_steps": args.num_score_steps,
         "method": args.method,
+        "model_loader": args.model_loader,
         "quant_scope": args.quant_scope,
         "disabled_layers": args.disabled_layers,
         "trust_remote_code": args.trust_remote_code,

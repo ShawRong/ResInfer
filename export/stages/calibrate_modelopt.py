@@ -185,6 +185,7 @@ class ModelOptCalibrateStage(Stage):
             device=params.get("device"),
             dtype_str=params.get("dtype", "auto"),
             trust_remote_code=bool(params.get("trust_remote_code", False)),
+            model_loader=params.get("model_loader", "auto"),
         )
 
     def _load_model(
@@ -193,9 +194,17 @@ class ModelOptCalibrateStage(Stage):
         device: Optional[str] = None,
         dtype_str: str = "auto",
         trust_remote_code: bool = False,
+        model_loader: str = "auto",
     ):
         """Load HuggingFace model and tokenizer."""
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoConfig, AutoTokenizer
+
+        from .hf_model_class import resolve_hf_auto_model_class
+
+        config = AutoConfig.from_pretrained(
+            model_path, trust_remote_code=trust_remote_code
+        )
+        auto_model_cls = resolve_hf_auto_model_class(config, model_loader)
 
         # Determine device
         if device is None:
@@ -217,7 +226,7 @@ class ModelOptCalibrateStage(Stage):
         }
         if dtype is not None:
             load_kwargs["torch_dtype"] = dtype
-        model = AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
+        model = auto_model_cls.from_pretrained(model_path, **load_kwargs)
 
         tokenizer = AutoTokenizer.from_pretrained(
             model_path,
@@ -227,7 +236,10 @@ class ModelOptCalibrateStage(Stage):
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        print_rank_0(f"Loaded: {model.config.model_type} on {model.device} ({model.dtype})")
+        print_rank_0(
+            f"Loaded: {model.config.model_type} via {auto_model_cls.__name__} "
+            f"on {model.device} ({model.dtype})"
+        )
         return model, tokenizer
 
     def _get_calibration_data(

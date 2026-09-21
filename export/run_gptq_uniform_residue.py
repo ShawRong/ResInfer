@@ -21,6 +21,11 @@ def common_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument(
+        "--model-loader",
+        choices=["auto", "causal_lm", "multimodal_lm"],
+        default="auto",
+    )
 
 
 def parse_args() -> argparse.Namespace:
@@ -99,6 +104,7 @@ def load_params(args: argparse.Namespace, model_path: Path) -> dict:
         "device": "cuda",
         "dtype": "bfloat16",
         "trust_remote_code": False,
+        "model_loader": args.model_loader,
         "verbose": args.verbose,
     }
 
@@ -136,6 +142,7 @@ def prepare_gptq(args: argparse.Namespace) -> dict:
         context,
         {
             "model_path": str(args.model_path),
+            "model_loader": args.model_loader,
             "clean_hf_export_dir": str(clean_dir),
             "dtype": "bfloat16",
             "apply_awq_scale_fusion": False,
@@ -149,6 +156,7 @@ def prepare_gptq(args: argparse.Namespace) -> dict:
         "status": "PASS",
         "stage": "prepare-gptq",
         "model_path": str(args.model_path),
+        "model_loader": args.model_loader,
         "dataset_jsonl": str(args.dataset_jsonl),
         "num_samples": args.num_samples,
         "seq_len": args.seq_len,
@@ -230,6 +238,7 @@ def residue_arm(args: argparse.Namespace) -> dict:
         "status": "PASS",
         "stage": "residue-arm",
         "model_path": str(args.model_path),
+        "model_loader": args.model_loader,
         "dataset_jsonl": str(args.dataset_jsonl),
         "num_samples": args.num_samples,
         "seq_len": args.seq_len,
