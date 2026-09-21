@@ -31,8 +31,8 @@ _DEGRADED = [False]
 
 # Actual source of the most recent call's tactic (see sm120_fold_tuner).
 _LAST_SOURCE: list = [None]
-# The tactic that ACTUALLY ran (see sm120_fold_tuner). None on the legacy
-# path, which resolves its tile inside nvfp4.fold and does not report it.
+# The tactic that ACTUALLY ran (see sm120_fold_tuner). The static fallback
+# resolves its tile from the same table used by run_fold_default.
 _LAST_TILE: list = [None]
 
 
@@ -173,9 +173,10 @@ def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
 
 def _run_fallback(inputs, out_dtype) -> torch.Tensor:
     """Static row-pair fallback: never nest the old tuner inside FI tuning."""
-    from nvfp4.cute_fold.tactics import run_fold_default
+    from nvfp4.cute_fold.tactics import run_fold_default, select_arch_tactic
 
-    _LAST_TILE[0] = None      # legacy path picks internally and stays mute
+    _, tiler, cluster = select_arch_tactic(_arch(), int(inputs[0].shape[0]))
+    _LAST_TILE[0] = (_FAMILY, "tma", tiler, cluster, None)
     x_fp4, x_sf = _quant_for_family(inputs, _FAMILY)
     _, weight, _, wsb, alpha = inputs
     major, minor = torch.cuda.get_device_capability()
@@ -244,7 +245,7 @@ def _announce(runner, tactic, runners) -> str:
     if runner is runners[1] and tactic >= 0:
         return f"tactic source: autotuned {_candidates()[tactic]}"
     if tactic >= 0:
-        return "tactic source: autotuned (the legacy path won the profile)"
+        return "tactic source: autotuned_fallback (static row-pair won the profile)"
     return "tactic source: legacy dict/table (no tuned entry -- fallback)"
 
 

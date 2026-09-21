@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 from pathlib import Path
+import sys
+import types
 
 import pytest
 
 from benchmarks.mext_paper_aggregate import aggregate
-from benchmarks.mext_paper_shapes import load_suite, projection_shapes, resolve
+from benchmarks.mext_paper_shapes import (load_suite, parse_tp_overrides,
+                                          projection_shapes, resolve)
 from benchmarks.mext_paper_sweep import SUITE
 
 
@@ -17,9 +21,10 @@ def test_qwen3_and_qwen35_real_projection_shapes():
     four, _ = resolve(suite, {}, ["qwen3_4b"])
     physical = {(shape["n"], shape["k"]) for shape in four}
     assert (6144, 2560) in physical  # fused qkv
-    assert (2560, 1024) in physical  # TP4 o_proj
-    assert (4864, 2560) in physical  # TP4 gate_up
-    assert (2560, 1216) in physical  # TP8 down
+    assert (2560, 4096) in physical  # TP1 o_proj
+    assert (19456, 2560) in physical  # TP1 gate_up
+    assert (2560, 9728) in physical  # TP1 down
+    assert all(alias["tp"] == 1 for shape in four for alias in shape["aliases"])
     text = suite["models"]["qwen35_27b"]["config"]
     assert projection_shapes(text, ["qkv", "o", "gate_up", "down"]) == {
         "qkv": (8192, 5120), "o": (5120, 6144),
@@ -27,11 +32,58 @@ def test_qwen3_and_qwen35_real_projection_shapes():
     }
 
 
+def test_profiled_static_fallback_is_distinct_from_missing_tune(monkeypatch):
+    """The profiled fallback runner is a real winner, not a cache miss."""
+    path = Path(__file__).resolve().parents[1] / "quant/vllm_integration/fi_tuner_base.py"
+    spec = importlib.util.spec_from_file_location("fi_tuner_base_contract", path)
+    module = importlib.util.module_from_spec(spec)
+    with monkeypatch.context() as patch:
+        patch.setitem(sys.modules, "torch", types.ModuleType("torch"))
+        flashinfer = types.ModuleType("flashinfer")
+        flashinfer.__path__ = []
+        autotuner = types.ModuleType("flashinfer.autotuner")
+        patch.setitem(sys.modules, "flashinfer", flashinfer)
+        patch.setitem(sys.modules, "flashinfer.autotuner", autotuner)
+        spec.loader.exec_module(module)
+
+        fallback = types.SimpleNamespace(forward=lambda *a, **kw: "fallback")
+        candidate = types.SimpleNamespace(forward=lambda *a, **kw: "candidate")
+        class FakeTuner:
+            is_tuning_mode = False
+            selected = fallback
+            tactic = 0
+
+            @classmethod
+            def get(cls):
+                return cls
+
+            @classmethod
+            def choose_one(cls, *args):
+                return cls.selected, cls.tactic
+
+        autotuner.AutoTuner = FakeTuner
+        sources = []
+        def call():
+            return module.tuned_call(
+                "test", runners_getter=lambda: [fallback, candidate],
+                config_getter=lambda: object(), inputs=[], fallback_forward=lambda x: None,
+                kill_env_value="1", announce_flag=[True], record=sources.append)
+
+        assert call() == "fallback"
+        assert sources.pop() == "autotuned_fallback"
+        FakeTuner.selected = candidate
+        assert call() == "candidate"
+        assert sources.pop() == "autotuned"
+        FakeTuner.tactic = -1
+        assert call() == "candidate"
+        assert sources.pop() == "offline_table"
+
+
 def test_shared_physical_shape_is_timed_once():
     suite = load_suite(SUITE)
     suite["models"]["qwen3_4b_clone"] = suite["models"]["qwen3_4b"]
     shapes, _ = resolve(suite, {}, ["qwen3_4b", "qwen3_4b_clone"])
-    shared = next(s for s in shapes if (s["n"], s["k"]) == (2560, 1024))
+    shared = next(s for s in shapes if (s["n"], s["k"]) == (2560, 4096))
     assert len(shared["aliases"]) > 1
     assert len({(s["n"], s["k"]) for s in shapes}) == len(shapes)
 

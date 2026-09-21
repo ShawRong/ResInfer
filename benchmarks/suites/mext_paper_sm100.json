@@ -1,5 +1,5 @@
 {
-  "name": "mext_paper_sm100_v1",
+  "name": "mext_paper_sm100_v2",
   "description": "Full online activation quantization plus GEMM; SM100 MExt paper matrix",
   "m_values": [
     1,
@@ -15,12 +15,6 @@
     384,
     512
   ],
-  "tp_values": [
-    1,
-    2,
-    4,
-    8
-  ],
   "process_reps": 5,
   "timing_repeats": 5,
   "arms": [
@@ -32,6 +26,9 @@
   ],
   "models": {
     "qwen3_4b": {
+      "tp_values": [
+        1
+      ],
       "projections": [
         "qkv",
         "o",
@@ -48,6 +45,9 @@
       }
     },
     "qwen3_8b": {
+      "tp_values": [
+        1
+      ],
       "projections": [
         "qkv",
         "o",
@@ -64,6 +64,9 @@
       }
     },
     "qwen35_27b": {
+      "tp_values": [
+        1
+      ],
       "projections": [
         "qkv",
         "o",

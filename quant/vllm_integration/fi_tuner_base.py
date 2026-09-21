@@ -201,7 +201,7 @@ def tuned_call(
     the env stays in the op module so the contract table has one owner.
 
     `record`, when given, receives the resolved tactic source on EVERY call
-    ("autotuned" | "offline_table"); a degrade inside the candidate runner
+    ("autotuned" | "autotuned_fallback" | "offline_table"); a degrade inside the candidate runner
     overrides it afterwards via make_runner_pair's on_degrade. Exists so a
     bench can report the ACTUAL source per row instead of an architecture
     constant -- a field that looks like a measurement but is a constant is
@@ -236,5 +236,10 @@ def tuned_call(
         print(f"[residue] {op_name}: {announce(runner, tactic, runners)}",
               flush=True)
     if record is not None:
-        record("autotuned" if tactic >= 0 else "offline_table")
+        if tactic < 0:
+            record("offline_table")
+        elif runner is runners[0]:
+            record("autotuned_fallback")
+        else:
+            record("autotuned")
     return runner.forward(inputs, tactic=tactic)

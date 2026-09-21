@@ -21,8 +21,14 @@ def load_suite(path: str | Path) -> dict:
     suite = json.loads(Path(path).read_text())
     if not suite.get("name") or not suite.get("models"):
         raise ValueError("suite needs name and models")
-    if sorted(set(suite["tp_values"])) != sorted(suite["tp_values"]):
-        raise ValueError("tp_values must be unique")
+    for model, spec in suite["models"].items():
+        tp_values = spec.get("tp_values")
+        if tp_values is None:
+            if not spec.get("tp_required"):
+                raise ValueError(f"{model} needs tp_values or tp_required")
+        elif (not tp_values or any(type(tp) is not int or tp < 1 for tp in tp_values)
+              or len(set(tp_values)) != len(tp_values)):
+            raise ValueError(f"{model} tp_values must be positive and unique")
     if sorted(set(suite["m_values"])) != sorted(suite["m_values"]):
         raise ValueError("m_values must be unique")
     return suite
@@ -37,6 +43,23 @@ def parse_config_overrides(values: list[str]) -> dict[str, Path]:
         if not model or not raw_path or model in out:
             raise ValueError(f"bad or duplicate --model-config: {value}")
         out[model] = Path(raw_path).expanduser().resolve()
+    return out
+
+
+def parse_tp_overrides(values: list[str]) -> dict[str, list[int]]:
+    out: dict[str, list[int]] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError(f"--model-tp expects MODEL=TP[,TP]: {value}")
+        model, raw = value.split("=", 1)
+        try:
+            tps = [int(tp) for tp in raw.split(",")]
+        except ValueError as exc:
+            raise ValueError(f"bad --model-tp: {value}") from exc
+        if (not model or model in out or not tps or
+            any(tp < 1 for tp in tps) or len(set(tps)) != len(tps)):
+            raise ValueError(f"bad or duplicate --model-tp: {value}")
+        out[model] = tps
     return out
 
 
@@ -72,15 +95,24 @@ def projection_shapes(config: dict, projections: list[str]) -> dict[str, tuple[i
 
 
 def resolve(suite: dict, overrides: dict[str, Path],
-            selected_models: list[str] | None = None) -> tuple[list[dict], dict]:
+            selected_models: list[str] | None = None,
+            tp_overrides: dict[str, list[int]] | None = None) -> tuple[list[dict], dict]:
     model_names = selected_models or list(suite["models"])
-    unknown = set(model_names) - set(suite["models"])
+    tp_overrides = tp_overrides or {}
+    unknown = (set(model_names) - set(suite["models"])) | (set(tp_overrides) - set(model_names))
     if unknown or set(overrides) - set(suite["models"]):
         raise ValueError(f"unknown models: {sorted(unknown | (set(overrides) - set(suite['models'])))}")
     by_shape: dict[tuple[int, int], dict] = {}
     sources = {}
     for model in model_names:
         model_spec = suite["models"][model]
+        if model in tp_overrides and not model_spec.get("tp_required"):
+            raise ValueError(f"{model} TP is fixed by the suite")
+        tp_values = tp_overrides.get(model, model_spec.get("tp_values"))
+        if not tp_values:
+            raise ValueError(f"{model} needs --model-tp {model}=<deployment TP>")
+        if any(type(tp) is not int or tp < 1 for tp in tp_values) or len(set(tp_values)) != len(tp_values):
+            raise ValueError(f"{model} TP values must be positive and unique")
         if model in overrides:
             path = overrides[model]
             raw = path.read_bytes()
@@ -97,11 +129,12 @@ def resolve(suite: dict, overrides: dict[str, Path],
                 "formal results must not guess dimensions")
         text = _text_config(config)
         sources[model] = {"source": origin, "sha256": source_hash,
-                          "model_type": text.get("model_type", config.get("model_type"))}
+                          "model_type": text.get("model_type", config.get("model_type")),
+                          "tp_values": tp_values}
         for projection, (n_full, k_full) in projection_shapes(
             config, model_spec["projections"]
         ).items():
-            for tp in suite["tp_values"]:
+            for tp in tp_values:
                 if projection in {"qkv", "gate_up"}:
                     if n_full % tp:
                         raise ValueError(f"{model}/{projection} N={n_full} cannot split TP={tp}")

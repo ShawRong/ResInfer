@@ -19,7 +19,7 @@ import sys
 import uuid
 
 from .mext_paper_aggregate import aggregate, write_outputs
-from .mext_paper_shapes import load_suite, parse_config_overrides, resolve
+from .mext_paper_shapes import load_suite, parse_config_overrides, parse_tp_overrides, resolve
 
 SUITE = pathlib.Path(__file__).with_name("suites") / "mext_paper_sm100.json"
 REQUIRED_ENV = {
@@ -44,6 +44,8 @@ def _arguments() -> argparse.Namespace:
     parser.add_argument("--outdir", type=pathlib.Path)
     parser.add_argument("--gpu", type=int, default=0, help="physical GPU index")
     parser.add_argument("--model-config", action="append", default=[], metavar="MODEL=PATH")
+    parser.add_argument("--model-tp", action="append", default=[], metavar="MODEL=TP[,TP]",
+                        help="required deployment TP for models marked tp_required in suite")
     parser.add_argument("--models", help="comma-separated subset; non-canonical")
     parser.add_argument("--shape-id", help="one resolved physical shape; non-canonical")
     parser.add_argument("--m-values", help="comma-separated subset; non-canonical")
@@ -62,7 +64,8 @@ def _prepare(args: argparse.Namespace) -> dict:
     suite = load_suite(args.suite)
     models = args.models.split(",") if args.models else None
     overrides = parse_config_overrides(args.model_config)
-    shapes, sources = resolve(suite, overrides, models)
+    tp_overrides = parse_tp_overrides(args.model_tp)
+    shapes, sources = resolve(suite, overrides, models, tp_overrides)
     if args.shape_id:
         shapes = [shape for shape in shapes if shape["shape_id"] == args.shape_id]
         if not shapes:
@@ -281,8 +284,9 @@ def _worker(args: argparse.Namespace) -> int:
                         if arm == "mext_r1":
                             row["tactic_source"] = sm10x_fold_tuner.last_tactic_source()
                             row["tactic"] = sm10x_fold_tuner.last_tactic_tile()
-                            if row["tactic_source"] != "autotuned" or row["tactic"] is None:
-                                raise RuntimeError("MExt Fold did not serve an autotuned tactic")
+                            if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
+                                or row["tactic"] is None):
+                                raise RuntimeError("MExt Fold did not serve a profiled tactic")
                         measured = timed_detail(fn, fn_args,
                                                 iters_within_graph=niw,
                                                 repeats=resolved["timing_repeats"])
