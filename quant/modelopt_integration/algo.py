@@ -480,6 +480,9 @@ def _compute_residue_salient_indices(
         # batches. sqrt(sum(error^2)) * ||W[:, j]||_2 estimates each input
         # channel's output perturbation energy.
         score = get_nvfp4_error_weighted_score(score, module.weight)
+    # Keep the full score until runtime-fused projections can choose one
+    # channel set jointly. The individual top-k alone loses that ranking.
+    module._residue_salience_score = score.detach().float().cpu().contiguous()
     salient_indices = get_salient_indices(
         score,
         module.residue_max.block_size,
@@ -826,6 +829,14 @@ def _residue_calibrate_core(
             if hasattr(module.input_quantizer, "_salient_indices"):
                 delattr(module.input_quantizer, "_salient_indices")
             apply_salient_indices(module, salient_indices)
+            ratio_key = f"{float(module.residue_max.residue_ratio):g}"
+            sidecar = getattr(module, "_residue_salient_indices_by_ratio", None)
+            if sidecar is None:
+                sidecar = {}
+                module._residue_salient_indices_by_ratio = sidecar
+            sidecar[ratio_key] = (
+                salient_indices.detach().cpu().to(torch.int64).contiguous()
+            )
             module._residue_ratio = getattr(module.residue_max, "residue_ratio", None)
             module._residue_materialized = False
             salience_only_count[0] += 1

@@ -212,6 +212,22 @@ def residue_arm(args: argparse.Namespace) -> dict:
     )
     model = mtq.quantize(model, quant_cfg, forward_loop=forward_loop)
     context.set_ref("model", model)
+    from quant.modelopt_integration.fused_salience import (
+        align_runtime_fused_salience,
+    )
+
+    fused_alignment = align_runtime_fused_salience(
+        model,
+        ratio=args.ratio,
+        block_size=args.calib_block_size,
+        salience_metric=args.salience_metric,
+    )
+    print(
+        "[residue-arm] runtime-fused salience: "
+        f"{fused_alignment['aligned_groups']} groups / "
+        f"{fused_alignment['aligned_layers']} layers",
+        flush=True,
+    )
     context = api["ExportHFStage"]("export_residue")(
         context,
         {
@@ -247,6 +263,7 @@ def residue_arm(args: argparse.Namespace) -> dict:
         "calib_block_size": args.calib_block_size,
         "expected_extended_linear_dims_min": args.expected_extended_linear_dims_min,
         "salience_metric": args.salience_metric,
+        "fused_salience_alignment": fused_alignment,
         "export_dir": str(export_dir),
         "metadata_layers": len(metadata.get("layers", {})),
         "extended_linear_dims": len(metadata.get("extended_linear_dims", {})),

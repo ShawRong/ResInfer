@@ -123,6 +123,10 @@ def collect_residue_salient_choices(model: torch.nn.Module) -> dict[str, Any]:
                     if input_quantizer is not None
                     else None
                 )
+                if salient is None or salient.numel() == 0:
+                    salient = getattr(
+                        module, "_residue_salient_indices_by_ratio", {}
+                    ).get(fmt_float(ratio))
                 modules.append(
                     {
                         "module_name": module_names.get(id(module), "<unknown>"),
@@ -180,6 +184,10 @@ def collect_residue_salient_indices_by_hparam(model: torch.nn.Module) -> dict[st
                     if input_quantizer is not None
                     else None
                 )
+                if salient is None or salient.numel() == 0:
+                    salient = getattr(
+                        module, "_residue_salient_indices_by_ratio", {}
+                    ).get(ratio_key)
                 if salient is None or salient.numel() == 0:
                     continue
                 values = salient.detach().cpu().to(torch.int64).contiguous().view(-1)
