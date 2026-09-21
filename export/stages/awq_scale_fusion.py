@@ -48,6 +48,15 @@ class ApplyAwqScaleFusionStage(Stage):
         ctx.metrics["awq_fused_with_prequant_markers_cleared"] = summary[
             "awq_fused_with_prequant_markers_cleared"
         ]
+        ctx.metrics["awq_pre_quant_scale_resmooth_fallback"] = summary[
+            "awq_pre_quant_scale_resmooth_fallback"
+        ]
+        ctx.metrics["awq_pre_quant_scale_resmooth_fallback_modules"] = summary[
+            "awq_pre_quant_scale_resmooth_fallback_modules"
+        ]
+        ctx.metrics["awq_unquantized_consumers_compensated"] = summary[
+            "awq_unquantized_consumers_compensated"
+        ]
 
         if summary["awq_pre_quant_scale_after_fusion"] and not allow_unfused_pre_quant_scale:
             preview = ", ".join(summary["awq_pre_quant_scale_after_fusion_modules"][:10])
@@ -60,6 +69,8 @@ class ApplyAwqScaleFusionStage(Stage):
             "AWQ pre-quant-scale fusion complete: "
             f"{summary['awq_pre_quant_scale_before_fusion']} before, "
             f"{summary['awq_pre_quant_scale_after_fusion']} after, "
+            f"resmoothed {summary['awq_pre_quant_scale_resmooth_fallback']} "
+            "non-fusible modules, "
             f"cleared {summary['awq_fused_with_prequant_markers_cleared']} "
             "fused_with_prequant markers"
         )
@@ -83,13 +94,15 @@ def fold_awq_pre_quant_scale_for_external_injection(
     scale tensors have already been consumed.
     """
     before = _find_pre_quant_scale_modules(model)
+    fallback_modules = _resmooth_nonfusible_pre_quant_scale_modules(model)
+    compensated_consumers = 0
     if before or run_when_empty:
         if verbose:
             print_rank_0(
                 "Applying AWQ pre-quant-scale fusion before residue injection "
                 f"({len(before)} modules with pre_quant_scale)"
             )
-        _apply_awq_scale_fusion(model)
+        compensated_consumers = _apply_awq_scale_fusion(model) or 0
     elif verbose:
         print_rank_0("AWQ scale fusion no-op: no pre_quant_scale modules found")
 
@@ -100,23 +113,105 @@ def fold_awq_pre_quant_scale_for_external_injection(
         "awq_pre_quant_scale_after_fusion": len(after),
         "awq_pre_quant_scale_after_fusion_modules": after,
         "awq_fused_with_prequant_markers_cleared": fused_marker_count,
+        "awq_pre_quant_scale_resmooth_fallback": len(fallback_modules),
+        "awq_pre_quant_scale_resmooth_fallback_modules": fallback_modules,
+        "awq_unquantized_consumers_compensated": compensated_consumers,
     }
 
 
-def _apply_awq_scale_fusion(model) -> None:
+def _apply_awq_scale_fusion(model) -> int:
     import modelopt.torch.export.unified_export_hf as export_hf
-    from modelopt.torch.export.quant_utils import fuse_prequant_to_linear
+    import modelopt.torch.export.quant_utils as quant_utils
+    from modelopt.torch.export.quant_utils import (
+        PQS_FUSE_MODULE_MAPPING,
+        fuse_prequant_to_linear,
+    )
+    from export.awq_unquantized_consumers import capture_consumers, compensate_consumers
 
-    with torch.inference_mode():
-        # The grouped-head path is required for Llama GQA/MQA o_proj.
-        fuse_prequant_to_linear(model, fuse_grouped_heads=True)
+    excluded_consumers = capture_consumers(model)
 
-        orig_fuse_prequant_to_linear = export_hf.fuse_prequant_to_linear
-        export_hf.fuse_prequant_to_linear = lambda *_args, **_kwargs: None
-        try:
-            export_hf.requantize_resmooth_fused_llm_layers(model)
-        finally:
-            export_hf.fuse_prequant_to_linear = orig_fuse_prequant_to_linear
+    # ModelOpt 0.45 predates the Qwen3.5 class names.  These two modules have
+    # the same algebraic producer/consumer pairs as their Qwen3 counterparts,
+    # so reusing the existing mappings is exact.  Keep the extension local to
+    # this call instead of mutating ModelOpt process-global policy forever.
+    qwen35_mappings = [
+        (["Qwen3_5Attention"], ("v_proj", "o_proj")),
+        (["Qwen3_5MLP"], ("up_proj", "down_proj")),
+    ]
+    added_mappings = []
+    for mapping in qwen35_mappings:
+        if mapping not in PQS_FUSE_MODULE_MAPPING:
+            PQS_FUSE_MODULE_MAPPING.append(mapping)
+            added_mappings.append(mapping)
+
+    try:
+        with torch.inference_mode():
+            # The grouped-head path is required for Llama/Qwen GQA/MQA o_proj.
+            fuse_prequant_to_linear(model, fuse_grouped_heads=True)
+
+            orig_fuse_prequant_to_linear = export_hf.fuse_prequant_to_linear
+            orig_layernorm_uses_weight_plus_one = (
+                quant_utils._layernorm_uses_weight_plus_one
+            )
+
+            def layernorm_uses_weight_plus_one(module) -> bool:
+                # transformers' Qwen3.5 RMSNorm stores a zero-centred gamma and
+                # computes norm(x) * (1 + weight).  ModelOpt 0.45 predates this
+                # class, so its stock detector treats the parameter as an
+                # ordinary multiplicative gamma.  That makes AWQ fusion use
+                # ``weight * scale`` instead of the function-preserving
+                # ``(1 + weight) * scale - 1`` and corrupts the clean model.
+                if type(module).__name__ == "Qwen3_5RMSNorm":
+                    return True
+                return orig_layernorm_uses_weight_plus_one(module)
+
+            export_hf.fuse_prequant_to_linear = lambda *_args, **_kwargs: None
+            quant_utils._layernorm_uses_weight_plus_one = (
+                layernorm_uses_weight_plus_one
+            )
+            try:
+                export_hf.requantize_resmooth_fused_llm_layers(model)
+            finally:
+                export_hf.fuse_prequant_to_linear = orig_fuse_prequant_to_linear
+                quant_utils._layernorm_uses_weight_plus_one = (
+                    orig_layernorm_uses_weight_plus_one
+                )
+    finally:
+        for mapping in added_mappings:
+            PQS_FUSE_MODULE_MAPPING.remove(mapping)
+    compensated = compensate_consumers(excluded_consumers)
+    if compensated:
+        print_rank_0(f"AWQ shared-norm fusion: compensated {len(compensated)} excluded GDN consumers")
+    return len(compensated)
+
+
+def _resmooth_nonfusible_pre_quant_scale_modules(model) -> list[str]:
+    """Undo AWQ smoothing where Qwen3.5 has no exact upstream fusion target.
+
+    ``Qwen3_5GatedDeltaNet.out_proj`` consumes a recurrent/gated result whose
+    final RMSNorm shares 128 parameters across 48 heads.  AWQ learns 6,144
+    independent input scales, so those scales cannot be folded into that norm
+    unless they repeat across heads (real calibration shows they do not).
+    ModelOpt's official resmooth helper restores the original floating weight,
+    recalibrates it with max calibration, and lets clean-HF export remain exact.
+    """
+    from modelopt.torch.quantization.model_calib import (
+        disable_pre_quant_scale_and_resmooth,
+    )
+
+    fallback_modules = []
+    for name, module in model.named_modules():
+        if not name.endswith(".linear_attn.out_proj"):
+            continue
+        input_quantizer = getattr(module, "input_quantizer", None)
+        if input_quantizer is None or not hasattr(input_quantizer, "_pre_quant_scale"):
+            continue
+        disable_pre_quant_scale_and_resmooth(
+            module,
+            delete_pre_quant_scale=True,
+        )
+        fallback_modules.append(name)
+    return fallback_modules
 
 
 def _find_pre_quant_scale_modules(model) -> list[str]:

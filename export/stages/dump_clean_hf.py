@@ -253,32 +253,28 @@ class DumpCleanHFStage(Stage):
         if verbose:
             print_rank_0("Applying ModelOpt AWQ scale fusion before clean HF dump")
 
-        import modelopt.torch.export.unified_export_hf as export_hf
-        from modelopt.torch.export.quant_utils import fuse_prequant_to_linear
+        from .awq_scale_fusion import (
+            fold_awq_pre_quant_scale_for_external_injection,
+        )
 
-        # Follow the same fusion order as export_hf_checkpoint(), but make the
-        # first pre-quant-scale fusion GQA/MQA aware. Upstream
-        # requantize_resmooth_fused_llm_layers() calls fuse_prequant_to_linear()
-        # without fuse_grouped_heads=True, which leaves Llama GQA o_proj scales
-        # unfused (for example 2048 input scale vs 512 v_proj channels).
-        before = self._find_pre_quant_scale_modules(model)
-        with torch.inference_mode():
-            fuse_prequant_to_linear(model, fuse_grouped_heads=True)
+        summary = fold_awq_pre_quant_scale_for_external_injection(model)
+        before_count = summary["awq_pre_quant_scale_before_fusion"]
+        after = summary["awq_pre_quant_scale_after_fusion_modules"]
 
-            orig_fuse_prequant_to_linear = export_hf.fuse_prequant_to_linear
-            export_hf.fuse_prequant_to_linear = lambda *_args, **_kwargs: None
-            try:
-                export_hf.requantize_resmooth_fused_llm_layers(model)
-            finally:
-                export_hf.fuse_prequant_to_linear = orig_fuse_prequant_to_linear
-        after = self._find_pre_quant_scale_modules(model)
-
-        ctx.metrics["clean_hf_pre_quant_scale_before_awq_fusion"] = len(before)
+        ctx.metrics["clean_hf_pre_quant_scale_before_awq_fusion"] = before_count
         ctx.metrics["clean_hf_pre_quant_scale_after_awq_fusion"] = len(after)
+        ctx.metrics["clean_hf_pre_quant_scale_resmooth_fallback"] = summary[
+            "awq_pre_quant_scale_resmooth_fallback"
+        ]
+        ctx.metrics["clean_hf_pre_quant_scale_resmooth_fallback_modules"] = summary[
+            "awq_pre_quant_scale_resmooth_fallback_modules"
+        ]
         if verbose:
             print_rank_0(
                 "  pre_quant_scale modules: "
-                f"{len(before)} before AWQ fusion, {len(after)} after AWQ fusion"
+                f"{before_count} before AWQ fusion, {len(after)} after AWQ fusion; "
+                f"resmoothed {summary['awq_pre_quant_scale_resmooth_fallback']} "
+                "non-fusible modules"
             )
 
         if after and not allow_unfused_pre_quant_scale:
