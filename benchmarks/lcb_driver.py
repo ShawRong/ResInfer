@@ -48,8 +48,10 @@ import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 VLLM_BIN = REPO / ".venv" / "bin" / "vllm"
+SERVING_PYTHON = REPO / ".venv" / "bin" / "python"
 # The isolated scorer env (a declarative uv sub-project, benchmarks/README.md).
 LIGHTEVAL_CLI = REPO / "envs" / "lighteval" / ".venv" / "bin" / "lighteval"
+LIGHTEVAL_PYTHON = REPO / "envs" / "lighteval" / ".venv" / "bin" / "python"
 
 _PIDS: list[int] = []
 
@@ -292,15 +294,6 @@ def health_ok(port: int) -> bool:
         return False
 
 
-def wait_until(fn, timeout_s: int) -> bool:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        if fn():
-            return True
-        time.sleep(5)
-    return False
-
-
 def free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -423,10 +416,11 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path,
     
     
     env["LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu:" + env.get("LIBRARY_PATH", "")
-    # probe_site FIRST (its sitecustomize chain-loads the repo's), repo root
-    # SECOND (`quant` is not pip-installed; the plugin imports it from here).
-    env["PYTHONPATH"] = ":".join(
-        [str(probe_site), str(REPO)]
+    # probe_site comes first because it chain-loads the repository's
+    # sitecustomize. Both package roots are required: quant lives at REPO,
+    # while nvfp4 lives under csrc/nvfp4.
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(probe_site), str(REPO), str(REPO / "csrc" / "nvfp4")]
         + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env["VLLM_SCHED_MEFF_LOG_DIR"] = str(event_dir)
     env["VLLM_SCHED_MEFF_ENABLE_FILE"] = str(enable_file)
@@ -483,14 +477,72 @@ def build_server_cmd(arm: dict, man: dict, a, port: int) -> list[str]:
 
 def launch_server(cmd: list[str], env: dict, case_out: pathlib.Path,
                   port: int, timeout_s: int) -> None:
-    log = open(case_out / "server.log", "wb")
-    proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=log,
-                            stderr=subprocess.STDOUT, start_new_session=True)
+    with (case_out / "server.log").open("wb") as log:
+        proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=log,
+                                stderr=subprocess.STDOUT, start_new_session=True)
     _PIDS.append(proc.pid)
     print(f"[lcb_driver] server pid={proc.pid} port={port}", flush=True)
-    if not wait_until(lambda: health_ok(port), timeout_s):
-        raise RuntimeError(f"server not healthy after {timeout_s}s -- see "
-                           f"{case_out / 'server.log'}")
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if health_ok(port):
+            return
+        returncode = proc.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                f"server exited with code {returncode} before /health became "
+                f"ready -- see {case_out / 'server.log'}")
+        time.sleep(2)
+    raise RuntimeError(f"server not healthy after {timeout_s}s -- see "
+                       f"{case_out / 'server.log'}")
+
+
+def preflight_server(arm: dict, env: dict, case_out: pathlib.Path) -> dict:
+    """Verify the residue package, extension ABI, and vLLM patch before serve."""
+    if arm["kind"] != "residue":
+        return {}
+    if not SERVING_PYTHON.exists():
+        raise RuntimeError(f"serving interpreter not found: {SERVING_PYTHON}")
+
+    script = r'''import hashlib, importlib.util, json, pathlib, sys
+import nvfp4, quant, torch
+from nvfp4.extension import ensure_loaded
+from quant.vllm_integration.patch import is_patched
+assert ensure_loaded(True), "nvfp4 extension did not load"
+assert is_patched(), "residue vLLM patch is not installed"
+spec = importlib.util.find_spec("nvfp4._C")
+origin = pathlib.Path(spec.origin).resolve() if spec and spec.origin else None
+assert origin and origin.is_file(), "nvfp4._C origin is unavailable"
+payload = {
+    "python": sys.version.split()[0],
+    "torch": torch.__version__,
+    "torch_cuda": torch.version.cuda,
+    "extension": str(origin),
+    "extension_sha256": hashlib.sha256(origin.read_bytes()).hexdigest(),
+}
+print("RESINFER_PREFLIGHT_JSON=" + json.dumps(payload, sort_keys=True))
+'''
+    proc = subprocess.run(
+        [str(SERVING_PYTHON), "-c", script], cwd=str(REPO), env=env,
+        capture_output=True, text=True,
+    )
+    log_path = case_out / "server_preflight.log"
+    log_path.write_text(proc.stdout + proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"residue server preflight exited {proc.returncode}; see {log_path}")
+    marker = "RESINFER_PREFLIGHT_JSON="
+    lines = [line for line in proc.stdout.splitlines() if line.startswith(marker)]
+    if not lines:
+        raise RuntimeError(f"server preflight produced no ABI record; see {log_path}")
+    payload = json.loads(lines[-1][len(marker):])
+    extension = pathlib.Path(payload["extension"])
+    try:
+        extension.relative_to(REPO / "csrc" / "nvfp4")
+    except ValueError as exc:
+        raise RuntimeError(
+            f"nvfp4 extension is not from this checkout: {extension}") from exc
+    payload["source_commit"] = git_head()
+    return payload
 
 
 # ---------------------------------------------------------------- the gates
@@ -611,8 +663,28 @@ def run_lighteval(arm: dict, man: dict, a, cfg_path: pathlib.Path,
 
     env = os.environ.copy()
     strip_proxies(env)
+    env.update({
+        "HF_HUB_OFFLINE": "1",
+        "HF_DATASETS_OFFLINE": "1",
+        "TRANSFORMERS_OFFLINE": "1",
+        "HF_HUB_DISABLE_TELEMETRY": "1",
+        "DISABLE_TELEMETRY": "1",
+        "DO_NOT_TRACK": "1",
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        "LITELLM_LOCAL_ANTHROPIC_BETA_HEADERS": "True",
+    })
+    if a.nltk_data:
+        env["NLTK_DATA"] = str(pathlib.Path(a.nltk_data).expanduser().resolve())
+    if a.data_root:
+        env["RESINFER_EVAL_DATA_ROOT"] = str(
+            pathlib.Path(a.data_root).expanduser().resolve())
+    compat = REPO / "envs" / "lighteval" / "compat"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(compat), str(REPO)]
+        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     # Shared HF cache so pre-fetched datasets are visible to the scorer venv.
     env.setdefault("HF_HOME", str(pathlib.Path.home() / ".cache" / "huggingface"))
+    preflight_lighteval(env, case_out)
     write_json(case_out / "lighteval_invocation.json",
                {"cmd": cmd, "config": str(cfg_path), "tasks": tasks})
     print(f"[lcb_driver] scorer: {' '.join(cmd)}", flush=True)
@@ -625,7 +697,44 @@ def run_lighteval(arm: dict, man: dict, a, cfg_path: pathlib.Path,
     hits = sorted(raw.rglob("results_*.json"))  # nested deep: model_name has slashes
     if not hits:
         raise RuntimeError(f"no lighteval results json found under {raw}")
+    if a.save_details and not list(raw.rglob("*.parquet")):
+        raise RuntimeError(f"--save-details produced no parquet file under {raw}")
     return json.loads(hits[-1].read_text()).get("results", {})
+
+
+def preflight_lighteval(env: dict, case_out: pathlib.Path) -> None:
+    """Fail before task loading if the offline scorer assets are incomplete."""
+    if not LIGHTEVAL_PYTHON.exists():
+        raise RuntimeError(f"lighteval interpreter not found: {LIGHTEVAL_PYTHON}")
+    if not env.get("NLTK_DATA"):
+        raise RuntimeError(
+            "NLTK_DATA is required for offline lighteval; run "
+            "envs/lighteval/bootstrap_offline.py and pass --nltk-data")
+    script = r'''import importlib.util, pathlib
+import nltk, xxhash
+spec = importlib.util.find_spec("lighteval")
+assert spec and spec.origin, "lighteval is not installed"
+task_dir = pathlib.Path(spec.origin).resolve().parent / "tasks" / "tasks"
+assert (task_dir / "tinyBenchmarks.pkl").is_file(), "tinyBenchmarks.pkl is missing"
+for resource in (
+    "tokenizers/punkt",
+    "tokenizers/punkt_tab",
+    "corpora/stopwords",
+    "taggers/averaged_perceptron_tagger_eng",
+):
+    nltk.data.find(resource)
+xxhash.xxh64("resinfer-text-compat").hexdigest()
+print("lighteval offline preflight passed")
+'''
+    result = subprocess.run(
+        [str(LIGHTEVAL_PYTHON), "-c", script], cwd=str(REPO), env=env,
+        capture_output=True, text=True,
+    )
+    log_path = case_out / "lighteval_preflight.log"
+    log_path.write_text(result.stdout + result.stderr)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"lighteval offline preflight exited {result.returncode}; see {log_path}")
 
 
 # ------------------------------------------------------------------ one case
@@ -656,8 +765,10 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     cache_dir = None if a.global_cache else case_out / "lighteval_cache"
 
     status, results, error, resolved_line = "fail", {}, None, None
+    server_preflight = {}
     server_log = case_out / "server.log"
     try:
+        server_preflight = preflight_server(arm, env, case_out)
         launch_server(cmd, env, case_out, port, a.ready_timeout_sec)
         # Delta 4: the pre-gate runs after health and before the first prompt.
         if arm["kind"] == "residue":
@@ -705,6 +816,7 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
         "arm": arm["id"], "model": arm["abs_path"], "kind": arm["kind"],
         "mext": arm.get("mext"), "manifest": man["_path"],
         "git_head": git_head(),
+        "server_preflight": server_preflight,
         "resolved_mode": resolved_line,
         "runtime_env": prov["runtime_env"],
         "cache_dir": str(cache_dir) if cache_dir else "GLOBAL (opted out)",
@@ -763,6 +875,11 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--custom-tasks", default=None,
                     help="lighteval --custom-tasks module, e.g. "
                          "benchmarks/lighteval_aime_avg_tasks.py for avg@8")
+    ap.add_argument("--data-root", default=None,
+                    help="root containing offline AIME/GPQA datasets for "
+                         "benchmarks/offline_tasks.py")
+    ap.add_argument("--nltk-data", default=os.environ.get("NLTK_DATA"),
+                    help="pre-staged NLTK data directory for offline scoring")
     ap.add_argument("--global-cache", action="store_true",
                     help="OPT OUT of the run-scoped lighteval cache (hazard!)")
     ap.add_argument("--max-samples", type=int, default=None,

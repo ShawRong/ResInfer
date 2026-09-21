@@ -21,36 +21,34 @@ import os
 
 
 def _maybe_patch_vllm() -> None:
-    if not os.environ.get("RESIDUE_PATCH_VLLM"):
+    enabled = os.environ.get("RESIDUE_PATCH_VLLM", "").strip().lower()
+    if enabled not in {"1", "true", "yes", "on"}:
         return
 
     # Pass model_dir if available; worker processes inherit this env var.
     model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
 
     try:
-        from quant.vllm_integration.patch import patch_vllm_modelopt
+        from quant.vllm_integration.patch import is_patched, patch_vllm_modelopt
 
         patch_vllm_modelopt(model_dir=model_dir)
+        if not is_patched():
+            raise RuntimeError(
+                "patch_vllm_modelopt did not install the requested patch")
     except Exception as exc:
-        # Best-effort only: vLLM may not be installed for non-vLLM workflows.
-        # But when RESIDUE_PATCH_VLLM is explicitly on, a silent skip means the
-        # residue kernels never activate — surface the reason instead of hiding
-        # it (this was the e2e "patch didn't reach the worker" root cause).
-        # ALWAYS loud (audit F10): the comment above promises "surface the
-        # reason instead of hiding it", but the print was gated behind a
-        # debug flag -- so a real patch failure silently served plain NVFP4.
-        # The plugin path re-raises; sitecustomize at least must print.
-        if True:
-            import traceback
+        import traceback
 
-            print(
-                f"[residue:sitecustomize] patch FAILED in pid={os.getpid()}: "
-                f"{type(exc).__name__}: {exc}",
-                flush=True,
-            )
-            traceback.print_exc()
-        return
+        print(
+            f"[residue:sitecustomize] patch FAILED in pid={os.getpid()}: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        traceback.print_exc()
+        # Exceptions raised by sitecustomize are otherwise reported and then
+        # ignored by Python. SystemExit makes an explicit patch request fail
+        # closed before the serving process can fall back to stock vLLM.
+        raise SystemExit(
+            "RESIDUE_PATCH_VLLM=1 but the patch was not installed") from exc
 
 
 _maybe_patch_vllm()
-
