@@ -50,15 +50,19 @@ def gemm(a, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
 
 
 def fold_gemm(a_rowpair, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
-              mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1)):
+              mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1),
+              store_mode="tma", pi_via_layout=False):
     """Fused FP32 pair sum; one physical weight and compact [M,N] output."""
     m2, _, _, arch = _validate(a_rowpair, b, a_scale, b_scale, out_dtype)
     if m2 % 2:
         raise ValueError("MExt input needs an even number of physical rows")
+    if store_mode not in ("tma", "tma_mext", "direct_mext"):
+        raise ValueError("unsupported MXFP4 Fold store mode")
     with torch.cuda.device(a_rowpair.device):
         return mext_fold_gemm_sm103(
             b, a_rowpair, b_scale, a_scale,
             None,
             out_dtype=out_dtype, mma_tiler_mn=tuple(mma_tiler_mn),
             cluster_shape_mn=tuple(cluster_shape_mn), kernel_arch=arch,
+            store_mode=store_mode, pi_via_layout=pi_via_layout,
             fp4_format="mxfp4")

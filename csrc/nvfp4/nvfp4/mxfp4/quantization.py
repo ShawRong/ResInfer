@@ -70,11 +70,14 @@ def quantize(source, *, layout="128x4", recipe="ceil"):
     return quantize_fused(source, residue=False, layout=layout)
 
 
-def quantize_mext(source, *, layout="128x4", recipe="ceil"):
+def quantize_mext(source, *, layout="128x4", recipe="ceil",
+                  mext_layout="row_pair", m_pad_multiple=None):
     _validate_2d(source, layout, recipe)
     from .residue_quant import quantize_fused
 
-    return quantize_fused(source, residue=True, layout=layout)
+    return quantize_fused(source, residue=True, layout=layout,
+                          mext_layout=mext_layout,
+                          m_pad_multiple=m_pad_multiple)
 
 
 def swizzle_scales(scales):

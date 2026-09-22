@@ -86,23 +86,33 @@ __device__ __forceinline__ uint2 encode16(float (&v)[16],Scale s) {
 template<class T,int R>
 __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
     uint8_t const* masks,uint8_t* q,uint8_t* sf,
-    int m,int k,int kp,int padded_rows,bool swizzle) {
+    int m,int k,int kp,int output_rows,int padded_rows,bool swizzle,bool tile8) {
   constexpr bool SELECTIVE=R>0 && R<8;
   constexpr int FACTOR=R==8?2:1;
   int row=blockIdx.x;
-  int outrow=row*FACTOR,rows=m*FACTOR;
+  int outrow=(R==8 && tile8)?(row/8)*16+row%8:row*FACTOR;
+  int resrow=(R==8 && tile8)?outrow+8:outrow+1;
   int groups=kp/32,selected=SELECTIVE?k/8*R:0;
   bool valid=row<m;
   int written_groups=k/32+(SELECTIVE?(selected+31)/32:0);
   int sf_groups=swizzle?(groups+3)/4*4:groups;
   // Clear only padding/invalid rows, never overwrite valid producer stores.
   for(int g=threadIdx.x;g<sf_groups;g+=blockDim.x) {
-    if((!valid || g>=written_groups) && outrow<(swizzle?padded_rows:rows)) {
+    if((!valid || g>=written_groups) && outrow<(swizzle?padded_rows:output_rows)) {
       sf[sf_offset(outrow,g,groups,swizzle)]=0;
-      if constexpr(FACTOR==2) sf[sf_offset(outrow+1,g,groups,swizzle)]=0;
+      if constexpr(FACTOR==2) sf[sf_offset(resrow,g,groups,swizzle)]=0;
     }
   }
-  if(row>=m) return;
+  if(row>=m) {
+    // A4/A6 read a padded tile8 activation as real GEMM rows. Zero its data
+    // as well as the scales; the old row-pair path has no physical padding.
+    if constexpr(R==8) if(tile8 && row<output_rows/2)
+      for(int j=threadIdx.x;j<kp/2;j+=blockDim.x) {
+        q[int64_t(outrow)*(kp/2)+j]=0;
+        q[int64_t(resrow)*(kp/2)+j]=0;
+      }
+    return;
+  }
   for(int tile=0;tile<(k+blockDim.x*16-1)/(blockDim.x*16);++tile) {
     int g=tile*blockDim.x+threadIdx.x;
     bool has_input=g<k/16;
@@ -127,8 +137,8 @@ __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
       Scale res=make_scale(reduce_max<2>(mx));
       uint2 rbits=encode16<false>(v,res);
       if(has_input) {
-        *reinterpret_cast<uint2*>(q+int64_t(outrow+1)*(kp/2)+g*8)=rbits;
-        if((g&1)==0) sf[sf_offset(outrow+1,g/2,groups,swizzle)]=res.code;
+        *reinterpret_cast<uint2*>(q+int64_t(resrow)*(kp/2)+g*8)=rbits;
+        if((g&1)==0) sf[sf_offset(resrow,g/2,groups,swizzle)]=res.code;
       }
     } else if constexpr(SELECTIVE) {
       constexpr int NR=2*R, SF_THREADS=32/NR, PACK_THREADS=8/NR;
@@ -171,12 +181,12 @@ __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
 
 template<class T>
 void dispatch(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
-    uint8_t const* masks,int per8,bool residue,bool swizzle,cudaStream_t stream) {
+    uint8_t const* masks,int per8,bool residue,bool swizzle,bool tile8,cudaStream_t stream) {
   int m=x.size(0),k=x.size(1),kp=q.size(1)*2,rows=q.size(0);
   int padded=swizzle?(rows+127)/128*128:rows;
   dim3 grid(residue&&!masks?padded/2:padded);
   auto p=reinterpret_cast<T const*>(x.data_ptr());
-  #define LAUNCH(R) fused_quant<T,R><<<grid,128,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,padded,swizzle)
+  #define LAUNCH(R) fused_quant<T,R><<<grid,128,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,rows,padded,swizzle,tile8)
   if(masks) {switch(per8) {case 1:LAUNCH(1);break;case 2:LAUNCH(2);break;case 4:LAUNCH(4);break;}}
   else if(residue) {LAUNCH(8);} else {LAUNCH(0);}
   #undef LAUNCH
@@ -185,7 +195,7 @@ void dispatch(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
 
 void mxfp4_residue_quant(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
          c10::optional<torch::Tensor> masks,int64_t per8,
-         bool residue,bool swizzle) {
+         bool residue,bool swizzle,bool tile8) {
   TORCH_CHECK(x.is_cuda()&&x.dim()==2,"expected CUDA [M,K]");
   c10::cuda::CUDAGuard guard(x.device());
   auto prop=at::cuda::getCurrentDeviceProperties();
@@ -195,9 +205,13 @@ void mxfp4_residue_quant(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
   int m=x.size(0),k=x.size(1);
   TORCH_CHECK(k>0&&k%32==0,"invalid MXFP4 extent");
   TORCH_CHECK(!masks||(residue&&(per8==1||per8==2||per8==4)),"per8 must be 1/2/4");
+  TORCH_CHECK(!tile8 || (residue && !masks && swizzle),
+              "tile8 requires full residue and 128x4 scales");
   if(masks) TORCH_CHECK(masks->device()==x.device()&&masks->scalar_type()==at::kByte&&masks->is_contiguous()&&masks->dim()==1&&masks->numel()==k/8,"prepared uint8 masks [K/8] required");
-  int rows=m*(residue&&!masks?2:1),selected=masks?k/8*per8:0;
-  TORCH_CHECK(q.dim()==2&&q.size(0)==rows,"invalid output rows");
+  int rows=q.size(0),selected=masks?k/8*per8:0;
+  TORCH_CHECK(q.dim()==2 && (tile8 ? (rows>=2*m && rows%16==0)
+                                  : rows==m*(residue&&!masks?2:1)),
+              "invalid output rows");
   int kp=q.size(1)*2;
   TORCH_CHECK(kp%32==0&&(masks?kp>=k+selected:kp==k),"invalid output K");
   int64_t ns=swizzle?int64_t((rows+127)/128)*((kp+127)/128)*512:int64_t(rows)*(kp/32);
@@ -205,7 +219,7 @@ void mxfp4_residue_quant(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
   if(!m)return;
   auto stream=at::cuda::getCurrentCUDAStream();
   auto mp=masks?masks->data_ptr<uint8_t>():nullptr;
-  #define DTYPE(T) dispatch<T>(x,q,sf,mp,per8,residue,swizzle,stream)
+  #define DTYPE(T) dispatch<T>(x,q,sf,mp,per8,residue,swizzle,tile8,stream)
   if(x.scalar_type()==at::kHalf){DTYPE(half);}else if(x.scalar_type()==at::kBFloat16){DTYPE(__nv_bfloat16);}
   else{TORCH_CHECK(x.scalar_type()==at::kFloat,"fp16/bf16/fp32 required");DTYPE(float);}
   #undef DTYPE

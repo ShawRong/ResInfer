@@ -51,6 +51,51 @@ def test_quant_mext():
     np.testing.assert_array_equal(ps[1::2].cpu(), err_s)
 
 
+@pytest.mark.parametrize("m,pad_multiple", [(1, 8), (7, 64), (8, 8), (9, 8), (128, 8)])
+def test_quant_mext_tile8_matches_row_pair(m, pad_multiple):
+    torch.manual_seed(109 + m)
+    k = 4096
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    row_q, row_sf = quantize_mext(x)
+    tile_q, tile_sf = quantize_mext(
+        x, mext_layout="tile8", m_pad_multiple=pad_multiple)
+    output_m = ((m + pad_multiple - 1) // pad_multiple) * pad_multiple
+    assert tile_q.shape == (2 * output_m, k // 2)
+    blocks_q = tile_q.reshape(output_m // 8, 2, 8, k // 2)
+    base_q = blocks_q[:, 0].reshape(output_m, k // 2)
+    res_q = blocks_q[:, 1].reshape(output_m, k // 2)
+    torch.testing.assert_close(base_q[:m], row_q[::2], rtol=0, atol=0)
+    torch.testing.assert_close(res_q[:m], row_q[1::2], rtol=0, atol=0)
+    assert not bool(torch.count_nonzero(base_q[m:]))
+    assert not bool(torch.count_nonzero(res_q[m:]))
+
+    row_linear = unswizzle_scales(row_sf, 2 * m, k)
+    tile_linear = unswizzle_scales(tile_sf, 2 * output_m, k)
+    blocks_sf = tile_linear.reshape(output_m // 8, 2, 8, k // 32)
+    base_sf = blocks_sf[:, 0].reshape(output_m, k // 32)
+    res_sf = blocks_sf[:, 1].reshape(output_m, k // 32)
+    torch.testing.assert_close(base_sf[:m], row_linear[::2], rtol=0, atol=0)
+    torch.testing.assert_close(res_sf[:m], row_linear[1::2], rtol=0, atol=0)
+    assert not bool(torch.count_nonzero(base_sf[m:]))
+    assert not bool(torch.count_nonzero(res_sf[m:]))
+
+
+def test_mxfp4_swap_ab_fold_matches_row_pair():
+    torch.manual_seed(223)
+    m, n, k = 128, 256, 4096
+    x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
+    w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16)
+    wq, ws = quantize(w)
+    row_q, row_sf = quantize_mext(x)
+    tile_q, tile_sf = quantize_mext(x, mext_layout="tile8")
+    reference = fold_gemm(row_q, wq, row_sf, ws)
+    for mode, pi in (("tma_mext", False), ("direct_mext", True)):
+        actual = fold_gemm(
+            tile_q, wq, tile_sf, ws, store_mode=mode,
+            mma_tiler_mn=(128, 64), pi_via_layout=pi)
+        torch.testing.assert_close(actual, reference, rtol=.02, atol=.125)
+
+
 def test_quant_zero_and_scale_extremes():
     maxima = np.array([0., -0., 2.**-127, 2.**-120, 2.**120,
                        np.finfo(np.float32).max], dtype=np.float32)

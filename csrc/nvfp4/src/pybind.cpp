@@ -54,7 +54,7 @@ void official_scaled_fp4_quant_pack16(torch::Tensor& output,
                                        torch::Tensor const& input_sf);
 void mxfp4_residue_quant(torch::Tensor x, torch::Tensor q, torch::Tensor sf,
                          c10::optional<torch::Tensor> masks, int64_t per8,
-                         bool residue, bool swizzle);
+                         bool residue, bool swizzle, bool tile8);
 
 // Register operator in the nvfp4 namespace
 TORCH_LIBRARY(nvfp4, m) {
@@ -98,7 +98,8 @@ TORCH_LIBRARY(nvfp4, m) {
       "Tensor(a!) q_pack, Tensor(b!) q_sf) -> ()");
   m.def(
       "mxfp4_residue_quant(Tensor x, Tensor(a!) q, Tensor(b!) sf, "
-      "Tensor? masks, int per8, bool residue, bool swizzle) -> ()");
+      "Tensor? masks, int per8, bool residue, bool swizzle, "
+      "bool tile8=False) -> ()");
 }
 
 // Register CUDA implementation
