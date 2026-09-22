@@ -218,6 +218,8 @@ def plan_qmul4_decode_nvfp4(
         wave_splits = max(1, _sm_count(str(device)) // grid_yz)
         useful_splits = sequence_tiles // 4
         splits = min(wave_splits, useful_splits, 16)
+        if splits == 2 and max_kv_len >= 8192:
+            return 2, "kernel"
         if splits < 4:
             return 1, "none"
         return 1 << (splits.bit_length() - 1), "gmem_fused"
