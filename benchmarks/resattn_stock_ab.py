@@ -348,8 +348,9 @@ def main() -> None:
                     default=.98)
     ap.add_argument("--reference-max-relative-rms", type=float,
                     default=.15)
-    ap.add_argument("--plan", choices=("auto", "1/none", "4/gmem_fused",
-                                         "8/gmem_fused", "16/gmem_fused"),
+    ap.add_argument("--plan", choices=("auto", "1/none", "2/kernel",
+                                         "4/gmem_fused", "8/gmem_fused",
+                                         "16/gmem_fused"),
                     default="auto")
     args = ap.parse_args()
     if (not 0 < args.reference_min_cosine <= 1 or
