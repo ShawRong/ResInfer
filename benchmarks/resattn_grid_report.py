@@ -67,7 +67,11 @@ def main() -> None:
         writer.writerows(rows)
     by_key = {(row["gqa"], row["batch"], row["seq"],
                row["output_contract"]): row for row in rows}
-    lines = ["# ResAttn kernel grid", "",
+    lines = ["# ResAttn decode-only attention-chain grid", "",
+             "Synthetic NVFP4 KV context is built before timing. CUDA Graph "
+             "replay times only BF16 Q to the selected attention output; "
+             "prefill, KV construction, projection/FFN layers and serving "
+             "are excluded.", "",
              "Cell values are stock / ResAttn median latency. `D` marks stock "
              "A/A drift above 2%; `F` marks a failed or invalid cell; `·` "
              "marks an unrun cell. `†` marks a supplemental ResAttn-only "
