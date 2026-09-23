@@ -28,19 +28,3 @@ Vendored from the CUTLASS CuTeDSL example tree
 (https://github.com/NVIDIA/cutlass, examples/python/CuTeDSL):
 
   csrc/nvfp4/nvfp4/cute_fold_sm120/_dsl_helpers.py
-
-Derived from FlashInfer's CuTeDSL grouped-GEMM kernels, with local
-modifications:
-
-  csrc/nvfp4/nvfp4/moe/blackwell/blockscaled_contiguous_gather_grouped_gemm_act_fusion.py
-  csrc/nvfp4/nvfp4/moe/blackwell/blockscaled_contiguous_grouped_gemm_finalize_fusion.py
-
-================================================================================
-Apache-2.0 (NVIDIA CORPORATION & AFFILIATES)
-================================================================================
-
-Derived from FlashInfer utility/pipeline sources; same license as the
-project, NVIDIA copyright retained in the file headers:
-
-  csrc/nvfp4/nvfp4/moe/blackwell/custom_pipeline.py
-  csrc/nvfp4/nvfp4/moe/blackwell/utils.py

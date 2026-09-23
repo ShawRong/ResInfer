@@ -34,22 +34,6 @@ KNOWN: dict[str, tuple] = {
                                 "applies to"),
     "RESIDUE_MEXT_ATTN_PROJ_NAMES": ("free", None,
                                      "legacy alias of RESIDUE_MEXT_PROJ_NAMES"),
-    "RESIDUE_ENABLE_MOE": ("one", None,
-                           "MoE expert takeover (residue_moe.py hook)"),
-    "RESIDUE_MOE_IMPL": ("enum", {"cutedsl"},
-                         'MoE experts implementation: FlashInfer CuTeDSL. For deterministic evaluation, use RESIDUE_MOE_DETERMINISTIC_FINALIZE=1.'),
-    "RESIDUE_MOE_DETERMINISTIC_FINALIZE": (
-        "one", None,
-        "MoE finalize that repeats bit-for-bit: each base+residue pair "
-        "atomically adds into its own zero row (two addends, and float "
-        "addition IS commutative -- it is associativity that costs "
-        "reproducibility), then torch sorts by token id and sums a fixed "
-        "shape. For eval arms whose numbers get compared; costs an "
-        "(n_pairs, K) buffer and a sort, so it is off by default"),
-    "RESIDUE_LINEAR_OFF": ("one", None,
-                           "leave ALL LinearBase layers on stock vLLM "
-                           "(auto kernel); install only the MoE hook -- "
-                           "for MoE-only runs and clean A/B attribution"),
     # -- fold dispatch -----------------------------------------------------
     "RESIDUE_ENABLE_DECODE_MEXT": ("one", None,
                                    "fold layout for extended_k/plain layers"),
@@ -139,9 +123,6 @@ KNOWN: dict[str, tuple] = {
                                     "a short value selects the no-split "
                                     "kernel, which uses no atomics at all and "
                                     "is measured bitwise repeatable"),
-    # -- MoE -----------------------------------------------------------------
-    "RESIDUE_MOE_MEXT": ("one", None, "MoE mext experiment gate"),
-    "RESIDUE_MOE_OBSERVE": ("one", None, "MoE routing observer"),
     # -- debug ----------------------------------------------------------------
     "RESIDUE_DEBUG": ("one", None, "verbose debug prints"),
     "RESIDUE_DEBUG_MASK": ("one", None, "mask debug prints"),

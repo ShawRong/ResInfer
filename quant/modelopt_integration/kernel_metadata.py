@@ -48,126 +48,6 @@ def _debug(msg: str) -> None:
         print(msg)
 
 
-# ---------------------------------------------------------------------------
-# MoE per-layer policy ("moe" section) — the export half of the paired
-
-# quant/vllm_integration/residue_moe_policy.py; keep the two in sync.
-# ---------------------------------------------------------------------------
-
-# impls this writer may emit. "extended_k" is deliberately NOT writable yet:
-# emitting it without actually K-extending the expert weights would produce
-# a checkpoint that lies about its own format (the server refuses the impl,
-# which is correct, but the export should not be producible at all until
-# W1-W3 of the plan exist).
-_MOE_WRITABLE_IMPLS = {"off": 0.0, "mext_r1": 1.0}
-
-
-def moe_expert_group_key(name: str) -> tuple[str, str] | None:
-    """"<prefix>.experts.<idx>.<proj>" -> (prefix, proj), else None.
-
-    Matches the HF MoE convention (Qwen3-MoE, Mixtral, ...): every expert
-    of one layer lives under `<block>.experts.<int>.` and the projection
-    name after the index identifies the role (gate/up/down). Shared by the
-    pooled-salience calibration (algo.py) and the metadata writer below so
-    both sides group experts by the same rule.
-    """
-    if name.startswith("experts."):
-        prefix, rest = "", name[len("experts."):]
-    elif ".experts." in name:
-        prefix, rest = name.split(".experts.", 1)
-    else:
-        return None
-    idx, _, proj = rest.partition(".")
-    if not idx.isdigit() or not proj:
-        return None
-    return (prefix, proj)
-
-
-def derive_moe_salience_rule(
-    salient_by_name: dict[str, list[int]],
-) -> str | None:
-    """Read the salience rule off the artifact: pooled | per_expert | None.
-
-    Derived, never trusted from process state: identical indices within
-    every (block, projection) expert group is the pooled calibration's
-    signature, and it is the property consumers actually care about --
-    whether two exports' expert salient sets follow the same rule. Works
-    identically on a live calibrated model and on a restored checkpoint,
-    and cannot disagree with the emitted per-layer indices. None when the
-    metadata carries no expert salient indices (dense model, or salience
-    skipped for experts).
-    """
-    groups: dict[tuple[str, str], list[list[int]]] = {}
-    for name, indices in salient_by_name.items():
-        key = moe_expert_group_key(name)
-        if key is not None:
-            groups.setdefault(key, []).append(indices)
-    if not groups:
-        return None
-    for members in groups.values():
-        if any(m != members[0] for m in members[1:]):
-            return "per_expert"
-    return "pooled"
-
-
-def find_moe_blocks(model) -> dict[str, Any]:
-    """MoE blocks = modules carrying both a router and an expert bank.
-
-    The `.gate` + `.experts` attribute pair is the Qwen3-MoE-family shape
-    and the same rule the serving side and the G1 probe use. Keyed by HF
-    module path ("model.layers.N.mlp") — the serving resolver matches
-    vLLM's child names ("...mlp.experts") against these by dotted prefix.
-    """
-    return {
-        name: module
-        for name, module in model.named_modules()
-        if hasattr(module, "gate") and hasattr(module, "experts")
-    }
-
-
-def collect_moe_kernel_metadata(
-    model,
-    layer_impls: dict[str, str] | None = None,
-) -> dict[str, Any] | None:
-    """Build the "moe" metadata section, or None for a dense model.
-
-    Every found MoE block gets an entry (the serving side refuses partial
-    policies, so a complete enumeration is part of the contract). Default
-    impl is "mext_r1" — identical to serving with no metadata at all, just
-    explicit. `layer_impls` overrides per module path; unknown paths and
-    unwritable impls raise rather than emit a policy the server would
-    refuse (or worse, one that misdescribes the weights).
-    """
-    blocks = find_moe_blocks(model)
-    if not blocks:
-        if layer_impls:
-            raise ValueError(
-                "moe layer_impls were provided but the model has no MoE "
-                f"blocks: {sorted(layer_impls)}")
-        return None
-
-    layer_impls = dict(layer_impls or {})
-    unknown = sorted(set(layer_impls) - set(blocks))
-    if unknown:
-        raise ValueError(
-            f"moe layer_impls name modules that are not MoE blocks of this "
-            f"model: {unknown}. Known blocks: {sorted(blocks)[:3]}...")
-
-    layers: dict[str, Any] = {}
-    for name in blocks:
-        impl = layer_impls.get(name, "mext_r1")
-        if impl not in _MOE_WRITABLE_IMPLS:
-            raise ValueError(
-                f"moe impl {impl!r} for {name!r} is not writable "
-                f"(writable: {sorted(_MOE_WRITABLE_IMPLS)}; extended_k "
-                "requires the K-extended export path, plan items W1-W3).")
-        layers[name] = {"impl": impl, "ratio": _MOE_WRITABLE_IMPLS[impl]}
-
-    _debug(f"[Collect] MoE policy: {len(layers)} layers, "
-           f"{sum(1 for v in layers.values() if v['impl'] == 'off')} off")
-    return {"granularity": "layer", "layers": layers}
-
-
 def collect_extended_linear_dims(model) -> dict[str, int]:
     """Collect Linear layers whose physical input dimension was extended."""
     extended_dims: dict[str, int] = {}
@@ -209,7 +89,6 @@ def collect_kernel_metadata(
     model,
     residue_ratio: float = 0.25,
     block_size: int = 8,
-    moe_layer_impls: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Collect metadata consumed by residue vLLM linear methods."""
     metadata: dict[str, Any] = {
@@ -219,12 +98,6 @@ def collect_kernel_metadata(
             "block_size": block_size,
         },
     }
-
-    moe_section = collect_moe_kernel_metadata(model, moe_layer_impls)
-    if moe_section is not None:
-        # dense models get no "moe" key at all, keeping their metadata
-        # byte-identical to before this section existed.
-        metadata["moe"] = moe_section
 
     for name, module in model.named_modules():
         input_quantizer = getattr(module, "input_quantizer", None)
@@ -261,18 +134,6 @@ def collect_kernel_metadata(
         if layer_data:
             metadata["layers"][name] = layer_data
 
-    salience_rule = derive_moe_salience_rule({
-        name: data["salient_indices"]
-        for name, data in metadata["layers"].items()
-        if "salient_indices" in data
-    })
-    if salience_rule is not None:
-        
-        
-        
-        
-        metadata["global"]["salience_rule"] = salience_rule
-
     return metadata
 
 
@@ -302,7 +163,6 @@ def save_kernel_metadata(
     residue_ratio: float = 0.25,
     block_size: int = 8,
     save_channel_masks: bool = True,
-    moe_layer_impls: dict[str, str] | None = None,
     calibration: dict | None = None,
 ) -> dict[str, Path]:
     """Save vLLM residue kernel metadata and optional bool channel masks.
@@ -320,8 +180,7 @@ def save_kernel_metadata(
     saved_files: dict[str, Path] = {}
 
     metadata = collect_kernel_metadata(
-        model, residue_ratio, block_size=block_size,
-        moe_layer_impls=moe_layer_impls)
+        model, residue_ratio, block_size=block_size)
     if calibration:
         metadata["calibration"] = calibration
     metadata_path = export_dir / "residue_kernel_metadata.json"
@@ -359,7 +218,5 @@ __all__ = [
     "collect_extended_linear_dims",
     "collect_salient_indices",
     "collect_kernel_metadata",
-    "collect_moe_kernel_metadata",
-    "find_moe_blocks",
     "save_kernel_metadata",
 ]

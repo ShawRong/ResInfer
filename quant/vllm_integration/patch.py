@@ -447,27 +447,6 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
             ModelOptNvFp4Config,
         )
 
-        # RESIDUE_LINEAR_OFF=1: leave every LinearBase layer on stock vLLM
-        # (auto kernel selection included) and install ONLY the MoE hook +
-        # persistent-cache patch. For MoE-focused runs on checkpoints whose
-        # linear layers carry no residue, the linear takeover buys nothing
-        # and costs the kernel-choice gap (mext pwal only speaks the
-        # cutlass weight format, so it force-pins the linear backend).
-        if os.environ.get("RESIDUE_LINEAR_OFF", "0") == "1":
-            try:
-                from . import patch_flashinfer_persistent_cache  # noqa: F401
-            except Exception as _e:  # pragma: no cover - best-effort
-                print(f"[residue] persistent-cache patch import failed: "
-                      f"{_e}", flush=True)
-            from .residue_moe import patch_moe_method, patch_moe_observer
-
-            if not patch_moe_method():
-                patch_moe_observer()
-            _patched = True
-            print("[residue] LINEAR OFF -- stock linear layers, MoE hook "
-                  "only", flush=True)
-            return True
-
         target_cls, resolved_version = _choose_linear_method_cls(version)
 
         # Store original for potential restoration
@@ -599,19 +578,6 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
         except Exception as _e:  # pragma: no cover - best-effort
             print(f"[residue] persistent-cache patch import failed: {_e}", flush=True)
 
-        # LinearMethodCls only covers LinearBase. `RoutedExperts` layers go
-        # to FusedMoEMethodCls. RESIDUE_ENABLE_MOE=1 installs the REAL
-        # residue expert method (ResidueCuteDSLExperts on the CuTeDSL
-        # graft); RESIDUE_MOE_OBSERVE=1 the numerics-neutral coverage
-        # observer. Method wins when both are set.
-        try:
-            from .residue_moe import patch_moe_method, patch_moe_observer
-
-            if not patch_moe_method():
-                patch_moe_observer()
-        except Exception as _e:  # pragma: no cover - best-effort
-            print(f"[residue] MoE hook install failed: {_e}", flush=True)
-
         _patched = True
         print(
             "[residue] Patched ModelOptNvFp4Config.LinearMethodCls "
@@ -667,29 +633,11 @@ def is_patched() -> bool:
     variable. This is important because in spawn multiprocessing, _patched
     resets to False in worker processes, but the class attribute check tells
     us the actual state.
-
-    What "installed" means depends on the configuration:
-      * RESIDUE_LINEAR_OFF=1 -- the linear side is DELIBERATELY stock, so
-        checking LinearMethodCls would report failure on a correct install
-        (found the hard way: the polhalf e2e's plugin refused to serve while
-        everything it asked for was in place). There the installed state is
-        the MoE hook (when RESIDUE_ENABLE_MOE=1) and nothing else.
-      * otherwise -- the linear method class is the residue method.
     """
     try:
         from vllm.model_executor.layers.quantization.modelopt import (
             ModelOptNvFp4Config,
         )
-
-        if os.environ.get("RESIDUE_LINEAR_OFF", "0") == "1":
-            if os.environ.get("RESIDUE_ENABLE_MOE", "0") == "1":
-                moe_cls = getattr(
-                    ModelOptNvFp4Config, "FusedMoEMethodCls", None)
-                return getattr(moe_cls, "__name__", "") == (
-                    "ModelOptNvFp4FusedMoEResidue")
-            # LINEAR_OFF with no MoE hook requested: an intentional no-op
-            # install (env contract warns about it); nothing to verify.
-            return True
 
         from .linear_method_v2 import ResidueNvFp4LinearMethodV2
 

@@ -36,7 +36,6 @@ from quant.mxfp4_checkpoint import padded_k
 from .algo_helper import (
     ResidueHelper,
     apply_salient_indices,
-    get_act_scale,
     get_nvfp4_error_weighted_score,
     get_salient_indices,
 )
@@ -48,7 +47,7 @@ def _now_utc() -> str:
     import time
 
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-from .kernel_metadata import is_mext_r1_layer, moe_expert_group_key
+from .kernel_metadata import is_mext_r1_layer
 from .residue_linear import ResidueQuantLinear
 from modelopt.torch.opt.dynamic import _DMRegistryCls
 from modelopt.torch.quantization.conversion import restore_quantizer_state
@@ -563,105 +562,6 @@ def _external_salient_indices_for_module(
     return salient.to(device=module.weight.device, dtype=torch.long)
 
 
-# grouping rule shared with the metadata writer (which derives the
-# salience_rule provenance field from the same partition)
-_moe_expert_group_key = moe_expert_group_key
-
-
-class _PooledExpertSalience:
-    'Layer-pooled salience for MoE expert linears.'
-
-    def __init__(self, block_size: int, residue_ratio: float):
-        self.block_size = block_size
-        self.residue_ratio = residue_ratio
-        self.members: dict[tuple[str, str], list[tuple[str, nn.Module]]] = {}
-        self.act_scale: dict[tuple[str, str], torch.Tensor] = {}
-        self.num_cache_steps: dict[tuple[str, str], int] = {}
-        self._handles: list = []
-
-    @property
-    def ratio_is_full(self) -> bool:
-        # ratio 1.0 selects every channel; no statistics needed at all.
-        return int(self.residue_ratio * self.block_size) >= self.block_size
-
-    def add(self, key: tuple[str, str], name: str, module: nn.Module) -> None:
-        self.members.setdefault(key, []).append((name, module))
-
-    def install_hooks(self) -> None:
-        if self.ratio_is_full:
-            return
-
-        def make_hook(key):
-            def hook(_module, args):
-                x = args[0] if args else None
-                if x is None or x.numel() == 0:
-                    return
-                x = x.to_local() if hasattr(x, "to_local") else x
-                scale = get_act_scale(x)
-                buf = self.act_scale.get(key)
-                if buf is None:
-                    self.act_scale[key] = scale
-                else:
-                    buf += scale
-                self.num_cache_steps[key] = self.num_cache_steps.get(key, 0) + 1
-
-            return hook
-
-        for key, mods in self.members.items():
-            for _name, module in mods:
-                self._handles.append(module.register_forward_pre_hook(make_hook(key)))
-
-    def remove_hooks(self) -> None:
-        for h in self._handles:
-            h.remove()
-        self._handles.clear()
-
-    def finalize_and_apply(self) -> tuple[int, int]:
-        """One topk per group, shared indices onto every member's quantizers.
-
-        Returns (applied_module_count, skipped_module_count).
-        """
-        applied = 0
-        skipped = 0
-        for key, mods in sorted(self.members.items()):
-            if self.ratio_is_full:
-                in_features = int(getattr(mods[0][1], "in_features",
-                                          mods[0][1].weight.shape[1]))
-                device = mods[0][1].weight.device
-                salient_indices = torch.arange(in_features, device=device,
-                                               dtype=torch.long)
-            else:
-                score = self.act_scale.get(key)
-                steps = self.num_cache_steps.get(key, 0)
-                if score is None or steps <= 0 or torch.any(torch.isnan(score)):
-                    reason = "no statistics" if score is None or steps <= 0 else "NaN in statistics"
-                    print_rank_0(
-                        f"residue_max: pooled MoE group {key}: {reason}; "
-                        f"{len(mods)} experts left without salient indices"
-                    )
-                    for _name, module in mods:
-                        module._residue_materialized = False
-                    skipped += len(mods)
-                    continue
-                parallel_state = getattr(mods[0][1], "parallel_state", None)
-                if parallel_state is not None and parallel_state.data_parallel_group.is_initialized():
-                    dist.all_reduce(score, op=dist.ReduceOp.AVG,
-                                    group=parallel_state.data_parallel_group.group)
-                salient_indices = get_salient_indices(
-                    score / steps, self.block_size, self.residue_ratio
-                )
-            for _name, module in mods:
-                if hasattr(module.weight_quantizer, "_salient_indices"):
-                    delattr(module.weight_quantizer, "_salient_indices")
-                if hasattr(module.input_quantizer, "_salient_indices"):
-                    delattr(module.input_quantizer, "_salient_indices")
-                apply_salient_indices(module, salient_indices)
-                module._residue_ratio = self.residue_ratio
-                module._residue_materialized = False
-                applied += 1
-        return applied, skipped
-
-
 @torch.no_grad()
 def _residue_calibrate_core(
     model: nn.Module,
@@ -703,45 +603,14 @@ def _residue_calibrate_core(
         else None
     )
 
-    pooled_moe = None
-    if (
-        salience_metric == "activation_max"
-        and external_salient_map is None
-        and os.environ.get("RESIDUE_MOE_POOLED_SALIENCE", "1") != "0"
-    ):
-        pooled_moe = _PooledExpertSalience(block_size, residue_ratio)
-    elif os.environ.get("RESIDUE_MOE_POOLED_SALIENCE", "1") != "0":
-        print_rank_0(
-            "residue_max: pooled MoE salience inactive "
-            f"(metric={salience_metric!r}, external map "
-            f"{'set' if external_salient_map is not None else 'unset'}); "
-            "expert linears take the per-module path"
-        )
-
     for name, module in model.named_modules():
         if is_quantized_linear(module) and module.weight_quantizer.is_enabled:
-            group_key = (
-                _moe_expert_group_key(name) if pooled_moe is not None else None
-            )
-            if group_key is not None:
-                pooled_moe.add(group_key, name, module)
-                module._layer_name = name
-                continue
             with enable_weight_access_and_writeback(module, model):
                 module.residue_max = ResidueHelper(
                     module, name, block_size, residue_ratio, salience_metric
                 )
             module.residue_max.setup()
             module._layer_name = name
-
-    if pooled_moe is not None and pooled_moe.members:
-        n_expert_modules = sum(len(v) for v in pooled_moe.members.values())
-        print_rank_0(
-            f"residue_max: pooled MoE salience: {n_expert_modules} expert "
-            f"linears -> {len(pooled_moe.members)} pooled groups"
-            + (" (ratio=1.0: no statistics needed)" if pooled_moe.ratio_is_full else "")
-        )
-        pooled_moe.install_hooks()
 
     ResidueHelper.cache_mode = True
     print_rank_0(
@@ -752,9 +621,6 @@ def _residue_calibrate_core(
     forward_loop(model)
 
     max_calibrate(model, lambda model: None)
-
-    if pooled_moe is not None:
-        pooled_moe.remove_hooks()
 
     def sync_act_scale_across_dp(module, data_parallel_group):
         """sync activation scale across data parallel (dp)."""
@@ -850,16 +716,6 @@ def _residue_calibrate_core(
         if hasattr(module, "residue_max"):
             postprocess(module, name)
             _cleanup_residue_postprocess(module, debug=debug)
-
-    if pooled_moe is not None and pooled_moe.members:
-        moe_applied, moe_skipped = pooled_moe.finalize_and_apply()
-        processed_count[0] += moe_applied + moe_skipped
-        salience_only_count[0] += moe_applied
-        skipped_count[0] += moe_skipped
-        print_rank_0(
-            f"residue_max: pooled MoE salience applied to {moe_applied} "
-            f"expert linears ({moe_skipped} skipped) [{_now_utc()}]"
-        )
 
     return {
         "processed_layers": processed_count[0],

@@ -268,10 +268,6 @@ class InspectQuantExportStage(Stage):
         if h is None:
             return None
         inter = cfg.get("intermediate_size")
-        # Expert projections are sized by the MoE intermediate width, not the
-        # dense one; using the dense value would fail every expert layer.
-        if ".experts." in name or ".mlp.experts" in name:
-            inter = cfg.get("moe_intermediate_size", inter)
         if name.endswith(("q_proj", "k_proj", "v_proj",
                           "gate_proj", "up_proj", "qkv_proj", "gate_up_proj")):
             return h
