@@ -86,7 +86,10 @@ __device__ __forceinline__ uint2 encode16(float (&v)[16],Scale s) {
 template<class T,int R>
 __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
     uint8_t const* masks,uint8_t* q,uint8_t* sf,
-    int m,int k,int kp,int output_rows,int padded_rows,bool swizzle,bool tile8) {
+    int m,int k,int kp,int output_rows,int padded_rows,bool swizzle,bool tile8,int pdl_mode) {
+  // Trigger every CTA, including padding CTAs. The consumer must wait before
+  // reading our outputs; this permits only its independent setup to overlap.
+  if(pdl_mode==2 && threadIdx.x==0) cudaTriggerProgrammaticLaunchCompletion();
   constexpr bool SELECTIVE=R>0 && R<8;
   constexpr int FACTOR=R==8?2:1;
   int row=blockIdx.x;
@@ -111,6 +114,10 @@ __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
         q[int64_t(outrow)*(kp/2)+j]=0;
         q[int64_t(resrow)*(kp/2)+j]=0;
       }
+    if(pdl_mode==1) {
+      __syncthreads();
+      if(threadIdx.x==0) cudaTriggerProgrammaticLaunchCompletion();
+    }
     return;
   }
   for(int tile=0;tile<(k+blockDim.x*16-1)/(blockDim.x*16);++tile) {
@@ -177,16 +184,20 @@ __global__ void fused_quant(T const* x,int64_t s0,int64_t s1,
   if constexpr(SELECTIVE)
     for(int j=k/2+((selected+7)/8)*4+threadIdx.x;j<kp/2;j+=blockDim.x)
       q[int64_t(row)*(kp/2)+j]=0;
+  if(pdl_mode==1) {
+    __syncthreads();
+    if(threadIdx.x==0) cudaTriggerProgrammaticLaunchCompletion();
+  }
 }
 
 template<class T>
 void dispatch(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
-    uint8_t const* masks,int per8,bool residue,bool swizzle,bool tile8,cudaStream_t stream) {
+    uint8_t const* masks,int per8,bool residue,bool swizzle,bool tile8,int pdl_mode,cudaStream_t stream) {
   int m=x.size(0),k=x.size(1),kp=q.size(1)*2,rows=q.size(0);
   int padded=swizzle?(rows+127)/128*128:rows;
   dim3 grid(residue&&!masks?padded/2:padded);
   auto p=reinterpret_cast<T const*>(x.data_ptr());
-  #define LAUNCH(R) fused_quant<T,R><<<grid,128,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,rows,padded,swizzle,tile8)
+  #define LAUNCH(R) fused_quant<T,R><<<grid,128,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,rows,padded,swizzle,tile8,pdl_mode)
   if(masks) {switch(per8) {case 1:LAUNCH(1);break;case 2:LAUNCH(2);break;case 4:LAUNCH(4);break;}}
   else if(residue) {LAUNCH(8);} else {LAUNCH(0);}
   #undef LAUNCH
@@ -195,7 +206,8 @@ void dispatch(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
 
 void mxfp4_residue_quant(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
          c10::optional<torch::Tensor> masks,int64_t per8,
-         bool residue,bool swizzle,bool tile8) {
+         bool residue,bool swizzle,bool tile8,int64_t pdl_mode) {
+  TORCH_CHECK(pdl_mode>=0 && pdl_mode<=2,"pdl_mode must be 0/off, 1/tail or 2/early");
   TORCH_CHECK(x.is_cuda()&&x.dim()==2,"expected CUDA [M,K]");
   c10::cuda::CUDAGuard guard(x.device());
   auto prop=at::cuda::getCurrentDeviceProperties();
@@ -219,7 +231,7 @@ void mxfp4_residue_quant(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
   if(!m)return;
   auto stream=at::cuda::getCurrentCUDAStream();
   auto mp=masks?masks->data_ptr<uint8_t>():nullptr;
-  #define DTYPE(T) dispatch<T>(x,q,sf,mp,per8,residue,swizzle,tile8,stream)
+  #define DTYPE(T) dispatch<T>(x,q,sf,mp,per8,residue,swizzle,tile8,pdl_mode,stream)
   if(x.scalar_type()==at::kHalf){DTYPE(half);}else if(x.scalar_type()==at::kBFloat16){DTYPE(__nv_bfloat16);}
   else{TORCH_CHECK(x.scalar_type()==at::kFloat,"fp16/bf16/fp32 required");DTYPE(float);}
   #undef DTYPE

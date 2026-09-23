@@ -5,10 +5,10 @@ import torch
 from ..extension import ensure_loaded
 
 
-def _run(source, packed, scales, masks, per8, residue, swizzle, tile8=False):
+def _run(source, packed, scales, masks, per8, residue, swizzle, tile8=False, pdl_mode=0):
     ensure_loaded()
     torch.ops.nvfp4.mxfp4_residue_quant(
-        source, packed, scales, masks, per8, residue, swizzle, tile8
+        source, packed, scales, masks, per8, residue, swizzle, tile8, pdl_mode
     )
 
 
@@ -22,7 +22,11 @@ def quantize_fused(
     kp=None,
     mext_layout="row_pair",
     m_pad_multiple=None,
+    pdl_mode="off",
 ):
+    modes = {"off": 0, "tail": 1, "early": 2}
+    if pdl_mode not in modes:
+        raise ValueError("pdl_mode must be off, tail or early")
     rows, k = source.shape
     padded_k = k if kp is None else kp
     if mext_layout not in ("row_pair", "tile8"):
@@ -60,5 +64,6 @@ def quantize_fused(
             residue,
             layout == "128x4",
             tile8,
+            modes[pdl_mode],
         )
     return packed, scales

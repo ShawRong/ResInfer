@@ -71,13 +71,18 @@ def quantize(source, *, layout="128x4", recipe="ceil"):
 
 
 def quantize_mext(source, *, layout="128x4", recipe="ceil",
-                  mext_layout="row_pair", m_pad_multiple=None):
+                  mext_layout="row_pair", m_pad_multiple=None, pdl_mode="off"):
+    """Quantize full residue; optional producer trigger for a PDL consumer.
+
+    off preserves the original launch. tail triggers after stores; early
+    triggers at CTA entry. Consumers using PDL must wait before reading.
+    """
     _validate_2d(source, layout, recipe)
     from .residue_quant import quantize_fused
 
     return quantize_fused(source, residue=True, layout=layout,
                           mext_layout=mext_layout,
-                          m_pad_multiple=m_pad_multiple)
+                          m_pad_multiple=m_pad_multiple, pdl_mode=pdl_mode)
 
 
 def swizzle_scales(scales):
