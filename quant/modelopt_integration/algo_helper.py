@@ -132,7 +132,7 @@ def customized_forward(self, input, *args, **kwargs):
     self.weight_quantizer.enable()
 
     if input.numel() == 0 or not self.residue_max.is_enabled:
-        # for moes, some experts might see 0 tokens
+        # Some layers may see an empty batch
         return out_actual
 
     if ResidueHelper.cache_mode:

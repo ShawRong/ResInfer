@@ -663,20 +663,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
             _b_shape_flat, self.sf_vec_size
         )
         if cutlass.const_expr(self.pi_via_layout):
-            # The SF must move WITH the weight. Under pi_via_layout the weight
-            # in memory is unpermuted and b_tensor maps kernel index p -> row
-            # f(p); the SF has to do the same or every output gets a neighbour's
-            # block scale -- a failure that is quiet (plausible magnitudes, wrong
-            # values), not a crash.
-            #
-            # BlockScaledBasicChunk's MN-major atom is ((vec,4),(32,4)) stride
-            # ((0,1),(16,4)), so the inner MN mode is (32):(16). Sending p to
-            # f(p) means offset 16*f(p) = 16*(va + 8ta + 2vc), i.e. splitting
-            # that mode into (va,ta,vc) = (2,4,4) with strides (16,128,32).
-            # Index order stays (1,2,8) -- implied by the shape -- so this is
-            # the same index-vs-offset swap used for B above.
-            # Verified as pure layout algebra in
-            # tests/test_fold_family_selection.py::test_pi_sf_mode_strides.
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
+            
             sfb_layout = _pi_permute_sf_mn(sfb_layout)
         sfb_tensor = cute.make_tensor(sfb_tensor.iterator, sfb_layout)
 

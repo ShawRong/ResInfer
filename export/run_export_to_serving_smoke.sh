@@ -120,7 +120,7 @@ echo "[release-smoke] step 2/3: start vLLM server"
 # unless the caller explicitly opts in.
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 
-"$RUNTIME_PY" "$REPO_ROOT/tools/vllm_patch/serve_vllm.py" \
+"$RUNTIME_PY" "$REPO_ROOT/dev/tools/vllm_patch/serve_vllm.py" \
   --model_path "$EXPORT_DIR" \
   --served_model_name "$SERVED_MODEL_NAME" \
   --quantization residue_nvfp4 \

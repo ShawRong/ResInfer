@@ -207,12 +207,6 @@ setup(
     
     
     packages=find_packages(include=['nvfp4', 'nvfp4.*']),
-    
-    
-    
-    
-    
-    
     package_data={'nvfp4': ['**/*.cu', '**/*.cuh']},
     include_package_data=False,
     ext_modules=ext_modules,
