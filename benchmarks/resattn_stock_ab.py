@@ -75,8 +75,10 @@ def sample(graph: torch.cuda.CUDAGraph, iterations: int) -> float:
 
 
 def run(args: argparse.Namespace) -> dict:
-    if args.batch < 1 or args.seq < 1 or args.iterations < 1 or args.repeats < 2:
-        raise ValueError("batch, seq, iterations and repeats must be positive")
+    if args.batch < 1 or args.seq < 1 or args.iterations < 1:
+        raise ValueError("batch, seq and iterations must be positive")
+    if args.repeats < 2 or args.warmups < 0:
+        raise ValueError("repeats must be at least 2 and warmups nonnegative")
     torch.manual_seed(args.seed)
     device = torch.device("cuda:0")
     batch, kv_heads, dim = args.batch, 8, 128
@@ -113,8 +115,11 @@ def run(args: argparse.Namespace) -> dict:
         if nvfp4_output else
         host.plan_qmul4_decode(batch, kv_heads, args.seq, device)
     )
-    plan = auto_plan if args.plan == "auto" else (
-        int(args.plan.split("/")[0]), args.plan.split("/")[1])
+    if args.plan == "auto":
+        plan = auto_plan
+    else:
+        split_count, reduction = args.plan.split("/", maxsplit=1)
+        plan = int(split_count), reduction
     physical_gqa = 8 if args.gqa == 4 else 16
     work = None
     if plan[1] == "gmem_fused":

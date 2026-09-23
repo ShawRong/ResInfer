@@ -93,6 +93,7 @@ class DirectOutputContractTests(unittest.TestCase):
             (1, 8192, (8, 'gmem_fused')),
             (1, 16384, (16, 'gmem_fused')),
             (8, 4103, (1, 'none')),
+            (8, 8191, (1, 'none')),
             (8, 8192, (2, 'kernel')),
             (8, 32768, (2, 'kernel')),
             (64, 32768, (1, 'none')),
