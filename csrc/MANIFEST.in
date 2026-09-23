@@ -1,0 +1,6 @@
+include build.sh
+recursive-include bindings *.cpp
+recursive-include common *.h *.cuh *.cu *.py *.md
+recursive-include nvfp4 *.h *.cuh *.cu *.py *.md
+recursive-include mxfp4 *.h *.cuh *.cu *.py *.md
+recursive-include resattn *.h *.cuh *.cu *.py *.md

@@ -12,19 +12,19 @@ BSD-3-Clause (NVIDIA CORPORATION & AFFILIATES)
 Derived from FlashInfer (https://github.com/flashinfer-ai/flashinfer),
 CuTeDSL attention kernels, with local modifications:
 
-  csrc/nvfp4/nvfp4/cute_attn/kernel_paged_decode.py
-  csrc/nvfp4/nvfp4/cute_attn/kernel_paged_prefill.py
-  csrc/nvfp4/nvfp4/cute_attn/_vendor_fmha_fwd.py
-  csrc/nvfp4/nvfp4/cute_attn/_vendor_fmha_helpers.py
+  csrc/resattn/kernel_paged_decode.py
+  dev/tools/resattn/prefill/kernel_paged_prefill.py
+  dev/tools/resattn/prefill/_vendor_fmha_fwd.py
+  dev/tools/resattn/prefill/_vendor_fmha_helpers.py
 
 Derived from FlashInfer's CuTeDSL fold/GEMM kernels, with local
 modifications (the fork relationship and upstream deltas are documented in
-csrc/nvfp4/nvfp4/cute_fold/FORK.md):
+csrc/common/fold/sm10x/FORK.md):
 
-  csrc/nvfp4/nvfp4/cute_fold/kernel_sm100_fold.py
-  csrc/nvfp4/nvfp4/cute_fold/kernel_sm103_fold.py
+  csrc/common/fold/sm10x/kernel_sm100_fold.py
+  csrc/common/fold/sm10x/kernel_sm103_fold.py
 
 Vendored from the CUTLASS CuTeDSL example tree
 (https://github.com/NVIDIA/cutlass, examples/python/CuTeDSL):
 
-  csrc/nvfp4/nvfp4/cute_fold_sm120/_dsl_helpers.py
+  csrc/common/fold/sm120/_dsl_helpers.py

@@ -420,7 +420,7 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path,
     # sitecustomize. Both package roots are required: quant lives at REPO,
     # while nvfp4 lives under csrc/nvfp4.
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(probe_site), str(REPO), str(REPO / "csrc" / "nvfp4")]
+        [str(probe_site), str(REPO), str(REPO / "csrc")]
         + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     env["VLLM_SCHED_MEFF_LOG_DIR"] = str(event_dir)
     env["VLLM_SCHED_MEFF_ENABLE_FILE"] = str(enable_file)

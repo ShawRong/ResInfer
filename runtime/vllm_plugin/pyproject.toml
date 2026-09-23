@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "residue-vllm-plugin"
+version = "0.1.0"
+description = "vLLM general plugin that initializes ResInfer linear and attention integrations in every vLLM process."
+requires-python = ">=3.10"
+# Intentionally NO runtime deps: `quant` is provided on PYTHONPATH, and vllm is
+# whatever the environment already has. Keeping deps empty means `pip install`
+# of this shim never perturbs the pinned torch/vllm/flashinfer stack.
+
+[project.entry-points."vllm.general_plugins"]
+# vLLM calls this in every process (process0, EngineCore, workers) before the
+# model executor is built. See residue_vllm_plugin.apply.
+residue_patch = "residue_vllm_plugin:apply"
+
+[tool.setuptools]
+py-modules = ["residue_vllm_plugin"]

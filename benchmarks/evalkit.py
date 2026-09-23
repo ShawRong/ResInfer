@@ -329,7 +329,7 @@ def install_env(a):
                 "bounds set kills BOTH bands and yields the plain cell.")
     repo = a.repo or os.environ.get("RESINFER_REPO", "")
     if repo:
-        parts = [repo, str(pathlib.Path(repo) / "csrc" / "nvfp4")]
+        parts = [repo, str(pathlib.Path(repo) / "csrc")]
         os.environ["PYTHONPATH"] = ":".join(
             [p for p in parts + [os.environ.get("PYTHONPATH", "")] if p])
         # spawn workers read PYTHONPATH, but THIS process fixed sys.path at

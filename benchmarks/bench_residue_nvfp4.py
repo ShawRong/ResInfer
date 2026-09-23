@@ -37,7 +37,7 @@ except ImportError:           # `python benchmarks/bench_residue_nvfp4.py`
                          pid_identity, timed_detail, warm_equally)
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
-for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc" / "nvfp4")):
+for _p in (str(REPO_ROOT), str(REPO_ROOT / "csrc")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -220,7 +220,7 @@ def assert_gpu_exclusive(gpu: int, exclusive: bool = True) -> list[dict]:
 
 def provenance(gpu: int, run_id: str) -> dict:
     so = next(iter(sorted(
-        (REPO_ROOT / "csrc" / "nvfp4" / "nvfp4").glob("_C*.so"))), None)
+        (REPO_ROOT / "csrc" / "nvfp4").glob("_C*.so"))), None)
     major, minor = torch.cuda.get_device_capability(gpu)
     return {
         "kind": "provenance",

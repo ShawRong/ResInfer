@@ -35,7 +35,7 @@ dependencies = [
     # ── Runtime quantization support ─────────────────────────────────────
     # Export/calibration ModelOpt is managed separately in env-export/.
     "torch-c-dlpack-ext>=0.1.5",
-    "nvfp4",                              # local CUDA kernel (csrc/nvfp4)
+    "nvfp4",                              # local kernel wheel (csrc)
 
     # ── HF / data stack ──────────────────────────────────────────────────
     # vLLM nightly requires Transformers 5.x.  Some lm-eval imports still
@@ -148,7 +148,7 @@ explicit = true
 torch = { index = "pytorch-cu130" }
 torchvision = { index = "pytorch-cu130" }
 torchaudio = { index = "pytorch-cu130" }
-nvfp4 = { path = "csrc/nvfp4", editable = true }
+nvfp4 = { path = "csrc", editable = true }
 nixl = { index = "nvidia" }
 nixl-cu13 = { index = "nvidia" }
 nvidia-cudnn-cu12 = { index = "nvidia" }

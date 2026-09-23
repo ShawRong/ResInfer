@@ -10,7 +10,7 @@
 # tensorrt-llm 1.1.0, which uses a [[tool.uv.dependency-metadata]] override to
 # strip its modelopt~=0.37 pin.
 #
-# This script then layers in nvfp4 (csrc/nvfp4), which needs install-time flags
+# This script then layers in nvfp4 (csrc), which needs install-time flags
 # uv cannot express in pyproject.toml:
 #   - --no-build-isolation (so the build sees torch)
 #   - non-editable (avoids sharing the built .so with the main .venv, which
@@ -77,7 +77,7 @@ CUDAARCHS="$NVFP4_CUDAARCHS" \
 NVFP4_BUILD_ARCHS="$NVFP4_BUILD_ARCHS" \
 NVFP4_BUILD_GEMM="$NVFP4_BUILD_GEMM" \
 uv pip install --python "$PY" \
-    "$REPO_ROOT/csrc/nvfp4" \
+    "$REPO_ROOT/csrc" \
     --no-build-isolation \
     --no-deps
 

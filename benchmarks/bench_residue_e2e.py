@@ -158,7 +158,7 @@ def provenance(gpu: int, neighbors: list) -> dict:
         except Exception:                                       # noqa: BLE001
             return None
 
-    so = next(iter(sorted((REPO / "csrc" / "nvfp4" / "nvfp4").glob("_C*.so"))),
+    so = next(iter(sorted((REPO / "csrc" / "nvfp4").glob("_C*.so"))),
               None)
     md5 = None
     if so:
@@ -532,7 +532,7 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
     env["CUDA_VISIBLE_DEVICES"] = str(gpu)
     env["VLLM_NO_USAGE_STATS"] = "1"
     env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO), str(REPO / "csrc" / "nvfp4")]
+        [str(REPO), str(REPO / "csrc")]
         + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     if quant == "residue_nvfp4":
         env["RESIDUE_PATCH_VLLM"] = "1"

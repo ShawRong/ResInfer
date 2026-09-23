@@ -94,7 +94,7 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_ATTN": (
         "one", None,
         "register phase-separated ResAttn: pure decode uses ResAttn; "
-        "prefill and mixed steps use stock FlashInfer/TRT",
+        "pure prefill uses stock FlashInfer/TRT; mixed steps are rejected",
     ),
     "RESIDUE_ATTN_DISABLE_QK_RESIDUE": (
         "one",
@@ -103,15 +103,6 @@ KNOWN: dict[str, tuple] = {
         "run the base-only ResAttn kernel; does not affect vendor "
         "context/prefill",
     ),
-    "RESIDUE_ATTN_CONTEXT_KERNEL": ("one", None,
-                                    "0 disables the paged context kernel"),
-    "RESIDUE_ATTN_PREFILL_EXACT": ("one", None,
-                                   "force the gather_dequant oracle prefill; "
-                                   "same information as the default, "
-                                   "different arithmetic -- a reference, not "
-                                   "a serving mode"),
-    "RESIDUE_ATTN_PREFILL_BF16": ("one", None,
-                                  'Prefill attends live BF16 K/V instead of the FP4 pool. Disabled by default; do not enable for quality comparisons against FP4-cache prefill.'),
     "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
                                "capture ResAttn decode into CUDA graphs "
                                "(1.70-2.08x decode on sm100). PERFORMANCE "

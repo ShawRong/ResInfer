@@ -20,7 +20,7 @@ import statistics
 
 import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from nvfp4.cute_attn.append import quantize_paged_trtllm_format
+from dev.tools.resattn.append import quantize_paged_trtllm_format
 from nvfp4.cute_attn import host
 from nvfp4.cute_attn.kv_layout import NvFp4PagedKVPool
 from vllm import envs
