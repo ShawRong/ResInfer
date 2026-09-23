@@ -77,6 +77,19 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
             raise ValueError(f"optional arm failed after engagement: {key}: {row.get('reason')}")
     for sid in expected_shape:
         for m in m_values:
+            tuned_arm = "resinfer_mxfp4_mext_r1_tuned"
+            if tuned_arm in arms:
+                tuned_rows = [observed[(rep, sid, m, tuned_arm)]
+                              for rep in range(len(files))]
+                if all(row["status"] == "passed" for row in tuned_rows):
+                    choices = {json.dumps(row.get("tactic"), sort_keys=True)
+                               for row in tuned_rows}
+                    hashes = {(row.get("preflight") or {}).get("candidate_hash")
+                              for row in tuned_rows}
+                    if (len(choices) != 1 or "null" in choices
+                            or len(hashes) != 1 or None in hashes):
+                        raise ValueError(
+                            f"mixed or missing MXFP4 tuned tactic/provenance: {sid} M={m}")
             for arm in arms:
                 if arm not in required:
                     states = {observed[(rep, sid, m, arm)]["status"]
@@ -87,6 +100,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
     points = []
     macro: dict[tuple[str, int], list[float]] = defaultdict(list)
     mx_macro: dict[tuple[str, int], list[float]] = defaultdict(list)
+    mx_tuned_macro: dict[tuple[str, int], list[float]] = defaultdict(list)
     for sid, shape in expected_shape.items():
         for m in m_values:
             latency = {arm: statistics.median(
@@ -115,6 +129,13 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                     ratio = latency[mx_arm] / latency[arm]
                     ratios[f"mxfp4_mext_over_{arm}"] = ratio
                     mx_macro[(arm, m)].append(ratio)
+            mx_tuned = "resinfer_mxfp4_mext_r1_tuned"
+            for arm in (mx_arm, "fi_mxfp4_mxfp4_stock",
+                        "fi_mxfp4_mxfp4_cutedsl_quant"):
+                if mx_tuned in latency and arm in latency:
+                    ratio = latency[mx_tuned] / latency[arm]
+                    ratios[f"mxfp4_tuned_over_{arm}"] = ratio
+                    mx_tuned_macro[(arm, m)].append(ratio)
             points.append({"shape_id": sid, "n": shape["n"], "k": shape["k"],
                            "m": m, "aliases": shape["aliases"],
                            "latency_us": latency, "process_range_us": process_range,
@@ -125,9 +146,13 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
     mx_by_m = [{"arm": arm, "m": m, "n_unique_shapes": len(values),
                 "macro_median_ratio": statistics.median(values)}
                for (arm, m), values in sorted(mx_macro.items())]
+    mx_tuned_by_m = [{"arm": arm, "m": m, "n_unique_shapes": len(values),
+                      "macro_median_ratio": statistics.median(values)}
+                     for (arm, m), values in sorted(mx_tuned_macro.items())]
     return {"schema": SCHEMA, "status": "complete", "run_id": next(iter(run_ids)),
             "process_reps": len(files), "unique_shapes": len(shapes),
-            "points": points, "by_m": by_m, "mxfp4_by_m": mx_by_m}
+            "points": points, "by_m": by_m, "mxfp4_by_m": mx_by_m,
+            "mxfp4_tuned_by_m": mx_tuned_by_m}
 
 
 def write_outputs(summary: dict, directory: Path) -> None:
@@ -136,7 +161,7 @@ def write_outputs(summary: dict, directory: Path) -> None:
         writer = csv.DictWriter(stream, fieldnames=(
             "shape_id", "n", "k", "m", "models_projections_tp", "arm",
             "latency_us", "process_min_us", "process_max_us", "mext_over_arm",
-            "mxfp4_mext_over_arm"))
+            "mxfp4_mext_over_arm", "mxfp4_tuned_over_arm"))
         writer.writeheader()
         for point in summary["points"]:
             aliases = ";".join(f"{a['model']}/{a['projection']}/tp{a['tp']}"
@@ -150,4 +175,6 @@ def write_outputs(summary: dict, directory: Path) -> None:
                                  "process_max_us": point["process_range_us"][arm][1],
                                  "mext_over_arm": point["ratios"].get(f"mext_over_{arm}"),
                                  "mxfp4_mext_over_arm": point["ratios"].get(
-                                     f"mxfp4_mext_over_{arm}")})
+                                     f"mxfp4_mext_over_{arm}"),
+                                 "mxfp4_tuned_over_arm": point["ratios"].get(
+                                     f"mxfp4_tuned_over_{arm}")})

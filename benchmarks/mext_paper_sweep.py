@@ -35,6 +35,7 @@ ARM_FORMAT = {
     "fi_nvfp4_cutlass": ("NVFP4", "NVFP4", "FlashInfer CUTLASS"),
     "fi_nvfp4_cutedsl": ("NVFP4", "NVFP4", "FlashInfer CuTeDSL"),
     "resinfer_mxfp4_mext_r1": ("MXFP4", "MXFP4+residue", "ResInfer Fold"),
+    "resinfer_mxfp4_mext_r1_tuned": ("MXFP4", "MXFP4+residue", "ResInfer Fold tuned"),
     "fi_mxfp4_mxfp4_stock": ("MXFP4", "MXFP4", "FlashInfer CuTeDSL"),
     "fi_mxfp4_mxfp4_cutedsl_quant": ("MXFP4", "MXFP4", "FlashInfer CuTeDSL quant+GEMM"),
     "fi_mxfp4_mxfp8_w4a8": ("MXFP4", "MXFP8", "FlashInfer grouped"),
@@ -229,6 +230,8 @@ def _runtime_fingerprint(prov: dict) -> str:
         "loaded_nvfp4_so_sha256": prov.get("loaded_nvfp4_so_sha256"),
         "trtllm_version": prov.get("trtllm_version"),
         "candidate_hash": prov.get("candidate_hash"),
+        "mxfp4_candidate_hash": prov.get("mxfp4_candidate_hash"),
+        "mxfp4_fold_pdl_mode": prov.get("mxfp4_fold_pdl_mode"),
         "torch": prov.get("torch"), "flashinfer": prov.get("flashinfer"),
         "cuda": prov.get("cuda"), "driver_version": prov.get("driver_version"),
         "gpu_uuid": prov.get("gpu", {}).get("uuid"),
@@ -289,6 +292,9 @@ def _worker(args: argparse.Namespace) -> int:
     from .mext_trtllm_adapter import prepare_weight as prepare_trtllm_weight
     from .mext_trtllm_adapter import require_dense_ops
     resolved = json.loads(args.resolved.read_text())
+    mxfp4_fold_tuner = None
+    if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
+        from quant.vllm_integration import mxfp4_fold_tuner
     trtllm_fp4_utils = (require_dense_ops()
                        if "trtllm_nvfp4_fp8_w4a8" in resolved["arms"] else None)
 
@@ -318,6 +324,9 @@ def _worker(args: argparse.Namespace) -> int:
                  "fold_max_m": os.environ["RESIDUE_MEXT_FOLD_MAX_M"],
                  "fold_mext": os.environ["RESIDUE_FOLD_MEXT"],
                  "candidate_hash": sm10x_fold_tuner.candidates_hash()})
+    if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
+        prov["mxfp4_candidate_hash"] = mxfp4_fold_tuner.candidates_hash()
+        prov["mxfp4_fold_pdl_mode"] = "early"
     if trtllm_fp4_utils is not None:
         prov["trtllm_version"] = importlib.metadata.version("tensorrt-llm")
     extension = importlib.util.find_spec("nvfp4._C")
@@ -368,6 +377,11 @@ def _worker(args: argparse.Namespace) -> int:
                     x_scale_trt = (x.float().abs().max() / 448.0).reshape(1).float()
                     alpha_trt = (x_scale_trt / wgs_trt).reshape(1).float()
                 reference = x @ weight.T
+                mxfp4_preflight = None
+                if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
+                    mxfp4_preflight = mxfp4_fold_tuner.preflight_tactics(
+                        (x, w_mx, ws_mx_flat), reference,
+                        pdl_mode="early", out_dtype=torch.bfloat16)
                 outputs = {arm: torch.empty(m, n, device=device, dtype=torch.bfloat16)
                            for arm in resolved["arms"] if arm != "mext_r1"}
                 padded_m = max(4, m)
@@ -406,6 +420,11 @@ def _worker(args: argparse.Namespace) -> int:
                     return mxfp4_fold_gemm(aq, w, asc, ws,
                                            out_dtype=torch.bfloat16)
 
+                def res_mxfp4_mext_tuned(a, w, ws):
+                    return mxfp4_fold_tuner.tuned_mxfp4_fold(
+                        a, w, ws, pdl_mode="early",
+                        out_dtype=torch.bfloat16)
+
                 def fi_mxfp4_stock(a, w, ws):
                     aq, asc = mxfp4_quantize(a)
                     return mm_fp4(
@@ -428,6 +447,8 @@ def _worker(args: argparse.Namespace) -> int:
                     "fi_nvfp4_cutlass": (fi_cutlass, (x, w_nv, ws_nv)),
                     "fi_nvfp4_cutedsl": (fi_cutedsl, (x, w_nv, ws_nv)),
                     "resinfer_mxfp4_mext_r1": (res_mxfp4_mext, (x, w_mx, ws_mx_flat)),
+                    "resinfer_mxfp4_mext_r1_tuned": (
+                        res_mxfp4_mext_tuned, (x, w_mx, ws_mx_flat)),
                     "fi_mxfp4_mxfp4_stock": (fi_mxfp4_stock, (x, w_mx, ws_mx)),
                     "fi_mxfp4_mxfp4_cutedsl_quant": (
                         fi_mxfp4_cutedsl_quant, (x, w_mx, ws_mx)),
@@ -473,6 +494,17 @@ def _worker(args: argparse.Namespace) -> int:
                             if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
                                 or row["tactic"] is None):
                                 raise RuntimeError("MExt Fold did not serve a profiled tactic")
+                        if arm == "resinfer_mxfp4_mext_r1_tuned":
+                            row["tactic_source"] = mxfp4_fold_tuner.last_tactic_source()
+                            row["tactic"] = mxfp4_fold_tuner.last_tactic_tile()
+                            row["preflight"] = mxfp4_preflight
+                            if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
+                                or row["tactic"] is None):
+                                raise RuntimeError("MXFP4 Fold did not serve a profiled tactic")
+                            family, mode, tile, _cluster, _ab = row["tactic"]
+                            pad = (max(8, tile[0] // 2) if mode == "direct_mext"
+                                   else 8) if family[0] == "tile8" else 1
+                            row["physical_m"] = 2 * ((m + pad - 1) // pad) * pad
                         measured = timed_detail(fn, fn_args,
                                                 iters_within_graph=niw,
                                                 repeats=resolved["timing_repeats"])

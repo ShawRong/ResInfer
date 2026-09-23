@@ -143,6 +143,33 @@ def test_mxfp4_only_diagnostic_has_own_ratios(tmp_path: Path):
     assert got["mxfp4_by_m"][0]["macro_median_ratio"] == 12 / 11
 
 
+def test_mxfp4_tuned_suite_reports_paired_pipeline_ratios(tmp_path: Path):
+    suite = load_suite(SUITE.with_name("mext_paper_sm100_v5_mxfp4_fold_tuned.json"))
+    tuned = "resinfer_mxfp4_mext_r1_tuned"
+    assert tuned in suite["arms"] and tuned in suite["required_arms"]
+    shapes, _ = resolve(suite, {}, ["qwen3_4b"])
+    shape = shapes[0]
+    arms = ["resinfer_mxfp4_mext_r1", tuned, "fi_mxfp4_mxfp4_stock"]
+    files = _sample_files(tmp_path, [shape])
+    for path in files:
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [row for row in rows if row["arm"] in arms]
+        rows.append(dict(rows[0], arm=tuned, us=8.0,
+                         tactic=[["row_pair", "std"], "tma", [128, 32], [1, 1], None],
+                         preflight={"candidate_hash": "same-across-reps"}))
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    got = aggregate(files, [shape], [8], arms, arms)
+    ratios = {row["arm"]: row["macro_median_ratio"]
+              for row in got["mxfp4_tuned_by_m"]}
+    assert ratios["resinfer_mxfp4_mext_r1"] == 8 / 12
+    assert ratios["fi_mxfp4_mxfp4_stock"] == 8 / 11
+    changed = [json.loads(line) for line in files[1].read_text().splitlines()]
+    next(row for row in changed if row["arm"] == tuned)["tactic"][2] = [128, 64]
+    files[1].write_text("".join(json.dumps(row) + "\n" for row in changed))
+    with pytest.raises(ValueError, match="mixed or missing MXFP4 tuned tactic"):
+        aggregate(files, [shape], [8], arms, arms)
+
+
 def test_cutedsl_quantizer_companion_has_separate_mxfp4_ratio(tmp_path: Path):
     path = SUITE.with_name("mext_paper_sm100_v4_mxfp4_producer.json")
     suite = load_suite(path)
