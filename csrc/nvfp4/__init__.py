@@ -4,7 +4,6 @@ from .extension import ensure_loaded
 from .mext import scaled_fp4_quant_mext_r1
 from .quant import (
     indices_to_channel_masks,
-    official_scaled_fp4_quant,
     scaled_fp4_quant,
     scaled_fp4_quant_pack8_r0125_no_swap_with_mask,
     scaled_fp4_quant_pack8_r025_no_swap_with_mask,
@@ -15,7 +14,6 @@ from .quant import (
 __all__ = [
     "ensure_loaded",
     "indices_to_channel_masks",
-    "official_scaled_fp4_quant",
     "scaled_fp4_quant",
     "scaled_fp4_quant_mext_r1",
     "scaled_fp4_quant_pack8_r0125_no_swap_with_mask",

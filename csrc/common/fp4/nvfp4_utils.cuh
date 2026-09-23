@@ -1214,17 +1214,21 @@ __device__ ResidueType* cvt_swap_residue_data_get_offset(int rowIdx, int colIdx,
   return nullptr;
 }
 
-// helper function for tiled offset calculation
-template <class SFType>
+// Shared SF addressing. Defaults preserve the NVFP4 block16 tiled layout;
+// MXFP4 supplies block32 and can also request row-major scales.
+template <class SFType, int SF_VEC_SIZE = CVT_FP4_SF_VEC_SIZE>
 __device__ inline int64_t compute_tiled_sf_offset(
-  int32_t mIdx, int32_t kIdx, int32_t numTotalCols) {
+  int32_t mIdx, int32_t kIdx, int32_t numTotalCols, bool swizzle = true) {
+  if (!swizzle) {
+    return int64_t(mIdx) * (numTotalCols / SF_VEC_SIZE) + kIdx;
+  }
   int32_t mTileIdx = mIdx / (32 * 4);
-  constexpr int factor = CVT_FP4_SF_VEC_SIZE * 4; // 64
+  constexpr int factor = SF_VEC_SIZE * 4;
   int32_t numKTiles = (numTotalCols + factor - 1) / factor;
   int64_t mTileStride = numKTiles * 32 * 4 * 4;
 
   int32_t kTileIdx = (kIdx / 4); // kIdx here represents scale factor index, and 
-  // 4 SFs x 16 elements = 64 elements
+  // Each K tile contains four scale factors.
   int64_t kTileStride = 32 * 4 * 4;
 
   int32_t outerMIdx = (mIdx % 32);

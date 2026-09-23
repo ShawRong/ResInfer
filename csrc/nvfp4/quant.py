@@ -269,33 +269,8 @@ def scaled_fp4_quant_with_mask(
     return output.view(m, n_ext // 2), output_scale
 
 
-def official_scaled_fp4_quant(input_tensor: torch.Tensor, input_scale: torch.Tensor):
-    """Standalone vLLM-style swizzled-scale NVFP4 quantization helper."""
-    m, k = input_tensor.shape
-    if k % 16 != 0:
-        raise ValueError(f"official scaled_fp4_quant requires K multiple of 16, got {k}")
-
-    output = torch.empty(m * k // 2, dtype=torch.uint8, device=input_tensor.device)
-    num_m_tiles = (m + 127) // 128
-    num_k_tiles = (k + 63) // 64
-    output_scale = torch.empty(
-        num_m_tiles * num_k_tiles * 512,
-        dtype=torch.uint8,
-        device=input_tensor.device,
-    )
-    ensure_loaded()
-    torch.ops.nvfp4.official_scaled_fp4_quant_pack8(
-        output,
-        input_tensor,
-        output_scale,
-        input_scale,
-    )
-    return output.view(m, k // 2), output_scale
-
-
 __all__ = [
     "indices_to_channel_masks",
-    "official_scaled_fp4_quant",
     "scaled_fp4_quant",
     "scaled_fp4_quant_pack8_r0125_no_swap_with_mask",
     "scaled_fp4_quant_pack8_r025_no_swap_with_mask",

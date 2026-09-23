@@ -51,8 +51,8 @@ def _native_2d(source, layout):
 def _validate_2d(source, layout, recipe):
     _check_recipe(recipe)
     if (source.ndim != 2 or not source.is_cuda
-            or source.dtype not in (torch.float16, torch.bfloat16, torch.float32)):
-        raise ValueError("expected CUDA fp16/bf16/fp32 [M,K]")
+            or source.dtype not in (torch.float16, torch.bfloat16)):
+        raise ValueError("expected CUDA fp16/bf16 [M,K]")
     k = source.shape[1]
     if k <= 0 or k % 32:
         raise ValueError("K must be a positive multiple of 32")
@@ -63,11 +63,7 @@ def _validate_2d(source, layout, recipe):
 
 def quantize(source, *, layout="128x4", recipe="ceil"):
     _validate_2d(source, layout, recipe)
-    if source.dtype != torch.float32:
-        return _native_2d(source, layout)
-    from .residue_quant import quantize_fused
-
-    return quantize_fused(source, residue=False, layout=layout)
+    return _native_2d(source, layout)
 
 
 def quantize_mext(source, *, layout="128x4", recipe="ceil",
@@ -78,9 +74,9 @@ def quantize_mext(source, *, layout="128x4", recipe="ceil",
     triggers at CTA entry. Consumers using PDL must wait before reading.
     """
     _validate_2d(source, layout, recipe)
-    from .residue_quant import quantize_fused
+    from .residue_quant import quantize_residue
 
-    return quantize_fused(source, residue=True, layout=layout,
+    return quantize_residue(source, layout=layout,
                           mext_layout=mext_layout,
                           m_pad_multiple=m_pad_multiple, pdl_mode=pdl_mode)
 

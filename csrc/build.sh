@@ -141,7 +141,6 @@ print(f'[build] OK — nvfp4 from {nvfp4.__file__}')
 expected = [
     'scaled_fp4_quant_mext_r1',
     'scaled_fp4_quant',
-    'official_scaled_fp4_quant_pack8',
     'mxfp4_residue_quant',
     'nvfp4_quantize_q_residue',
 ]

@@ -69,13 +69,12 @@ def quantize_selective(
             or masks.numel() != k // 8):
         raise ValueError("masks must be contiguous uint8 [K/8] on input device")
 
-    from .residue_quant import quantize_fused
+    from .residue_quant import quantize_residue
 
-    return quantize_fused(
+    return quantize_residue(
         source,
         masks=masks,
         per8=selected * 8 // k,
-        residue=True,
         layout=layout,
         kp=padded_k,
     )

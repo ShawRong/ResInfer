@@ -94,7 +94,6 @@ sources = [
     'nvfp4/cuda/nvfp4_quant_kernels.cu',
     'nvfp4/cuda/nvfp4_residue_pack8.cu',
     'nvfp4/cuda/nvfp4_residue_pack16.cu',
-    'nvfp4/cuda/official_nvfp4_quant_kernels.cu',
     'resattn/cuda/nvfp4_quantize_q.cu',
     'mxfp4/cuda/mxfp4_residue_quant.cu',
 ]
