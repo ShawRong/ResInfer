@@ -13,7 +13,7 @@ Usage (with patch - recommended):
 """
 
 # Keep independent quantization integrations importable without initializing
-# the NVFP4 dev/runtime/ModelOpt patch stack. Existing public names stay lazy.
+# the NVFP4/ModelOpt patch stack. Existing public names stay lazy.
 from importlib import import_module
 
 

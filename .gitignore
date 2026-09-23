@@ -96,10 +96,10 @@ result/
 /result/figures/
 
 # Local runner scratch suites.
-# Keep production/reusable suites under dev/dev/tests/runner/suites/*.yaml.
+# Keep production/reusable suites under .dev/tests/runner/suites/*.yaml.
 # Put one-off experiments here so they do not pollute git status.
-/dev/dev/tests/runner/suites/_tmp/*
-!/dev/dev/tests/runner/suites/_tmp/README.md
+/.dev/tests/runner/suites/_tmp/*
+!/.dev/tests/runner/suites/_tmp/README.md
 
 # Local scratch scripts.
 /scripts/_tmp/*

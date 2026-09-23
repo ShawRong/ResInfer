@@ -17,10 +17,15 @@ import json
 import math
 import os
 import statistics
+import sys
+from pathlib import Path
+
+# Research helpers are deliberately excluded from the runtime wheels.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / ".dev" / "tools"))
 
 import torch
 from flashinfer.decode import trtllm_batch_decode_with_kv_cache
-from dev.tools.resattn.append import quantize_paged_trtllm_format
+from resattn.append import quantize_paged_trtllm_format
 from nvfp4.cute_attn import host
 from nvfp4.cute_attn.kv_layout import NvFp4PagedKVPool
 from vllm import envs

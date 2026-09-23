@@ -13,9 +13,9 @@ Derived from FlashInfer (https://github.com/flashinfer-ai/flashinfer),
 CuTeDSL attention kernels, with local modifications:
 
   csrc/resattn/kernel_paged_decode.py
-  dev/tools/resattn/prefill/kernel_paged_prefill.py
-  dev/tools/resattn/prefill/_vendor_fmha_fwd.py
-  dev/tools/resattn/prefill/_vendor_fmha_helpers.py
+  .dev/tools/resattn/prefill/kernel_paged_prefill.py
+  .dev/tools/resattn/prefill/_vendor_fmha_fwd.py
+  .dev/tools/resattn/prefill/_vendor_fmha_helpers.py
 
 Derived from FlashInfer's CuTeDSL fold/GEMM kernels, with local
 modifications (the fork relationship and upstream deltas are documented in

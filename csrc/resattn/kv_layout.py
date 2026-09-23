@@ -3,7 +3,7 @@
 """NVFP4 pool views and scale-factor atom addressing.
 
 Production uses stock vLLM cache storage (trtllm profile). Historical
-native-token allocation and writers live in dev.tools.resattn.
+native-token allocation and writers live in resattn.
 """
 
 from __future__ import annotations
@@ -91,7 +91,7 @@ class NvFp4PagedKVPool:
     [pages, heads, 128, D/2], scales [pages, heads, 128, D/16].
     vLLM owns allocation and writes; data/scales retain its storage strides.
     The native_token profile is retained for research kernels. Its allocator
-    and V staging writer live in dev.tools.resattn.kv_reference / append.
+    and V staging writer live in resattn.kv_reference / append.
     """
 
     num_kv_heads: int

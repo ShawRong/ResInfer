@@ -699,33 +699,7 @@ SMOKE_SPEC = [
 
 
 def cmd_smoke(a) -> int:
-    """Run the WHOLE chain at nano scale, locally, in minutes.
-
-    Why this exists, and it is the most useful comment in this file:
-
-    Every defect this driver has shipped was found on the pod, one per
-    round trip, in the order the steps run -- the driver living in dev/,
-    a fingerprint that hashed absolute paths, a preflight placed before its
-    own producer, two components disagreeing about where the frontier
-    lives, a required key dropped by a rename, and a gate that no
-    pod-built base could satisfy. Six defects, six round trips, each one
-    reachable only after the previous was fixed, and each round trip
-    costing hours because the pod has no network and must be synced by
-    hand.
-
-    None of them needed a big model or real data to reproduce. Every one
-    of them is in the CONTROL FLOW, and control flow runs at any scale.
-    The gates we had -- yaml parse, bash -n, capability probes -- are all
-    static; not one of them EXECUTES the chain, which is why the defects
-    could only surface where it does execute.
-
-    So: 0.6B, four calibration lines, two arms, one ratio. It proves
-    nothing about numerics and is not meant to. It proves the chain runs,
-    which is the property we kept discovering we did not have.
-
-    RUN THIS BEFORE EVERY DISPATCH. It is cheaper than the round trip by
-    three orders of magnitude.
-    """
+    'Run the WHOLE chain at nano scale, locally, in minutes.'
     import tempfile
     global DATASET_PATH, BASE_MODEL, ORIG_BF16
     root = Path(a.out) if a.out else Path(tempfile.mkdtemp(prefix="campaign_smoke_"))
