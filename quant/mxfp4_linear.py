@@ -55,11 +55,11 @@ def mxfp4_linear(
                 out_dtype=output_dtype,
             )
 
-        # The independent residue_mxfp4 config installs the shared vLLM warmup
+        # The ModelOpt MXFP4 LinearMethod installs the shared vLLM warmup
         # wrapper only when this opt-in route is enabled. Only an actual
         # FlashInfer tuning window may preflight/profile tactics; a normal
         # request without this process's preflight keeps the existing Fold.
-        from quant.vllm_integration import mxfp4_fold_tuner as fold_tuner
+        from quant.flashinfer_integration import mxfp4_fold_tuner as fold_tuner
 
         if not fold_tuner.tuner_enabled() or activation_recipe != "ceil":
             fold_tuner.record_static_fallback()

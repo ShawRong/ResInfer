@@ -314,8 +314,8 @@ def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
 # ----------------------------------------------------------------- timing
 def fold_tactic_tile(sm: str):
     'WHICH tile/tactic actually ran, not just where the choice came from.'
-    mod = ("quant.vllm_integration.sm120_fold_tuner" if sm.startswith("sm12")
-           else "quant.vllm_integration.sm10x_fold_tuner")
+    mod = ("quant.flashinfer_integration.sm120_fold_tuner" if sm.startswith("sm12")
+           else "quant.flashinfer_integration.sm10x_fold_tuner")
     try:
         import importlib
 
@@ -329,7 +329,7 @@ def fold_tactic_source(sm: str, warned: bool) -> str:
     "Where the fold's tile choice came from on this architecture."
     if sm.startswith("sm12"):
         try:
-            from quant.vllm_integration.sm120_fold_tuner import \
+            from quant.flashinfer_integration.sm120_fold_tuner import \
                 last_tactic_source
 
             src = last_tactic_source()
@@ -342,7 +342,7 @@ def fold_tactic_source(sm: str, warned: bool) -> str:
     # first, same as sm120, and keep the warned-logic for the legacy path
     # (tuner disabled or pre-flip tree).
     try:
-        from quant.vllm_integration.sm10x_fold_tuner import \
+        from quant.flashinfer_integration.sm10x_fold_tuner import \
             last_tactic_source as _sm10x_source
 
         src = _sm10x_source()
@@ -481,7 +481,7 @@ def run(args) -> None:
         selected hot, which is exactly what every row before 98500d3 did.
         """
         try:
-            from quant.vllm_integration.fi_tuner_base import cold_tuning_state
+            from quant.flashinfer_integration.fi_tuner_base import cold_tuning_state
 
             st = cold_tuning_state()
         except Exception:                              # noqa: BLE001

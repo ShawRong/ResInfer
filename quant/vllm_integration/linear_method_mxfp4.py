@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""SM100 MXFP4 loading for explicit ModelOpt packed checkpoints."""
+"""Native ModelOpt MXFP4 loading and ResInfer Linear execution on SM100."""
 from __future__ import annotations
 
 import torch
@@ -11,58 +11,22 @@ from vllm.model_executor.layers.linear import (
     UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.quantization import register_quantization_config
-from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.modelopt import ModelOptQuantConfigBase
 from vllm.model_executor.utils import set_weight_attrs
 
 from quant.mxfp4_linear import mxfp4_linear
 
-_MODES = ("standard", "selective", "mext_r1")
+@register_quantization_config("modelopt_mxfp4")
+class ModelOptMxfp4Config(ModelOptQuantConfigBase):
+    """vLLM adapter for native ModelOpt MXFP4; residue uses the shared sidecar."""
 
-
-@register_quantization_config("residue_mxfp4")
-class ResidueMxfp4Config(QuantizationConfig):
-    """Explicit per-layer contract for packed ModelOpt MXFP4 checkpoints."""
-
-    def __init__(
-        self,
-        layers=None,
-        checkpoint_format=None,
-        activation_recipe="ceil",
-        **format_metadata,
-    ):
-        super().__init__()
-        from quant.mxfp4_checkpoint import validate_format, validate_layer
-
-        contract = {
-            "checkpoint_format": checkpoint_format,
-            "activation_recipe": activation_recipe,
-            **format_metadata,
-        }
-        validate_format(contract)
-        self.activation_recipe = activation_recipe
-        self.layers = dict(layers or {})
-        if not self.layers:
-            raise ValueError("packed MXFP4 checkpoint requires explicit layers")
-        for prefix, spec in self.layers.items():
-            validate_layer(spec)
-            if spec.get("mode") not in _MODES:
-                raise ValueError(f"unknown MXFP4 mode for {prefix}")
-        # This independent config does not run patch_vllm_modelopt(). Install
-        # the existing vLLM FlashInfer warmup wrapper only for an explicitly
-        # enabled MExt model, before vLLM constructs the model runner.
-        from . import mxfp4_fold_tuner
-
-        if mxfp4_fold_tuner.tuner_enabled() and any(
-            spec["mode"] == "mext_r1" for spec in self.layers.values()
-        ):
-            mxfp4_fold_tuner.request_vllm_warmup()
-            from .patch import _install_fold_decode_autotune_warmup
-
-            _install_fold_decode_autotune_warmup()
+    def __init__(self, exclude_modules=None):
+        super().__init__(exclude_modules or [])
+        self._metadata = None
 
     @classmethod
     def get_name(cls):
-        return "residue_mxfp4"
+        return "modelopt_mxfp4"
 
     @classmethod
     def get_supported_act_dtypes(cls):
@@ -72,37 +36,103 @@ class ResidueMxfp4Config(QuantizationConfig):
     def get_min_capability(cls):
         return 100
 
-    @staticmethod
-    def get_config_filenames():
-        return ["residue_mxfp4_config.json"]
+    @classmethod
+    def override_quantization_method(cls, hf_quant_cfg, user_quant, hf_config=None):
+        if cls._extract_modelopt_quant_algo(hf_quant_cfg) == "MXFP4":
+            return cls.get_name()
+        return None
 
     @classmethod
     def from_config(cls, config):
-        return cls(**{key: value for key, value in config.items()
-                      if key != "quant_method"})
+        # Upstream's base parser rejects MXFP4 before constructing a method.
+        # Keep this adapter local; do not modify the global algorithm whitelist.
+        quant = config.get("quantization", config)
+        if str(quant.get("quant_algo", "")).upper() != "MXFP4":
+            raise ValueError("ModelOpt MXFP4 adapter requires quant_algo=MXFP4")
+        if quant.get("group_size", 32) != 32:
+            raise ValueError("MXFP4 requires group_size=32")
+        if quant.get("kv_cache_quant_algo") or quant.get("kv_cache_scheme"):
+            raise ValueError("MXFP4 adapter does not support quantized KV cache")
+        excluded = quant.get("exclude_modules", quant.get("ignore", []))
+        if not isinstance(excluded, list) or any(not isinstance(v, str) for v in excluded):
+            raise ValueError("ModelOpt exclude_modules/ignore must be a list of strings")
+        return cls(excluded)
+
+    def _load_metadata(self):
+        if self._metadata is not None:
+            return self._metadata
+        import json
+        import os
+        from pathlib import Path
+
+        model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
+        if not model_dir:
+            from vllm.config import get_current_vllm_config
+            model_dir = get_current_vllm_config().model_config.model
+        if not Path(model_dir).is_dir():
+            raise ValueError("MXFP4 residue metadata requires a local model directory; "
+                             "set RESIDUE_VLLM_MODEL_DIR to the checkpoint directory")
+        path = Path(model_dir) / "residue_kernel_metadata.json"
+        # Native non-residue checkpoints need no sidecar. Parse errors must fail.
+        self._metadata = json.loads(path.read_text()) if path.exists() else {}
+        return self._metadata
 
     def get_quant_method(self, layer, prefix):
+        from .linear_utils import get_residue_layer_candidates, get_fused_hf_candidates
+        from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+        if isinstance(layer, RoutedExperts):
+            raise ValueError("ResInfer MXFP4 supports dense Linear layers only")
         if not isinstance(layer, LinearBase):
             return None
-        spec = self.layers.get(prefix)
-        if spec is None:
+        candidates = get_residue_layer_candidates(prefix)
+        groups = get_fused_hf_candidates(prefix)
+        excluded = [self.is_layer_excluded(name) for name in candidates]
+        # An alias of the whole fused layer, or every member of one HF group,
+        # may be excluded. A single excluded constituent is incompatible.
+        if any(excluded):
+            constituents = {name for group in groups for name in group}
+            whole = any(self.is_layer_excluded(name) for name in candidates
+                        if name not in constituents)
+            all_members = any(all(self.is_layer_excluded(name) for name in group)
+                              for group in groups)
+            if not whole and not all_members:
+                raise ValueError(f"partially quantized fused group: {prefix}")
             return UnquantizedLinearMethod()
-        return ResidueMxfp4LinearMethod(
-            spec,
-            activation_recipe=self.activation_recipe,
-        )
+        data = self._load_metadata()
+        layers = data.get("layers", {})
+        metas = [layers[name] for name in candidates if name in layers]
+        if metas and any(meta != metas[0] for meta in metas[1:]):
+            raise ValueError(f"fused group must share residue metadata: {prefix}")
+        # Export validates the full group; reject missing constituent metadata
+        # for externally authored sidecars as well.
+        for names in groups:
+            present = [name in layers for name in names]
+            if any(present) and not all(present):
+                raise ValueError(f"partially specified residue fused group: {prefix}")
+        meta = metas[0] if metas else {}
+        dims = data.get("extended_linear_dims", {})
+        widths = {dims[name] for name in candidates if name in dims}
+        if len(widths) > 1:
+            raise ValueError(f"fused group must share extended input width: {prefix}")
+        return ResidueMxfp4LinearMethod(meta, extended_dim=next(iter(widths), None))
 
 
 class ResidueMxfp4LinearMethod(LinearMethodBase):
     """Load packed uint8 weights/scales and dispatch the opaque MXFP4 op."""
 
-    def __init__(self, spec, *, activation_recipe="ceil"):
+    def __init__(self, metadata=None, *, extended_dim=None, activation_recipe="ceil"):
         self.activation_recipe = activation_recipe
-        self.spec = dict(spec)
-        self.mode = spec["mode"]
-        self.indices = tuple(spec.get("indices", ()))
-        if self.mode not in _MODES:
-            raise ValueError(f"unknown mode {self.mode}")
+        self.metadata = metadata or {}
+        self.extended_dim = extended_dim
+        runtime_mode = self.metadata.get("runtime_mode", "standard")
+        if runtime_mode == "mext_r1":
+            from ..flashinfer_integration import mxfp4_fold_tuner
+            if mxfp4_fold_tuner.tuner_enabled():
+                from .autotune_warmup import request_mxfp4_warmup
+                from .patch import _install_fold_decode_autotune_warmup
+                request_mxfp4_warmup()
+                _install_fold_decode_autotune_warmup()
 
     def create_weights(
         self,
@@ -114,7 +144,7 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
         params_dtype,
         **extra_weight_attrs,
     ):
-        from quant.mxfp4_checkpoint import padded_k, validate_layer
+        from quant.kernel_metadata import padded_k, residue_spec
 
         n = sum(output_partition_sizes)
         k = input_size_per_partition
@@ -124,11 +154,12 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             raise ValueError("MXFP4 output dtype must be fp16 or bf16")
         if k <= 0 or k % 128 or n <= 0 or n % 32:
             raise ValueError("MXFP4 linear requires positive K%128==0 and N%32==0")
-        validate_layer(self.spec)
-        if (k, n) != (self.spec["input_size"], self.spec["output_size"]):
-            raise ValueError("checkpoint dimensions do not match this runtime linear")
-
+        self.spec = residue_spec(self.metadata, k, n)
+        self.mode = self.spec["mode"]
+        self.indices = tuple(self.spec.get("indices", ()))
         kp = padded_k(k, len(self.indices))
+        if self.extended_dim is not None and self.extended_dim != kp:
+            raise ValueError("metadata extended dimension does not match MXFP4 weights")
         loader = extra_weight_attrs.pop("weight_loader")
         layer._mxfp4_loaded = {"weight": set(), "weight_scale": set()}
         layer._mxfp4_shards = len(output_partition_sizes)

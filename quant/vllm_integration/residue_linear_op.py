@@ -360,7 +360,7 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
     # registration and the whitelist is complete for the whole model.
     if key[3] and _sm10x_fold_arch() is not None and _mext_prefill_two_gemm():
         try:
-            from .mext_prefill_tuner import (_PRECOMPILED,
+            from ..flashinfer_integration.mext_prefill_tuner import (_PRECOMPILED,
                                              precompile_kloop_sm100)
 
             if not any(k0 == "sm100" for k0, *_ in _PRECOMPILED):
@@ -376,7 +376,7 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         # Symbolic shapes -- one warm covers every layer, so first
         # registration triggers it, same as the kloop above.
         try:
-            from .sm10x_fold_tuner import precompile_row_pair, tuner_enabled
+            from ..flashinfer_integration.sm10x_fold_tuner import precompile_row_pair, tuner_enabled
 
             if tuner_enabled():
                 precompile_row_pair()
@@ -413,7 +413,7 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         
         
         
-        from .sm120_fold_tuner import precompile_fold_tiles
+        from ..flashinfer_integration.sm120_fold_tuner import precompile_fold_tiles
 
         a_ld = None if key[2] == key[1] else key[2]
         n_cand = precompile_fold_tiles(key[0], key[1], a_ld=a_ld)
@@ -434,7 +434,7 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
             # been JITing inside cudagraph capture instead. Now that prefill
             # never folds, the condition it guarded is simply always true.
             try:
-                from .mext_prefill_tuner import precompile_kloop_sm120
+                from ..flashinfer_integration.mext_prefill_tuner import precompile_kloop_sm120
 
                 n_kloop = precompile_kloop_sm120(key[0], key[1])
                 if n_kloop:
@@ -583,6 +583,12 @@ def _run_mext_r1_two_gemm(
     return y[0::2] + y[1::2]
 
 
+def _mext_prefill_fallback(inputs):
+    """vLLM's backend for the framework-independent prefill adapter."""
+    x, weight, scale_inv, weight_sf, alpha = inputs
+    return _run_mext_r1_two_gemm(x, weight, scale_inv, weight_sf, alpha, x.dtype)
+
+
 def _run_mext_fold_gemm_sm10x(
     x_fp4_rowpair: torch.Tensor,
     weight: torch.Tensor,
@@ -704,7 +710,7 @@ def _run_mext_fold_gemm_sm120_cutedsl(
     k_base: int,
 ) -> torch.Tensor:
     'SM120 CuTeDSL fold, tile picked by the FlashInfer tuner.'
-    from .sm120_fold_tuner import tuned_sm120_fold
+    from ..flashinfer_integration.sm120_fold_tuner import tuned_sm120_fold
 
     if not _SM120_DSL_FIRED[0]:
         _SM120_DSL_FIRED[0] = True
@@ -848,12 +854,14 @@ def nvfp4_linear(
                 # branch can never JIT while serving. Any tuner-layer error
                 # degrades to plain two_gemm rather than breaking the op.
                 try:
-                    from .mext_prefill_tuner import tuned_mext_prefill
+                    from ..flashinfer_integration.mext_prefill_tuner import tuned_mext_prefill
 
                     return tuned_mext_prefill(
                         x, _w_view, input_global_scale_inv,
                         weight_scale_base, alpha, output_dtype,
                         force_kloop=(_MEXT_PREFILL_PATH == "k_loop"),
+                        fallback_forward=_mext_prefill_fallback,
+                        fallback_key="vllm_cutlass_scaled_fp4_mm_v1",
                     )
                 except Exception:                         # noqa: BLE001
                     pass
@@ -887,7 +895,7 @@ def nvfp4_linear(
 
             major, minor = torch.cuda.get_device_capability()
 
-            from .sm10x_fold_tuner import tuned_sm10x_fold, tuner_enabled
+            from ..flashinfer_integration.sm10x_fold_tuner import tuned_sm10x_fold, tuner_enabled
 
             if tuner_enabled():
                 # The candidate index includes producer layout and Fold

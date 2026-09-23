@@ -1,89 +1,113 @@
-"""Export wrapper for residue-quantized checkpoints.
+"""Common ModelOpt export: native quantization config plus residue metadata."""
+from __future__ import annotations
 
-This module provides a wrapper around ModelOpt's export_hf_checkpoint
-that ensures config.json accurately reflects the extended weight dimensions.
-
-This is a UNIVERSAL correctness fix - not specific to any inference framework.
-The problem: ModelOpt exports weights with extended dimensions, but config.json
-still has the original model dimensions. This causes loaders that read config.json
-(like vLLM) to pre-allocate tensors with wrong shapes.
-
-Usage:
-    from quant.modelopt_integration.export import export_residue_checkpoint
-
-    export_residue_checkpoint(
-        model,
-        export_dir="./exported",
-        dtype=torch.float16,
-    )
-"""
-
+import hashlib
+import importlib.metadata
+import inspect
 import json
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, Dict, Any
 
 import torch
 
+from quant.kernel_metadata import padded_k, residue_spec, runtime_layer_specs
 
 def export_residue_checkpoint(
-    model: torch.nn.Module,
-    export_dir: str,
-    dtype: Optional[torch.dtype] = None,
-    residue_ratio: float = 0.125,
-    **export_kwargs: Any,
-) -> Path:
-    """Export residue-quantized model checkpoint.
+    model, export_dir, dtype=None, residue_ratio=0.125, *,
+    block_size=8, calibration=None, source_checkpoint=None,
+    preserve_unloaded_prefixes=None, tokenizer=None, processor=None,
+    save_kernel_metadata=True, save_channel_masks=True, **export_kwargs,
+):
+    """Use ModelOpt's exporter for both NVFP4 and MXFP4, without changing format.
 
-    This wrapper calls ModelOpt's export_hf_checkpoint() for proper FP4 packing.
-
-    IMPORTANT: config.json is NOT modified. The original dimensions (hidden_size,
-    intermediate_size) are preserved because:
-    - Embedding layer uses hidden_size and is NOT extended
-    - Linear layers have extended dimensions but get them from metadata
-
-    vLLM's residue NVFP4 linear method reads extended_linear_dims from
-    residue_kernel_metadata.json to override input_size_per_partition
-    in create_weights().
-
-    Args:
-        model: Quantized model to export
-        export_dir: Directory to save checkpoint
-        dtype: Export dtype (default: model dtype)
-        residue_ratio: Ratio used for residue extension (for metadata)
-        **export_kwargs: Additional args for export_hf_checkpoint
-
-    Returns:
-        Path to exported checkpoint directory
+    Collect residue metadata before ModelOpt temporarily packs/replaces modules.
+    MXFP4 validation checks native output; it never rewrites weights or config.
     """
-    from .mxfp4_export import has_mxfp4_weights, export_mxfp4_checkpoint
-    if has_mxfp4_weights(model):
-        export_kwargs.pop("save_modelopt_state", None)
-        return export_mxfp4_checkpoint(model, export_dir, dtype=dtype, **export_kwargs)
-
     from modelopt.torch.export import export_hf_checkpoint
+    from .kernel_metadata import save_kernel_metadata as save_metadata
 
-    export_path = Path(export_dir)
+    path = Path(export_dir)
+    mxfp4 = has_mxfp4_weights(model)
+    hf_layers, preserved, source_record = {}, {}, None
+    if mxfp4:
+        _require_modelopt_export_api(export_hf_checkpoint)
+        model_type = getattr(model.config, "model_type", None)
+        if model_type == "qwen3_5" and source_checkpoint is None:
+            raise ValueError("Qwen3.5 requires the source checkpoint to preserve vision/MTP")
+        if path.exists() and any(path.iterdir()):
+            raise FileExistsError(f"refusing to overwrite export: {path}")
+        hf_layers = _collect_mxfp4_layers(model)
+        # Validate fused activation contracts before writing anything.
+        runtime_layer_specs(hf_layers, model_type)
+    if source_checkpoint is not None or mxfp4:
+        if preserve_unloaded_prefixes is None:
+            preserve_unloaded_prefixes = (("mtp.",) if
+                getattr(model.config, "model_type", None) == "qwen3_5" else ())
+        quantized_layers = hf_layers or {
+            name: {} for name, module in model.named_modules()
+            if getattr(getattr(module, "weight_quantizer", None), "is_enabled", False)
+        }
+        extra, preserved, source_record = _collect_preserved_state(
+            model, source_checkpoint, quantized_layers, preserve_unloaded_prefixes)
+        if extra:
+            supplied = export_kwargs.get("extra_state_dict") or {}
+            if set(extra) & set(supplied):
+                raise ValueError("duplicate preserved extra_state_dict keys")
+            export_kwargs["extra_state_dict"] = {**supplied, **extra}
 
-    # Standard ModelOpt export (handles FP4 packing)
-    # DO NOT update config.json - dimensions must stay original for embedding
-    # Extended dimensions are handled per-layer via metadata
-    with torch.inference_mode():
-        export_hf_checkpoint(
-            model,
-            export_dir=str(export_path),
-            dtype=dtype,
-            **export_kwargs,
-        )
-
-    # vLLM's ModelOpt quantization loader currently only whitelists "NVFP4"
-    # (see QUANT_ALGOS in vllm/model_executor/layers/quantization/modelopt.py).
-    # ModelOpt may export AWQ-lite checkpoints as "NVFP4_AWQ", while the actual
-    # packed weights are still NVFP4. Runtime pre_quant_scale is not supported
-    # by the native vLLM real-quant contract; formal AWQ exports must fold it
-    # before vLLM loading.
-    _normalize_quant_algo_for_vllm(export_path)
-
-    return export_path
+    path.mkdir(parents=True, exist_ok=True)
+    # Required residue state must never depend on an optional debug flag.
+    from .kernel_metadata import collect_kernel_metadata, collect_extended_linear_dims
+    metadata = collect_kernel_metadata(model, residue_ratio, block_size)
+    dims = collect_extended_linear_dims(model)
+    if save_kernel_metadata or metadata["layers"] or dims:
+        save_metadata(model, path, residue_ratio, block_size,
+                      save_channel_masks=save_channel_masks, calibration=calibration)
+    export_kwargs.setdefault("save_modelopt_state", False if mxfp4 else True)
+    if mxfp4:
+        export_kwargs["save_modelopt_state"] = False
+    with torch.inference_mode(), _omit_private_export_buffers(model):
+        export_hf_checkpoint(model, export_dir=path, dtype=dtype, **export_kwargs)
+    _normalize_quant_algo_for_vllm(path)
+    manifest = None
+    if mxfp4:
+        _, native, hashes = _validate_modelopt_export(path, hf_layers, preserved)
+        manifest = {
+            "status": "structure_validated", "runtime_validated": False,
+            "native_quantization_config": native,
+            "model_class": f"{type(model).__module__}.{type(model).__name__}",
+            "source_checkpoint": source_record,
+            "max_shard_size": export_kwargs.get("max_shard_size", "10GB"),
+            "tokenizer_saved": tokenizer is not None,
+            "processor_saved": processor is not None,
+            "exporter_source_sha256": _file_hash(Path(__file__)),
+            "native_packed_tensor_sha256": hashes,
+            "preserved_parameter_sha256": preserved,
+            "calibration": calibration,
+            "versions": {p: importlib.metadata.version(p) for p in
+                         ("torch", "nvidia-modelopt", "transformers", "safetensors")},
+        }
+    if processor is not None:
+        processor.save_pretrained(path)
+    if tokenizer is not None:
+        tokenizer.save_pretrained(path)
+    if manifest is not None:
+        manifest["metadata_file_sha256"] = {
+            file.name: _file_hash(file) for file in sorted(path.iterdir())
+            if file.is_file() and file.suffix != ".safetensors"
+        }
+        manifest["safetensor_shards"] = {
+            file.name: file.stat().st_size for file in path.glob("*.safetensors")
+        }
+        source_manifest = Path(__file__).resolve().parents[2] / "SOURCE_MANIFEST.json"
+        manifest["source_manifest_sha256"] = (_file_hash(source_manifest)
+                                              if source_manifest.is_file() else None)
+        device = next(model.parameters()).device
+        manifest["device"] = str(device)
+        manifest["cuda_capability"] = (list(torch.cuda.get_device_capability(device))
+                                       if device.type == "cuda" else None)
+        (path / "export_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    return path
 
 
 def _normalize_quant_algo_for_vllm(export_path: Path) -> None:
@@ -140,121 +164,221 @@ def _normalize_quant_algo_for_vllm(export_path: Path) -> None:
     )
 
 
-def _update_config_with_extended_dims(export_path: Path, residue_ratio: float) -> None:
-    """Update config.json to match actual weight dimensions.
 
-    Reads actual weight shapes from safetensors and updates
-    hidden_size/intermediate_size to reflect the true dimensions.
-
-    Args:
-        export_path: Path to exported checkpoint directory
-        residue_ratio: Fallback ratio if can't read from weights
-    """
-    config_path = export_path / "config.json"
-    if not config_path.exists():
-        print(f"[residue] Warning: config.json not found at {config_path}")
-        return
-
-    # Read current config
-    with open(config_path) as f:
-        config = json.load(f)
-
-    original_hidden = config.get("hidden_size", 4096)
-    original_intermediate = config.get("intermediate_size", 14336)
-
-    # Read actual dimensions from exported weights (authoritative source)
-    actual_dims = _read_weight_dims_from_safetensors(export_path)
-
-    if actual_dims:
-        extended_hidden = actual_dims.get("hidden_size", original_hidden)
-        extended_intermediate = actual_dims.get("intermediate_size", original_intermediate)
-    else:
-        # Fallback: compute from ratio
-        print("[residue] Warning: Could not read weight dims from safetensors, using ratio fallback")
-        extended_hidden = original_hidden + int(original_hidden * residue_ratio)
-        extended_intermediate = original_intermediate + int(original_intermediate * residue_ratio)
-
-    # Only update if dimensions actually changed
-    if extended_hidden == original_hidden and extended_intermediate == original_intermediate:
-        print("[residue] Dimensions unchanged, skipping config.json update")
-        return
-
-    # Update config with actual dimensions
-    config["hidden_size"] = extended_hidden
-    config["intermediate_size"] = extended_intermediate
-
-    # Preserve original dimensions for reference
-    config["_original_hidden_size"] = original_hidden
-    config["_original_intermediate_size"] = original_intermediate
-    config["_residue_extended"] = True
-
-    # Write updated config
-    with open(config_path, "w") as f:
-        json.dump(config, f, indent=2)
-
-    print(f"[residue] Updated config.json with actual dimensions:")
-    print(f"  hidden_size: {original_hidden} → {extended_hidden}")
-    print(f"  intermediate_size: {original_intermediate} → {extended_intermediate}")
+def _file_hash(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
-def _read_weight_dims_from_safetensors(export_path: Path) -> Dict[str, int]:
-    """Read actual weight dimensions from exported safetensors.
+def _hash(tensor):
+    array = tensor.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy()
+    return hashlib.sha256(memoryview(array)).hexdigest()
 
-    Returns dict with extended hidden_size and intermediate_size
-    based on actual weight shapes.
 
-    The logic:
-    - gate_proj.weight shape: [intermediate_size, hidden_size_packed]
-      → hidden_size = packed_dim * 2 (FP4 nibble packing)
-    - down_proj.weight shape: [hidden_size, intermediate_size_packed]
-      → intermediate_size = packed_dim * 2
+def _require_modelopt_export_api(export_hf_checkpoint):
+    version = importlib.metadata.version("nvidia-modelopt")
+    if version.split(".")[:2] != ["0", "45"]:
+        raise ValueError(
+            f"MXFP4 export is validated with ModelOpt 0.45.x, got {version}"
+        )
+    required = {"model", "dtype", "export_dir", "save_modelopt_state",
+                "extra_state_dict", "max_shard_size"}
+    missing = required - set(inspect.signature(export_hf_checkpoint).parameters)
+    if missing:
+        raise ValueError(f"ModelOpt exporter is missing required parameters: {sorted(missing)}")
+    return version
 
-    Args:
-        export_path: Path to exported checkpoint directory
 
-    Returns:
-        Dict with "hidden_size" and/or "intermediate_size" keys
-    """
-    try:
-        from safetensors import safe_open
-    except ImportError:
-        print("[residue] Warning: safetensors not installed, cannot read weight dims")
-        return {}
+def has_mxfp4_weights(model):
+    return any(getattr(q, "is_enabled", False)
+               and getattr(q, "num_bits", None) == (2, 1)
+               and (getattr(q, "block_sizes", None) or {}).get("scale_bits") == (8, 0)
+               for module in model.modules() for q in [getattr(module, "weight_quantizer", None)])
 
-    safetensor_files = list(export_path.glob("*.safetensors"))
-    if not safetensor_files:
-        return {}
 
-    result: Dict[str, int] = {}
-
-    for sf_path in safetensor_files:
-        try:
-            with safe_open(sf_path, framework="pt") as f:
-                for key in f.keys():
-                    # Look for gate_proj to determine extended hidden_size
-                    # gate_proj shape: [intermediate_size, hidden_size_packed]
-                    if "gate_proj.weight" in key and "hidden_size" not in result:
-                        tensor = f.get_tensor(key)
-                        # Unpack: hidden_size = packed_dim * 2 (FP4 nibble packing)
-                        result["hidden_size"] = tensor.shape[1] * 2
-
-                    # Look for down_proj to determine extended intermediate_size
-                    # down_proj shape: [hidden_size, intermediate_size_packed]
-                    if "down_proj.weight" in key and "intermediate_size" not in result:
-                        tensor = f.get_tensor(key)
-                        # Unpack: intermediate_size = packed_dim * 2
-                        result["intermediate_size"] = tensor.shape[1] * 2
-
-                    if len(result) == 2:
-                        break
-        except Exception as e:
-            print(f"[residue] Warning: Error reading {sf_path}: {e}")
+def _collect_mxfp4_layers(model):
+    from modelopt.torch.export.quant_utils import get_quantization_format
+    from .kernel_metadata import collect_kernel_metadata
+    metadata = collect_kernel_metadata(model)["layers"]
+    layers = {}
+    for name, module in model.named_modules():
+        wq = getattr(module, "weight_quantizer", None)
+        if wq is None or not wq.is_enabled:
             continue
+        if not isinstance(module, torch.nn.Linear) or get_quantization_format(module) != "mxfp4":
+            raise ValueError(f"only dense MXFP4 W4A4 is supported: {name}")
+        if any(getattr(q, "pre_quant_scale", None) is not None
+               for q in (wq, module.input_quantizer)):
+            raise ValueError(f"fuse pre_quant_scale before MXFP4 export: {name}")
+        k = int(getattr(module, "_original_in_features", module.weight.shape[1]))
+        spec = residue_spec(metadata.get(name), k, module.weight.shape[0])
+        expected = padded_k(k, len(spec.get("indices", [])))
+        if module.weight.shape[1] != expected:
+            raise ValueError(f"materialize and pad selected weights before export: {name}; "
+                             f"expected K={expected}, got {module.weight.shape[1]}")
+        if not torch.isfinite(module.weight).all().item():
+            raise ValueError(f"nonfinite source weight: {name}")
+        layers[name] = spec
+    if not layers:
+        raise ValueError("no enabled MXFP4 linear layers found")
+    return layers
 
-        if len(result) == 2:
-            break
 
-    return result
+@contextmanager
+def _omit_private_export_buffers(model):
+    """Keep residue metadata live while excluding it from exported state_dicts."""
+    added = []
+    for module in model.modules():
+        if "_salient_indices" not in getattr(module, "_buffers", {}):
+            continue
+        non_persistent = module._non_persistent_buffers_set
+        if "_salient_indices" not in non_persistent:
+            non_persistent.add("_salient_indices")
+            added.append(module)
+    try:
+        yield
+    finally:
+        for module in added:
+            module._non_persistent_buffers_set.discard("_salient_indices")
+
+
+def _validate_modelopt_export(path, hf_layers, preserved):
+    """Validate official ModelOpt output without rewriting its shards."""
+    from safetensors import safe_open
+
+    config_path = path / "config.json"
+    config = json.loads(config_path.read_text())
+    native_config = config.get("quantization_config")
+    if (not isinstance(native_config, dict)
+            or native_config.get("quant_method") != "modelopt"
+            or str(native_config.get("quant_algo", "")).lower() != "mxfp4"):
+        raise ValueError(f"unexpected ModelOpt MXFP4 config: {native_config!r}")
+
+    seen, hashes, weight_map = set(), {}, {}
+    expected_quant = {
+        f"{name}.{key}" for name in hf_layers for key in ("weight", "weight_scale")
+    }
+    shards = sorted(path.glob("*.safetensors"))
+    if not shards:
+        raise ValueError("ModelOpt export produced no safetensors")
+    index_path = path / "model.safetensors.index.json"
+    native_index = json.loads(index_path.read_text()) if index_path.exists() else None
+    native_weight_map = (native_index or {}).get("weight_map", {})
+
+    for shard in shards:
+        with safe_open(shard, framework="pt") as handle:
+            for key in handle.keys():
+                if key in seen:
+                    raise ValueError(f"duplicate exported tensor: {key}")
+                seen.add(key)
+                if "quantizer." in key:
+                    raise ValueError(f"unexpected calibration tensor: {key}")
+                tensor = handle.get_tensor(key)
+                prefix, leaf = key.rsplit(".", 1)
+                if prefix in hf_layers and leaf in ("weight", "weight_scale"):
+                    spec = hf_layers[prefix]
+                    k = padded_k(spec["input_size"], len(spec.get("indices", [])))
+                    width = k // (2 if leaf == "weight" else 32)
+                    expected_shape = [spec["output_size"], width]
+                    if tensor.dtype != torch.uint8 or list(tensor.shape) != expected_shape:
+                        raise ValueError(
+                            "unexpected native ModelOpt MXFP4 shape/dtype: "
+                            f"{key} {tensor.shape} {tensor.dtype}"
+                        )
+                    if leaf == "weight_scale" and (tensor == 255).any().item():
+                        raise ValueError(f"NaN E8M0 code in {key}")
+                    hashes[key] = _hash(tensor)
+                elif prefix in hf_layers and leaf != "bias":
+                    raise ValueError(f"unexpected MXFP4 auxiliary tensor: {key}")
+                if tensor.is_floating_point() and not tensor.isfinite().all().item():
+                    raise ValueError(f"nonfinite exported tensor: {key}")
+                if key in preserved and _hash(tensor) != preserved[key]:
+                    raise ValueError(f"unquantized parameter changed during export: {key}")
+                weight_map[key] = shard.name
+
+    if native_index is not None:
+        if native_weight_map != weight_map:
+            raise ValueError("ModelOpt shard index does not match exported tensors")
+    elif len(shards) != 1:
+        raise ValueError("multi-shard ModelOpt export is missing its safetensors index")
+    missing = (expected_quant | set(preserved)) - set(weight_map)
+    if missing:
+        raise ValueError(f"missing exported tensors: {sorted(missing)}")
+    return config, native_config, hashes
+
+
+def _collect_preserved_state(model, source_checkpoint, hf_layers,
+                             preserve_unloaded_prefixes):
+    """Return ModelOpt extra_state_dict plus hashes for unquantized tensors."""
+    if source_checkpoint is None:
+        hashes = {
+            name: _hash(parameter)
+            for name, parameter in model.named_parameters()
+            if (name.rsplit(".", 1)[0] not in hf_layers or name.endswith(".bias"))
+            and "quantizer" not in name
+        }
+        return {}, hashes, None
+
+    from safetensors import safe_open
+
+    source = Path(source_checkpoint).resolve()
+    if not source.is_dir():
+        raise ValueError(f"source checkpoint is not a directory: {source}")
+    source_index = source / "model.safetensors.index.json"
+    if source_index.is_file():
+        index = json.loads(source_index.read_text())
+        source_map = index.get("weight_map")
+        if not isinstance(source_map, dict) or not source_map:
+            raise ValueError(f"invalid source safetensors index: {source_index}")
+        inventory = {
+            "kind": "sharded_safetensors",
+            "index_sha256": _file_hash(source_index),
+        }
+    else:
+        source_file = source / "model.safetensors"
+        if not source_file.is_file():
+            raise ValueError(
+                "source checkpoint must contain model.safetensors or "
+                "model.safetensors.index.json"
+            )
+        with safe_open(source_file, framework="pt") as handle:
+            source_map = {name: source_file.name for name in handle.keys()}
+        inventory = {"kind": "single_safetensors", "filename": source_file.name}
+    if any(not str(filename).endswith(".safetensors")
+           for filename in source_map.values()):
+        raise ValueError("source checkpoint index must reference safetensors shards")
+    loaded_keys = set(model.state_dict())
+    excluded = set(source_map) - loaded_keys
+    if any(not name.startswith(tuple(preserve_unloaded_prefixes)) for name in excluded):
+        raise ValueError(f"unloaded source tensor families: {sorted(excluded)[:10]}")
+
+    extra_tensors, hashes = {}, {}
+    for filename in sorted(set(source_map.values())):
+        with safe_open(source / filename, framework="pt") as handle:
+            for name in handle.keys():
+                if name not in source_map or source_map[name] != filename:
+                    raise ValueError(f"invalid source shard index: {name}")
+                if name.endswith(".weight") and name[:-7] in hf_layers:
+                    continue
+                tensor = handle.get_tensor(name)
+                hashes[name] = _hash(tensor)
+                if name in excluded:
+                    extra_tensors[name] = tensor
+    expected = set(source_map) - {name + ".weight" for name in hf_layers}
+    if expected != set(hashes):
+        raise ValueError("source preservation inventory mismatch")
+    record = {
+        "checkpoint_name": source.name,
+        "weight_inventory": inventory,
+        "config_sha256": _file_hash(source / "config.json"),
+        "source_tensor_count": len(source_map),
+        "preserved_unloaded_tensors": sorted(excluded),
+    }
+    return extra_tensors, hashes, record
+
 
 
 def is_residue_quantized(model: torch.nn.Module) -> bool:

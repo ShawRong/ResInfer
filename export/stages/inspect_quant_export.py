@@ -168,15 +168,16 @@ class InspectQuantExportStage(Stage):
         min_metadata_layers = params.get("expected_residue_metadata_min_layers")
         min_extended_dims = params.get("expected_extended_linear_dims_min")
         if min_metadata_layers is not None or min_extended_dims is not None:
-            is_mxfp4 = (export_dir / "residue_mxfp4_config.json").exists()
-            metadata_path = export_dir / ("mxfp4_export_manifest.json" if is_mxfp4
-                                          else "residue_kernel_metadata.json")
+            config = json.loads((export_dir / "config.json").read_text())
+            quant_config = config.get("quantization_config", {})
+            is_mxfp4 = (quant_config.get("quant_method") == "modelopt" and
+                        str(quant_config.get("quant_algo", "")).upper() == "MXFP4")
+            metadata_path = export_dir / "residue_kernel_metadata.json"
             if not metadata_path.exists():
                 raise AssertionError(f"{export_dir}: missing {metadata_path.name}")
             metadata = json.loads(metadata_path.read_text())
-            layers = metadata.get("hf_layers" if is_mxfp4 else "layers", {})
-            extended_dims = ({k:v for k,v in layers.items() if v.get("mode") == "selective"}
-                             if is_mxfp4 else metadata.get("extended_linear_dims", {}))
+            layers = metadata.get("layers", {})
+            extended_dims = metadata.get("extended_linear_dims", {})
             if min_metadata_layers is not None and len(layers) < int(min_metadata_layers):
                 raise AssertionError(
                     f"{metadata_path}: expected at least {min_metadata_layers} metadata layers, "
@@ -220,21 +221,28 @@ class InspectQuantExportStage(Stage):
     @classmethod
     def _assert_mxfp4_tensors(cls, export_dir: Path, layers: dict):
         from safetensors import safe_open
-        from quant.mxfp4_checkpoint import validate_format, validate_layer, padded_k, runtime_layer_specs
+        from quant.kernel_metadata import residue_spec, padded_k
         config = json.loads((export_dir / "config.json").read_text())
-        contract = json.loads((export_dir / "residue_mxfp4_config.json").read_text())
-        validate_format(contract)
-        if contract != config["quantization_config"] or contract["layers"] != runtime_layer_specs(layers, config.get("model_type", "llama")):
-            raise AssertionError("inconsistent MXFP4 runtime and HF layer metadata")
+        quant = config.get("quantization_config", {})
+        if quant.get("quant_method") != "modelopt" or str(quant.get("quant_algo", "")).upper() != "MXFP4":
+            raise AssertionError("expected native ModelOpt MXFP4 config")
         expected = {}
-        for name, spec in layers.items():
-            validate_layer(spec)
-            base = cls._expected_in_features(name, config.get("text_config", config))
-            if base is None or base != spec["input_size"]:
-                raise AssertionError(f"MXFP4 source config input dimension mismatch: {name}")
-            kp = padded_k(base, len(spec.get("indices", [])))
-            for suffix, divisor in (("weight", 2), ("weight_scale", 32)):
-                expected[f"{name}.{suffix}"] = [spec["output_size"], kp // divisor]
+        for shard in sorted(export_dir.glob("*.safetensors")):
+            with safe_open(shard, framework="pt") as f:
+                for key in f.keys():
+                    if not key.endswith(".weight_scale"):
+                        continue
+                    name = key[:-len(".weight_scale")]
+                    base = cls._expected_in_features(name, config.get("text_config", config))
+                    if base is None:
+                        raise AssertionError(f"unknown MXFP4 source input dimension: {name}")
+                    n = f.get_slice(key).get_shape()[0]
+                    spec = residue_spec(layers.get(name), base, n)
+                    kp = padded_k(base, len(spec.get("indices", [])))
+                    for suffix, divisor in (("weight", 2), ("weight_scale", 32)):
+                        expected[f"{name}.{suffix}"] = [n, kp // divisor]
+        if not expected or any(name + ".weight" not in expected for name in layers):
+            raise AssertionError("missing MXFP4 tensors for residue metadata")
         seen = {}
         for shard in sorted(export_dir.glob("*.safetensors")):
             with safe_open(shard, framework="pt") as f:

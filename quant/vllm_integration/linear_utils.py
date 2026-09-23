@@ -145,3 +145,19 @@ def get_layer_metadata(quant_config, layer_name: str) -> dict | None:
             return meta
 
     return None
+
+
+def get_fused_hf_candidates(layer_name: str) -> list[list[str]]:
+    """HF constituent groups for each supported runtime prefix spelling."""
+    suffixes = {
+        "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+        "gate_up_proj": ("gate_proj", "up_proj"),
+        "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+        "in_proj_ba": ("in_proj_b", "in_proj_a"),
+    }
+    result = []
+    for candidate in get_residue_layer_candidates(layer_name):
+        parent, _, leaf = candidate.rpartition(".")
+        if leaf in suffixes:
+            result.append([(parent + "." if parent else "") + name for name in suffixes[leaf]])
+    return result

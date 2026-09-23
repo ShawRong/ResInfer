@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 import os
 
 import torch
@@ -69,13 +71,6 @@ def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     xp = torch.zeros(rows, x.shape[1], dtype=x.dtype, device=x.device)
     xp[: x.shape[0]] = x
     return xp
-
-
-def _run_two_gemm(inputs):
-    from .residue_linear_op import _run_mext_r1_two_gemm
-
-    x, w, gs_inv, wsb, alpha = inputs
-    return _run_mext_r1_two_gemm(x, w, gs_inv, wsb, alpha, x.dtype)
 
 
 def _is_sm10x() -> bool:
@@ -192,21 +187,21 @@ def _kloop_valid_tactics(inputs, tuning):
             if (n_w, k, tile) in _PRECOMPILED]
 
 
-def _make_runners():
+def _make_runners(fallback_forward, fallback_key, output_dtype):
     from .fi_tuner_base import make_runner_pair
 
     return make_runner_pair(
         _CUSTOM_OP,
-        fallback_forward=_run_two_gemm,
-        fallback_extras=("two_gemm", 1),
+        fallback_forward=fallback_forward,
+        fallback_extras=("two_gemm", 2, fallback_key, str(output_dtype)),
         valid_tactics=_kloop_valid_tactics,
         run_tactic=_run_kloop,
-        candidate_extras=lambda inputs: ("k_loop", 1),
+        candidate_extras=lambda inputs: ("k_loop", 2, fallback_key, str(output_dtype)),
         degraded_flag=_DEGRADED,
     )
 
 
-_RUNNERS = None
+_RUNNERS = {}
 
 
 def tuned_mext_prefill(
@@ -217,37 +212,50 @@ def tuned_mext_prefill(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
     force_kloop: bool = False,
+    *,
+    fallback_forward: Callable[[list], torch.Tensor],
+    fallback_key: str,
 ) -> torch.Tensor:
-    """Route one mext_r1 prefill GEMM through FlashInfer's tuned choice."""
-    global _RUNNERS
+    """Route prefill through FlashInfer with a caller-owned two-GEMM fallback.
+
+    ``fallback_forward(inputs)`` receives [x, weight, scale_inv, weight_sf,
+    alpha] and returns the result. ``fallback_key`` must be a stable,
+    versioned backend identifier: changing the fallback changes the race.
+    Current K-loop candidates require output_dtype == x.dtype.
+    """
+    if (not callable(fallback_forward)
+            or not isinstance(fallback_key, str) or not fallback_key):
+        raise ValueError("provide a callable fallback_forward and a nonempty fallback_key")
     inputs = [x, weight, input_global_scale_inv, weight_scale_base, alpha]
+    if output_dtype != x.dtype:
+        return fallback_forward(inputs)
 
     if force_kloop:
         if _is_sm10x():
             for i, (t, c) in enumerate(KLOOP_SM100_CFGS):
                 if ("sm100", t, c) in _PRECOMPILED:
                     return _run_kloop(inputs, i)
-            return _run_two_gemm(inputs)
+            return fallback_forward(inputs)
         n_w, k = int(weight.shape[0]), int(weight.shape[1]) * 2
         for i, tile in enumerate(KLOOP_TILES):
             if (n_w, k, tile) in _PRECOMPILED:
                 return _run_kloop(inputs, i)
-        return _run_two_gemm(inputs)
+        return fallback_forward(inputs)
 
     from .fi_tuner_base import tuned_call
 
     def _runners():
-        global _RUNNERS
-        if _RUNNERS is None:
-            _RUNNERS = _make_runners()
-        return _RUNNERS
+        key = (fallback_forward, fallback_key, output_dtype)
+        if key not in _RUNNERS:
+            _RUNNERS[key] = _make_runners(fallback_forward, fallback_key, output_dtype)
+        return _RUNNERS[key]
 
     return tuned_call(
         _CUSTOM_OP,
         runners_getter=_runners,
         config_getter=_tuning_config,
         inputs=inputs,
-        fallback_forward=_run_two_gemm,
+        fallback_forward=fallback_forward,
         kill_env_value=None,       # no kill switch: two_gemm IS the fallback
         announce_flag=_ANNOUNCED,
         announce=None,

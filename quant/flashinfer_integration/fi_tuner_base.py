@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared scaffold for residue ops tuned through FlashInfer's AutoTuner.
 
-Three tuners share one shape: a FALLBACK runner at index 0 (FlashInfer's
+The adapters share one shape: a FALLBACK runner at index 0 (FlashInfer's
 designated cache-miss target -- serving it must never compile) and a
 CANDIDATE runner whose tactics are indices into a stable list, offered in
 full inside the tuning window and filtered to precompiled kernels outside

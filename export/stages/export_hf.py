@@ -157,7 +157,7 @@ class ExportHFStage(Stage):
         processor=None,
         runtime_asset_source: str | Path | None = None,
     ) -> Path:
-        """Export model with HF save_pretrained and optional kernel metadata."""
+        """Export native ModelOpt weights and common residue metadata."""
         if model is None:
             raise RuntimeError(
                 "Model is None! Cannot export. "
@@ -203,65 +203,20 @@ class ExportHFStage(Stage):
         if verbose:
             print_rank_0(f"  Export dtype: {model_dtype}")
 
-        from quant.modelopt_integration.mxfp4_export import (
-            export_mxfp4_checkpoint,
-            has_mxfp4_weights,
+        from quant.modelopt_integration.export import export_residue_checkpoint
+
+        export_residue_checkpoint(
+            model=model, export_dir=export_path, dtype=model_dtype,
+            residue_ratio=residue_ratio if residue_ratio is not None else 0.125,
+            block_size=kernel_metadata_block_size, calibration=calibration,
+            max_shard_size=max_shard_size, source_checkpoint=source_checkpoint,
+            processor=processor, tokenizer=tokenizer,
+            save_kernel_metadata=save_kernel_metadata,
         )
-        if has_mxfp4_weights(model):
-            if export_target != "vllm":
-                raise ValueError("ResInfer MXFP4 export requires export_target='vllm'")
-            return export_mxfp4_checkpoint(
-                model, export_path, dtype=model_dtype, tokenizer=tokenizer,
-                calibration=calibration, max_shard_size=max_shard_size,
-                source_checkpoint=source_checkpoint, processor=processor,
-            )
-
-        # NVFP4 residue metadata; MXFP4 uses its explicit checkpoint contract.
-        from quant.modelopt_integration.kernel_metadata import (
-            collect_extended_linear_dims,
-        )
-        extended_dims = collect_extended_linear_dims(model)
-
-        # Check if model has residue quantization
-        from quant.modelopt_integration.export import is_residue_quantized
-
-        if is_residue_quantized(model):
-            # Use our wrapper that corrects config.json dimensions
-            # This is a universal correctness fix - config.json should reflect actual weight dims
-            from quant.modelopt_integration.export import export_residue_checkpoint
-
-            if verbose:
-                print_rank_0(f"  Detected residue-quantized model, using export_residue_checkpoint()")
-
-            export_residue_checkpoint(
-                model=model,
-                export_dir=str(export_path),
-                dtype=model_dtype,
-                residue_ratio=residue_ratio if residue_ratio is not None else 0.125,
-                save_modelopt_state=True,
-            )
-        else:
-            # Standard ModelOpt export for non-residue models
-            from modelopt.torch.export import export_hf_checkpoint
-
-            export_hf_checkpoint(
-                model=model,
-                dtype=model_dtype,
-                export_dir=export_path,
-                save_modelopt_state=True,
-            )
-
-        # Normalize quant_algo for vLLM compatibility (idempotent).
-        # Rewrites "NVFP4_AWQ" → "NVFP4" in hf_quant_config.json / config.json
-        # so vLLM's ModelOpt whitelist accepts the checkpoint.
-        from quant.modelopt_integration.export import _normalize_quant_algo_for_vllm
-        _normalize_quant_algo_for_vllm(export_path)
 
         if verbose:
             print_rank_0(f"  ✓ Exported FP4 packed weights (nibble-packed uint8)")
 
-        # Save tokenizer
-        tokenizer.save_pretrained(export_path)
         if runtime_asset_source is not None:
             from export.hf_runtime_assets import copy_hf_runtime_assets
 
@@ -274,156 +229,4 @@ class ExportHFStage(Stage):
         if verbose:
             print_rank_0(f"  ✓ Model saved to {export_path}")
 
-        # Save kernel metadata if requested
-        if save_kernel_metadata:
-            if residue_ratio is None:
-                self.logger.warning(
-                    "  save_kernel_metadata=True but residue_ratio not provided, "
-                    "skipping metadata export"
-                )
-            else:
-                if verbose:
-                    print_rank_0("  Saving kernel metadata...")
-
-                from quant.modelopt_integration.kernel_metadata import (
-                    save_kernel_metadata as save_metadata_fn,
-                )
-
-                try:
-                    saved_files = save_metadata_fn(
-                        model=model,
-                        export_dir=export_path,
-                        residue_ratio=residue_ratio,
-                        block_size=kernel_metadata_block_size,
-                        save_channel_masks=True,
-                        calibration=calibration,
-                    )
-
-                    if verbose:
-                        for key, path in saved_files.items():
-                            print_rank_0(f"    ✓ {key}: {path.name}")
-                except Exception as e:
-                    self.logger.error(f"  Failed to save kernel metadata: {e}")
-                    if verbose:
-                        import traceback
-                        self.logger.error(traceback.format_exc())
-
-        # For vLLM target: save extended_linear_dims to metadata
-        # This allows patched residue linear methods to read extended dimensions.
-        if export_target == "vllm" and extended_dims:
-            import json
-            metadata_path = export_path / "residue_kernel_metadata.json"
-
-            # Load existing metadata if present
-            if metadata_path.exists():
-                with open(metadata_path) as f:
-                    metadata = json.load(f)
-            else:
-                metadata = {}
-
-            # Add extended_linear_dims
-            metadata["extended_linear_dims"] = extended_dims
-
-            with open(metadata_path, "w") as f:
-                json.dump(metadata, f, indent=2)
-
-            if verbose:
-                print_rank_0(f"  ✓ Saved extended_linear_dims to {metadata_path.name}")
-                print_rank_0(f"    {len(extended_dims)} layers with extended dimensions")
-
-        # For vLLM target: remove _salient_indices from checkpoint
-        # vLLM's llama.py load_weights doesn't know how to handle these keys
-        # The indices are already in residue_kernel_metadata.json
-        if export_target == "vllm":
-            removed_count = self._remove_salient_indices_from_checkpoint(
-                export_path, verbose
-            )
-
         return export_path
-
-    def _remove_salient_indices_from_checkpoint(
-        self, export_path: Path, verbose: bool = False
-    ) -> int:
-        """Remove input_quantizer._salient_indices from checkpoint safetensors.
-
-        vLLM's llama.py load_weights doesn't know how to handle these keys,
-        causing KeyError during model loading. The indices are already saved
-        in residue_kernel_metadata.json by save_kernel_metadata.
-
-        This is a post-processing step for vLLM target exports.
-
-        Args:
-            export_path: Path to the exported model directory
-            verbose: Enable debug logging
-
-        Returns:
-            Number of keys removed
-        """
-        try:
-            from safetensors import safe_open
-            from safetensors.torch import save_file
-        except ImportError:
-            self.logger.warning("  ⚠ safetensors not installed, skipping filter")
-            return 0
-
-        import json
-
-        safetensor_files = list(export_path.glob("*.safetensors"))
-        if not safetensor_files:
-            return 0
-
-        total_removed = 0
-
-        for sf_path in safetensor_files:
-            # Load all tensors from safetensors file
-            tensors = {}
-            keys_to_remove = []
-
-            with safe_open(sf_path, framework="pt") as f:
-                for key in f.keys():
-                    if "input_quantizer._salient_indices" in key:
-                        keys_to_remove.append(key)
-                    else:
-                        tensors[key] = f.get_tensor(key)
-
-            if not keys_to_remove:
-                continue
-
-            # Save filtered tensors back
-            save_file(tensors, sf_path)
-
-            total_removed += len(keys_to_remove)
-            if verbose:
-                print_rank_0(
-                    f"  ✓ Removed {len(keys_to_remove)} _salient_indices keys from {sf_path.name}"
-                )
-
-        # Update model.safetensors.index.json if it exists
-        index_path = export_path / "model.safetensors.index.json"
-        if index_path.exists() and total_removed > 0:
-            with open(index_path) as f:
-                index = json.load(f)
-
-            # Filter weight_map
-            if "weight_map" in index:
-                original_count = len(index["weight_map"])
-                index["weight_map"] = {
-                    k: v for k, v in index["weight_map"].items()
-                    if "input_quantizer._salient_indices" not in k
-                }
-                filtered_count = original_count - len(index["weight_map"])
-
-                if filtered_count > 0:
-                    with open(index_path, "w") as f:
-                        json.dump(index, f, indent=2)
-                    if verbose:
-                        print_rank_0(
-                            f"  ✓ Removed {filtered_count} entries from {index_path.name}"
-                        )
-
-        if total_removed > 0:
-            print_rank_0(
-                f"  ✓ Removed {total_removed} _salient_indices keys for vLLM compatibility"
-            )
-
-        return total_removed

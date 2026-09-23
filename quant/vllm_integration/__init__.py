@@ -20,7 +20,7 @@ from importlib import import_module
 def __getattr__(name):
     if name == "ResidueNvFp4LinearMethodV2":
         module = import_module(".linear_method_v2", __name__)
-    elif name in ("ResidueMxfp4Config", "ResidueMxfp4LinearMethod"):
+    elif name in ("ModelOptMxfp4Config", "ResidueMxfp4LinearMethod"):
         module = import_module(".linear_method_mxfp4", __name__)
     elif name in __all__:
         module = import_module(".patch", __name__)
@@ -33,7 +33,7 @@ def __getattr__(name):
 
 __all__ = [
     # Linear methods
-    "ResidueMxfp4Config",
+    "ModelOptMxfp4Config",
     "ResidueMxfp4LinearMethod",
     "ResidueNvFp4LinearMethodV2",
     # Patch functions (recommended way to use)

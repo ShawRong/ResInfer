@@ -181,6 +181,7 @@ def save_kernel_metadata(
 
     metadata = collect_kernel_metadata(
         model, residue_ratio, block_size=block_size)
+    metadata["extended_linear_dims"] = collect_extended_linear_dims(model)
     if calibration:
         metadata["calibration"] = calibration
     metadata_path = export_dir / "residue_kernel_metadata.json"

@@ -254,15 +254,15 @@ def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
     try:
         import torch
 
-        from .mxfp4_fold_tuner import vllm_warmup_requested
+        from .autotune_warmup import mxfp4_warmup_requested
 
-        mx_warmup = vllm_warmup_requested()
+        mx_warmup = mxfp4_warmup_requested()
         try:
             from .residue_linear_op import _SM120_FOLD_SHAPES
         except Exception:
             if not mx_warmup:
                 raise
-            # The independent residue_mxfp4 config does not need a working
+            # The ModelOpt MXFP4 adapter does not need a working
             # NVFP4 ModelOpt/runtime op stack for its own warmup buckets.
             _SM120_FOLD_SHAPES = ()
         if _SM120_FOLD_SHAPES or mx_warmup:

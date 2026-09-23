@@ -31,7 +31,7 @@ from modelopt.torch.opt.conversion import ModeloptStateManager
 from modelopt.torch.quantization.model_calib import max_calibrate 
 from modelopt.torch.utils import print_rank_0
 from modelopt.torch.quantization.utils import enable_weight_access_and_writeback
-from quant.mxfp4_checkpoint import padded_k
+from quant.kernel_metadata import padded_k
 
 from .algo_helper import (
     ResidueHelper,

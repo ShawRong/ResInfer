@@ -1,31 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Checkpoint contract shared by ModelOpt export and the SM100 vLLM loader."""
-FORMAT = {
-    "checkpoint_format": "residue_modelopt_mxfp4_v2",
-    "block_size": 32,
-    "weight_encoding": "e2m1_even_low_nibble",
-    "scale_encoding": "e8m0_uint8",
-    "scale_layout": "linear",
-    "activation_recipe": "ceil",
-    "activation_rounding": "nearest_even",
-    "activation_min_scale_exponent": -127,
-    "activation_quantizers": {
-        "standard": "flashinfer_cute_dsl",
-        "selective": "torch.ops.nvfp4.mxfp4_residue_quant",
-        "mext_r1": "torch.ops.nvfp4.mxfp4_residue_quant",
-    },
-    # Stable producer contract. The exact ModelOpt package version belongs in
-    # export provenance, not in the runtime ABI checked by the loader.
-    "weight_quantizer": "modelopt_mxfp4",
-}
+"""Pure helpers for residue layer metadata and MXFP4 kernel constraints.
 
-
-def validate_format(config):
-    for key, value in FORMAT.items():
-        if config.get(key) != value:
-            raise ValueError(f"unsupported MXFP4 {key}: {config.get(key)!r}; expected {value!r}")
-
-
+These are in-memory layer descriptions, not a checkpoint format. Quantization
+encoding is owned by ModelOpt; residue sidecars use the common metadata schema.
+"""
 def padded_k(k, selected=0):
     return ((k + selected + 127) // 128) * 128
 
@@ -80,3 +58,27 @@ def runtime_layer_specs(layers, model_type):
     if model_type not in ("llama", "qwen3"):
         raise ValueError(f"unsupported MXFP4 model_type: {model_type}")
     return fused
+
+
+def residue_spec(metadata, input_size, output_size):
+    """Translate common residue metadata to the MXFP4 execution contract."""
+    metadata = metadata or {}
+    indices = metadata.get("salient_indices", [])
+    if metadata.get("num_salient", len(indices)) != len(indices):
+        raise ValueError("num_salient disagrees with salient_indices")
+    runtime_mode = metadata.get("runtime_mode", "extended_k" if indices else "standard")
+    if runtime_mode == "mext_r1":
+        if indices != list(range(input_size)):
+            raise ValueError("mext_r1 requires every input channel in order")
+        mode, indices = "mext_r1", []
+    elif runtime_mode == "extended_k" and indices:
+        mode = "selective"
+    elif runtime_mode == "standard" and not indices:
+        mode = "standard"
+    else:
+        raise ValueError(f"invalid residue runtime mode: {runtime_mode}")
+    spec = dict(mode=mode, input_size=input_size, output_size=output_size)
+    if indices:
+        spec["indices"] = indices
+    validate_layer(spec)
+    return spec

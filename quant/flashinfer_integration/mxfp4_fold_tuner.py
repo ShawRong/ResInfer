@@ -32,7 +32,6 @@ _ANNOUNCED = [False]
 _DEGRADED = [False]
 _LAST_SOURCE: list[str | None] = [None]
 _LAST_TILE: list[tuple | None] = [None]
-_WARMUP_REQUESTED = False
 
 
 def _candidates() -> list[tuple]:
@@ -72,15 +71,6 @@ def tuner_enabled() -> bool:
     if value not in ("0", "1"):
         raise ValueError("RESIDUE_MXFP4_FOLD_TUNER must be 0 or 1")
     return value == "1"
-
-
-def request_vllm_warmup() -> None:
-    global _WARMUP_REQUESTED
-    _WARMUP_REQUESTED = True
-
-
-def vllm_warmup_requested() -> bool:
-    return _WARMUP_REQUESTED and tuner_enabled()
 
 
 def is_tuning_mode() -> bool:

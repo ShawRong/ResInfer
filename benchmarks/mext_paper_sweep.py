@@ -280,7 +280,7 @@ def _worker(args: argparse.Namespace) -> int:
                             nvfp4_quantize)
     from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
 
-    # The legacy provenance module prepends its own source-tree csrc/nvfp4 to
+    # The legacy provenance module prepends its own source-tree csrc to
     # sys.path. Load the explicitly selected nvfp4 build first, so that
     # bookkeeping cannot shadow the compiled extension used for measurement.
     import nvfp4
@@ -294,7 +294,7 @@ def _worker(args: argparse.Namespace) -> int:
     resolved = json.loads(args.resolved.read_text())
     mxfp4_fold_tuner = None
     if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
-        from quant.vllm_integration import mxfp4_fold_tuner
+        from quant.flashinfer_integration import mxfp4_fold_tuner
     trtllm_fp4_utils = (require_dense_ops()
                        if "trtllm_nvfp4_fp8_w4a8" in resolved["arms"] else None)
 
@@ -304,7 +304,7 @@ def _worker(args: argparse.Namespace) -> int:
     from benchmarks.bench_residue_nvfp4 import (assert_gpu_exclusive,
                                                  physical_index, provenance)
     from quant.vllm_integration import residue_linear_op  # noqa: F401
-    from quant.vllm_integration import sm10x_fold_tuner
+    from quant.flashinfer_integration import sm10x_fold_tuner
 
     if torch.cuda.get_device_capability(0) != (10, 0):
         raise RuntimeError("paper suite requires SM100 (B200/Blackwell)")
