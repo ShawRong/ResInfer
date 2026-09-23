@@ -1,9 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'Tensor-parallel sharding for the residue K-extension.'
+'Tensor-parallel sharding for packed FP4 residue K-extensions.'
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -38,6 +38,10 @@ class ResidueShardPlan:
     num_salient: int
     tp_size: int
     tp_rank: int
+    scale_vec_size: int = SF_VEC_SIZE
+    scale_swizzle_blocks: int = SF_SWIZZLE_BLOCKS
+    residue_sf_group_channels: int = RESIDUE_SF_GROUP_CHANNELS
+    k_alignment: int = 1
 
     @property
     def k_ext(self) -> int:
@@ -56,15 +60,26 @@ class ResidueShardPlan:
         """Per-rank extended width. Equals k_ext // tp_size."""
         return self.base_shard + self.salient_shard
 
+    @property
+    def k_padded(self) -> int:
+        return ((self.k_ext + self.k_alignment - 1) // self.k_alignment) * self.k_alignment
+
+    @property
+    def k_shard_padded(self) -> int:
+        return ((self.k_ext_shard + self.k_alignment - 1) // self.k_alignment) * self.k_alignment
+
     def validate(self) -> None:
         """Reject shapes the two-range rule cannot serve, loudly.
 
-        Every constraint here is a real requirement, not defensive padding:
-        an unbalanced salient split would need ragged per-rank shapes, and a
-        boundary off the SF-swizzle grid would slice a scale-factor tile in
-        half.
+        An unbalanced salient split would need ragged per-rank shapes. A
+        boundary off the scale grid would split a quantization scale group.
         """
         tp = self.tp_size
+        if (self.scale_vec_size not in (16, 32)
+                or self.scale_swizzle_blocks <= 0
+                or self.residue_sf_group_channels <= 0
+                or self.k_alignment <= 0):
+            raise ResidueTPError("invalid FP4 scale or K alignment")
         if tp <= 0 or self.tp_rank not in range(tp):
             raise ResidueTPError(f"bad tp_rank={self.tp_rank} for tp_size={tp}")
         if self.k_base % tp:
@@ -83,23 +98,25 @@ class ResidueShardPlan:
                 f"{SALIENT_BLOCK}: ranks would get different salient counts"
             )
         # ...and must not cut a residue scale-factor group in half.
-        if self.base_shard % RESIDUE_SF_GROUP_CHANNELS:
+        if self.base_shard % self.residue_sf_group_channels:
             raise ResidueTPError(
                 f"K_base/tp={self.base_shard} is not a multiple of "
-                f"{RESIDUE_SF_GROUP_CHANNELS}: the boundary would split a "
+                f"{self.residue_sf_group_channels}: the boundary would split a "
                 "residue scale-factor group, so this rank would compute a "
                 "different residue amax than the unsharded model"
             )
         # Both ranges are sliced in scale-factor space too.
-        grid = SF_VEC_SIZE * SF_SWIZZLE_BLOCKS
+        grid = self.scale_vec_size * self.scale_swizzle_blocks
         for name, width in (("K_base/tp", self.base_shard),
                             ("S/tp", self.salient_shard)):
             if width % grid:
                 raise ResidueTPError(
                     f"{name}={width} is not a multiple of {grid}; the "
-                    "swizzled block-scale tile cannot be split there"
+                    "block-scale group cannot be split there"
                 )
         assert self.k_ext_shard * tp == self.k_ext, "K_ext must split evenly"
+        if self.k_padded % self.scale_vec_size or self.k_shard_padded % self.scale_vec_size:
+            raise ResidueTPError("padded K must align with scale groups")
 
     # -- range helpers ----------------------------------------------------
 
@@ -107,8 +124,10 @@ class ResidueShardPlan:
         """(base, salient) ranges as (offset, length), divided by `scale`.
 
         `scale` = 1 for logical channels, 2 for packed FP4 (two nibbles per
-        byte), SF_VEC_SIZE for block scales.
+        byte), or `scale_vec_size` for block scales.
         """
+        if scale <= 0:
+            raise ResidueTPError("scale must be positive")
         for name, v in (("k_base", self.k_base),
                         ("base_shard", self.base_shard),
                         ("salient_shard", self.salient_shard)):
@@ -126,15 +145,25 @@ class ResidueShardPlan:
         """Assemble this rank's shard from the two ranges."""
         (b_off, b_len), (s_off, s_len) = self.ranges(scale)
         want = full.shape[dim]
-        need = (self.k_ext) // scale
+        if self.k_padded % scale or self.k_shard_padded % scale:
+            raise ResidueTPError("padded K is not divisible by scale")
+        need = self.k_padded // scale
         if want != need:
             raise ResidueTPError(
                 f"expected extended dim {need} along dim {dim}, got {want}"
             )
-        return torch.cat(
+        result = torch.cat(
             [full.narrow(dim, b_off, b_len), full.narrow(dim, s_off, s_len)],
             dim=dim,
         )
+        pad = (self.k_shard_padded - self.k_ext_shard) // scale
+        if pad:
+            # FP4 zero has packed code 0; E8M0 code 0 is the producer's
+            # zero-block scale. Input checkpoint padding is discarded.
+            shape = list(result.shape)
+            shape[dim] = pad
+            result = torch.cat((result, result.new_zeros(shape)), dim=dim)
+        return result
 
     # -- runtime state ----------------------------------------------------
 
@@ -177,10 +206,10 @@ def interleave_extended_for_tp(full: torch.Tensor, plan: ResidueShardPlan,
                                scale: int = 1, dim: int = -1) -> torch.Tensor:
     """Reorder ``[base | salient]`` into ``[base_0 | sal_0 | base_1 | ...]``.
 
-    This is the trick that avoids replacing vLLM's weight loader. After the
-    permutation, rank r's *contiguous* range
+    This avoids replacing vLLM's weight loader. After the permutation, rank
+    r's *contiguous* physical range
 
-        [ r*K_ext/tp , (r+1)*K_ext/tp )
+        [ r*K_shard_padded , (r+1)*K_shard_padded )
 
     is exactly the two-range gather it needs. So the loader keeps doing its
     ordinary contiguous narrow and still lands on the right columns -- we
@@ -192,7 +221,7 @@ def interleave_extended_for_tp(full: torch.Tensor, plan: ResidueShardPlan,
     tp = plan.tp_size
     pieces = []
     for r in range(tp):
-        r_plan = ResidueShardPlan(plan.k_base, plan.num_salient, tp, r)
+        r_plan = replace(plan, tp_rank=r)
         pieces.append(r_plan.gather(full, scale=scale, dim=dim))
     return torch.cat(pieces, dim=dim).contiguous()
 
@@ -204,6 +233,10 @@ def plan_from_partition(
     input_size: int,
     num_salient: int,
     tp_rank: int = 0,
+    scale_vec_size: int = SF_VEC_SIZE,
+    scale_swizzle_blocks: int = SF_SWIZZLE_BLOCKS,
+    residue_sf_group_channels: int = RESIDUE_SF_GROUP_CHANNELS,
+    k_alignment: int = 1,
 ) -> ResidueShardPlan | None:
     """Build a shard plan from what vLLM hands `create_weights`.
 
@@ -233,6 +266,10 @@ def plan_from_partition(
         num_salient=num_salient,
         tp_size=tp_size,
         tp_rank=tp_rank,
+        scale_vec_size=scale_vec_size,
+        scale_swizzle_blocks=scale_swizzle_blocks,
+        residue_sf_group_channels=residue_sf_group_channels,
+        k_alignment=k_alignment,
     )
     plan.validate()
     return plan
