@@ -196,8 +196,12 @@ void dispatch(torch::Tensor x,torch::Tensor q,torch::Tensor sf,
   int m=x.size(0),k=x.size(1),kp=q.size(1)*2,rows=q.size(0);
   int padded=swizzle?(rows+127)/128*128:rows;
   dim3 grid(residue&&!masks?padded/2:padded);
+  
+  
+  
+  int threads=(residue&&!masks&&tile8&&m>=64&&(k==4096||k==8192))?k/16:128;
   auto p=reinterpret_cast<T const*>(x.data_ptr());
-  #define LAUNCH(R) fused_quant<T,R><<<grid,128,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,rows,padded,swizzle,tile8,pdl_mode)
+  #define LAUNCH(R) fused_quant<T,R><<<grid,threads,0,stream>>>(p,x.stride(0),x.stride(1),masks,q.data_ptr<uint8_t>(),sf.data_ptr<uint8_t>(),m,k,kp,rows,padded,swizzle,tile8,pdl_mode)
   if(masks) {switch(per8) {case 1:LAUNCH(1);break;case 2:LAUNCH(2);break;case 4:LAUNCH(4);break;}}
   else if(residue) {LAUNCH(8);} else {LAUNCH(0);}
   #undef LAUNCH

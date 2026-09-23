@@ -51,10 +51,12 @@ def test_quant_mext():
     np.testing.assert_array_equal(ps[1::2].cpu(), err_s)
 
 
-@pytest.mark.parametrize("m,pad_multiple", [(1, 8), (7, 64), (8, 8), (9, 8), (128, 8)])
-def test_quant_mext_tile8_matches_row_pair(m, pad_multiple):
+@pytest.mark.parametrize("m,pad_multiple,k", [
+    (1, 8, 4096), (7, 64, 4096), (8, 8, 4096), (9, 8, 4096),
+    (128, 8, 4096), (128, 8, 8192),
+])
+def test_quant_mext_tile8_matches_row_pair(m, pad_multiple, k):
     torch.manual_seed(109 + m)
-    k = 4096
     x = torch.randn((m, k), device="cuda", dtype=torch.bfloat16)
     row_q, row_sf = quantize_mext(x)
     tile_q, tile_sf = quantize_mext(
