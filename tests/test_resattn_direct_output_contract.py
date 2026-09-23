@@ -57,27 +57,58 @@ class DirectOutputContractTests(unittest.TestCase):
                 exec(code, dict(direct_output=direct, reduction=reduction, out_eff=out))
                 self.assertEqual(out.zero_.call_count, int(direct and reduction == 'none'))
 
-    def test_compact_gqa4_auto_plan_stays_on_supported_no_split_path(self):
+    def test_compact_gqa4_auto_plan_uses_only_supported_reductions(self):
         tree = ast.parse(HOST.read_text())
         fn = next(
             node for node in tree.body
             if isinstance(node, ast.FunctionDef)
             and node.name == 'plan_qmul4_decode_nvfp4'
         )
+        helpers = [
+            node for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in (
+                '_npo2', '_padded_group_size', '_residue_padded_group_size'
+            )
+        ]
         namespace = {
             'Tuple': tuple,
-            '_padded_group_size': lambda qo, kv: 8 if qo // kv == 4 else 16,
-            '_auto_splits_qmul4': lambda *args: (_ for _ in ()).throw(
-                AssertionError('GQA4 must return before the Q16 planner')),
+            'GQA_TILE_N': 16,
+            'RESIDUE_GQA_GROUPS': (4, 6, 8),
+            '_auto_splits_qmul4': lambda *args: (1, 'none'),
             '_sm_count': lambda device: 132,
             'QMUL4_KERNEL_REDUCTION_MIN_SEQ': 32768,
         }
-        exec(compile(ast.Module(body=[fn], type_ignores=[]), '<planner>', 'exec'),
+        exec(compile(ast.Module(body=helpers + [fn], type_ignores=[]), '<planner>', 'exec'),
              namespace)
         plan = namespace['plan_qmul4_decode_nvfp4']
-        for batch, sequence in ((8, 1025), (8, 4103), (1, 32768)):
+        for batch, sequence in ((8, 1025), (8, 4103)):
             with self.subTest(batch=batch, sequence=sequence):
                 self.assertEqual(plan(batch, 32, 8, sequence, 'cuda'), (1, 'none'))
+        self.assertEqual(plan(1, 32, 8, 32768, 'cuda'), (16, 'gmem_fused'))
+        for batch, sequence, expected in (
+            (1, 1025, (1, 'none')),
+            (1, 4096, (4, 'gmem_fused')),
+            (1, 4103, (4, 'gmem_fused')),
+            (1, 8192, (8, 'gmem_fused')),
+            (1, 16384, (16, 'gmem_fused')),
+            (8, 4103, (1, 'none')),
+            (8, 8191, (1, 'none')),
+            (8, 8192, (2, 'kernel')),
+            (8, 32768, (2, 'kernel')),
+            (64, 32768, (1, 'none')),
+        ):
+            with self.subTest(batch=batch, sequence=sequence, residue_fold=True):
+                self.assertEqual(
+                    plan(batch, 32, 8, sequence, 'cuda', residue_fold=True),
+                    expected,
+                )
+        # Q16 can also produce a two-SM wave at B8/Hkv8. The fused reducer
+        # rejects split2, so the auto plan must fall back to one CTA.
+        self.assertEqual(
+            plan(8, 64, 8, 4096, 'cuda', residue_fold=True),
+            (1, 'none'),
+        )
 
 
 if __name__ == '__main__':

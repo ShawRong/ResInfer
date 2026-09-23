@@ -23,9 +23,9 @@ class ResAttnE2EPlanTests(unittest.TestCase):
 
     def test_identical_model_and_common_cli(self):
         p = self.plan()
-        a, b = [p["arms"][k]["server_argv"] for k in ("trt", "resattn")]
-        self.assertEqual(a[:-1], b[:-1])
-        self.assertEqual((a[-1], b[-1]), ("FLASHINFER", "CUSTOM"))
+        a, b = [p["arms"][k]["server_argv"] for k in ("stock", "resattn")]
+        self.assertEqual(a + ["--attention-backend", "CUSTOM"], b)
+        self.assertNotIn("--attention-backend", a)
         self.assertEqual(p["status"], "PLAN_ONLY_NOT_RUN")
 
     def test_clean_attention_only_environment(self):
@@ -39,11 +39,17 @@ class ResAttnE2EPlanTests(unittest.TestCase):
                          "RESIDUE_ATTN_PREFILL_BF16", "NVFP4_TEST_OVERRIDE"):
                 self.assertIn(name, arm["env_unset"])
                 self.assertNotIn(name, arm["env_set"])
-        self.assertNotIn("RESIDUE_ATTN", p["arms"]["trt"]["env_set"])
+        self.assertNotIn("RESIDUE_ATTN", p["arms"]["stock"]["env_set"])
 
-    def test_reject_nonresidue_geometry(self):
-        with self.assertRaisesRegex(ValueError, "GQA8"):
-            self.plan(config={"num_attention_heads": 32})
+    def test_accept_gqa4_gqa6_gqa8_only(self):
+        for heads in (32, 48, 64):
+            with self.subTest(heads=heads):
+                self.assertEqual(
+                    self.plan(config={"num_attention_heads": heads})["geometry"]["q_heads"],
+                    heads,
+                )
+        with self.assertRaisesRegex(ValueError, "GQA4/6/8"):
+            self.plan(config={"num_attention_heads": 40})
 
     def test_no_implicit_context_extension(self):
         with self.assertRaisesRegex(ValueError, "context limit"):
@@ -82,9 +88,11 @@ class ResAttnE2EPlanTests(unittest.TestCase):
         p = self.plan(kv_cache_bytes=85899345920, attn_quant_fusion=True)
         for arm in p["arms"].values():
             argv = arm["server_argv"]
-            self.assertEqual(argv[argv.index("--kv-cache-memory") + 1], "85899345920")
+            self.assertEqual(argv[argv.index("--kv-cache-memory-bytes") + 1],
+                             "85899345920")
             config = json.loads(argv[argv.index("--compilation-config") + 1])
             self.assertTrue(config["pass_config"]["fuse_attn_quant"])
+        self.assertEqual(p["output_contract"], "nvfp4")
         with self.assertRaises(ValueError):
             self.plan(eager=True, attn_quant_fusion=True)
 

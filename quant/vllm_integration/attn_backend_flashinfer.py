@@ -16,6 +16,7 @@ from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     nvfp4_split_data_scale,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dynamic
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferBackend,
@@ -28,6 +29,8 @@ from vllm.v1.attention.backends.flashinfer import (
 from .attn_backend import (
     NvFp4PagedKVPool,
     ResAttnImpl,
+    _load_decode_kernel,
+    _qk_residue_for_geometry,
     _register_decode_warmup,
 )
 
@@ -151,10 +154,11 @@ class ResAttnFlashInferImpl(FlashInferImpl):
         _register_decode_warmup(self.num_heads, self.num_kv_heads, self.head_size)
 
     def fused_output_quant_supported(self, quant_key):
-        return False
+        return bool(self.is_kvcache_nvfp4 and quant_key == kNvfp4Dynamic)
 
     _get_decode_reduction_workspace = ResAttnImpl._get_decode_reduction_workspace
     _decode_forward = ResAttnImpl._decode_forward
+    _decode_forward_nvfp4 = ResAttnImpl._decode_forward_nvfp4
 
     def _pool_for(self, kv_cache, layer):
         key = (kv_cache.data_ptr(), tuple(kv_cache.shape), kv_cache.stride(),
@@ -180,12 +184,15 @@ class ResAttnFlashInferImpl(FlashInferImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
-        if output_scale is not None or output_block_scale is not None:
-            raise NotImplementedError("Initial stock-aligned adapter uses BF16 output")
+        fused_nvfp4 = output_scale is not None
+        if fused_nvfp4 != (output_block_scale is not None):
+            raise ValueError("NVFP4 attention output requires data and block scales")
         if attn_metadata is None:
             return output.fill_(0)
-        if query.dtype != torch.bfloat16 or output.dtype != torch.bfloat16:
-            raise ValueError("ResAttn needs original BF16 Q and BF16 output, not FP8 Q")
+        if query.dtype != torch.bfloat16:
+            raise ValueError("ResAttn needs original BF16 Q, not FP8 Q")
+        if output.dtype != (torch.uint8 if fused_nvfp4 else torch.bfloat16):
+            raise ValueError("ResAttn output dtype does not match fusion mode")
         md = attn_metadata
         if md.num_prefill_tokens:
             if md.stock is None:
@@ -193,11 +200,44 @@ class ResAttnFlashInferImpl(FlashInferImpl):
             # vLLM already invoked the inherited stock cache writer exactly
             # once. Delegate the complete step: pure prefill stays identical
             # to stock and mixed continuous batching is a correctness fallback.
-            return super().forward(layer, query, key, value, kv_cache,
-                                   md.stock, output)
+            if not fused_nvfp4:
+                return super().forward(layer, query, key, value, kv_cache,
+                                       md.stock, output)
+            stock_output = torch.empty_like(query, dtype=torch.bfloat16)
+            super().forward(layer, query, key, value, kv_cache,
+                            md.stock, stock_output)
+            n = md.num_actual_tokens
+            torch.ops._C.scaled_fp4_quant.out(
+                input=stock_output[:n].reshape(n, self.num_heads * self.head_size),
+                input_scale=output_scale,
+                is_sf_swizzled_layout=True,
+                output=output[:n].reshape(n, self.num_heads * self.head_size // 2),
+                output_scale=output_block_scale.view(torch.int32),
+            )
+            return output
         if md.residue_decode is not None:
-            self._decode_forward(query, key, value, self._pool_for(kv_cache, layer),
-                                 md.residue_decode, output)
+            pool = self._pool_for(kv_cache, layer)
+            if fused_nvfp4:
+                host = _load_decode_kernel()
+                if host is None:
+                    raise RuntimeError("ResAttn NVFP4 decode kernel unavailable")
+                plan = host.plan_qmul4_decode_nvfp4(
+                    md.residue_decode.num_decode_tokens,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    md.residue_decode.max_seq_len,
+                    query.device,
+                    residue_fold=_qk_residue_for_geometry(
+                        self.num_heads, self.num_kv_heads
+                    ),
+                )
+                self._decode_forward_nvfp4(
+                    query, pool, md.residue_decode, output,
+                    output_scale, output_block_scale, host, plan,
+                )
+            else:
+                self._decode_forward(query, key, value, pool,
+                                     md.residue_decode, output)
         return output
 
 

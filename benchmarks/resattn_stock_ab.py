@@ -1,0 +1,369 @@
+"""Reproducible stock TRT-LLM versus ResAttn decode serving-chain probe.
+
+Both arms read identical HND NVFP4 KV bytes and start with the same BF16 Q.
+The output contract is selected by --output-contract: BF16 matches the
+current real-model E2E path; NVFP4 measures the prospective fused path.
+This is a synthetic decode-chain experiment, not an engine throughput result.
+
+Select an idle GPU with CUDA_VISIBLE_DEVICES and provide a checksum-verified
+FLASHINFER_CUBIN_DIR before running. Results include raw interleaved samples
+and a stock/stock A/A control. No base-only ResAttn arm is used.
+"""
+from __future__ import annotations
+
+import argparse
+import importlib.metadata
+import json
+import math
+import os
+import statistics
+
+import torch
+from flashinfer.decode import trtllm_batch_decode_with_kv_cache
+from nvfp4.cute_attn.append import quantize_paged_trtllm_format
+from nvfp4.cute_attn import host
+from nvfp4.cute_attn.kv_layout import NvFp4PagedKVPool
+from vllm import envs
+from vllm._custom_ops import scaled_fp8_quant
+
+
+def unpack_nvfp4(data: torch.Tensor, scales: torch.Tensor, heads: int,
+                 dim: int) -> torch.Tensor:
+    """Decode the vLLM/CUTLASS 128x4 scale layout for validation only."""
+    batch = data.shape[0]
+    packed = data.reshape(batch, heads, dim // 2).to(torch.int32)
+    nibbles = torch.stack((packed & 15, packed >> 4), dim=-1).reshape(
+        batch, heads, dim)
+    lut = torch.tensor((0., .5, 1., 1.5, 2., 3., 4., 6.), device=data.device)
+    values = lut[nibbles & 7] * torch.where((nibbles & 8) == 0, 1., -1.)
+    blocks = heads * dim // 16
+    k_idx = torch.arange(blocks, device=data.device)
+    rows = torch.arange(batch, device=data.device)
+    sf_offsets = (
+        (rows[:, None] // 128 * math.ceil(blocks / 4)
+         + k_idx[None, :] // 4) * 512
+        + rows[:, None] % 32 * 16
+        + (rows[:, None] // 32) % 4 * 4
+        + k_idx[None, :] % 4
+    )
+    sf = scales.reshape(-1)[sf_offsets].float().reshape(batch, heads, dim // 16)
+    return (values.reshape(batch, heads, dim // 16, 16) * sf[..., None]).reshape(
+        batch, heads, dim)
+
+
+def capture(call, warmups: int) -> torch.cuda.CUDAGraph:
+    for _ in range(warmups):
+        call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        call()
+    graph.replay()
+    torch.cuda.synchronize()
+    return graph
+
+
+def sample(graph: torch.cuda.CUDAGraph, iterations: int) -> float:
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(
+        enable_timing=True)
+    start.record()
+    for _ in range(iterations):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000 / iterations
+
+
+def run(args: argparse.Namespace) -> dict:
+    if args.batch < 1 or args.seq < 1 or args.iterations < 1:
+        raise ValueError("batch, seq and iterations must be positive")
+    if args.repeats < 2 or args.warmups < 0:
+        raise ValueError("repeats must be at least 2 and warmups nonnegative")
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda:0")
+    batch, kv_heads, dim = args.batch, 8, 128
+    heads = kv_heads * args.gqa
+    width = math.ceil(args.seq / 128)
+    pages = batch * width
+    block_tables = torch.arange(pages, dtype=torch.int32, device=device).reshape(
+        batch, width)
+    kv_indices = block_tables.reshape(-1)
+    kv_indptr = torch.arange(batch + 1, dtype=torch.int32, device=device) * width
+    seq_lens = torch.full((batch,), args.seq, dtype=torch.int32, device=device)
+    k = torch.randn(batch, args.seq, kv_heads, dim,
+                    dtype=torch.bfloat16, device=device)
+    v = torch.randn_like(k)
+    k_data, k_sf, v_data, v_sf, k_deq, v_deq = (
+        quantize_paged_trtllm_format(
+            k, v, seq_lens, kv_indices, kv_indptr, pages))
+    del k, v
+    if not (args.reference_worst_head or args.reference_all_heads):
+        del k_deq, v_deq
+    q = torch.randn(batch, heads, dim, dtype=torch.bfloat16, device=device)
+    pool = NvFp4PagedKVPool(
+        num_kv_heads=kv_heads, head_dim=dim, k_data=k_data, v_data=v_data,
+        k_sf=k_sf, v_sf=v_sf,
+        v_staging=torch.empty(0, dtype=torch.bfloat16, device=device),
+        page_size=128, layout_profile="trtllm", k_global_scale=1.,
+        v_global_scale=1.)
+    output_scale_inv = torch.ones(1, dtype=torch.float32, device=device)
+    q_scale = torch.ones(1, dtype=torch.float32, device=device)
+    nvfp4_output = args.output_contract == "nvfp4"
+    auto_plan = (
+        host.plan_qmul4_decode_nvfp4(
+            batch, heads, kv_heads, args.seq, device, residue_fold=True)
+        if nvfp4_output else
+        host.plan_qmul4_decode(batch, kv_heads, args.seq, device)
+    )
+    if args.plan == "auto":
+        plan = auto_plan
+    else:
+        split_count, reduction = args.plan.split("/", maxsplit=1)
+        plan = int(split_count), reduction
+    physical_gqa = 8 if args.gqa == 4 else 16
+    work = None
+    if plan[1] == "gmem_fused":
+        work = host.allocate_qmul4_gmem_reduction_workspace(
+            plan[0], batch, kv_heads * physical_gqa, dim, device)
+    elif plan[1] == "kernel":
+        work = host.allocate_qmul4_reduction_workspace(
+            plan[0], batch, kv_heads * physical_gqa, dim, device)
+    elif plan != (1, "none") and not (
+            not nvfp4_output and plan[1] == "atomic"):
+        raise RuntimeError(f"unsupported direct output plan: {plan}")
+
+    stock_output = (host.allocate_nvfp4_attention_output(
+        batch, heads, dim, device) if nvfp4_output else None)
+    res_output = (host.allocate_nvfp4_attention_output(batch, heads, dim, device)
+                  if nvfp4_output else torch.empty_like(q))
+    fp8_q = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    fp8_o = torch.empty_like(q, dtype=torch.float8_e4m3fn)
+    bf16_o = torch.empty_like(q)
+    stock_work = torch.zeros(envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE,
+                             dtype=torch.uint8, device=device)
+
+    def stock() -> None:
+        scaled_fp8_quant(q.reshape(batch, heads * dim), scale=q_scale,
+                         output=fp8_q.reshape(batch, heads * dim),
+                         group_shape=(-1, -1))
+        trtllm_batch_decode_with_kv_cache(
+            query=fp8_q, kv_cache=(k_data, v_data),
+            workspace_buffer=stock_work, block_tables=block_tables,
+            seq_lens=seq_lens, max_seq_len=args.seq, bmm1_scale=dim ** -.5,
+            bmm2_scale=1., kv_cache_sf=(k_sf, v_sf), out=fp8_o,
+            backend="trtllm-gen", kv_layout="HND", q_len_per_req=1)
+        bf16_o.copy_(fp8_o)
+        if nvfp4_output:
+            data, scales = stock_output
+            torch.ops._C.scaled_fp4_quant.out(
+                bf16_o.reshape(batch, heads * dim), output_scale_inv, True,
+                output=data, output_scale=scales.view(torch.int32))
+
+    def resattn() -> None:
+        if nvfp4_output:
+            host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
+                q, pool, v_data, v_sf, kv_indices, kv_indptr, seq_lens,
+                dim ** -.5, output_scale_inv, out=res_output[0],
+                output_block_scale=res_output[1], max_seq_len=args.seq,
+                k_sf_mode="linear", value_scale=1., reduction_workspace=work,
+                plan=plan, residue_fold=True)
+        else:
+            host.run_paged_fp4_decode_qmul4_tmem(
+                q, pool, v_data, v_sf, kv_indices, kv_indptr, seq_lens,
+                dim ** -.5, out=res_output, max_seq_len=args.seq,
+                k_sf_mode="linear", value_scale=1., reduction_workspace=work,
+                plan=plan, residue_fold=True, direct_output=True)
+
+    calls = {"stock0": stock, "resattn": resattn, "stock1": stock}
+    stock()
+    stock_snapshot = ((stock_output[0].clone(), stock_output[1].clone())
+                      if nvfp4_output else bf16_o.clone())
+    resattn()
+    stock()
+    torch.cuda.synchronize()
+    stock_value = (unpack_nvfp4(*stock_output, heads, dim)
+                   if nvfp4_output else bf16_o.float())
+    res_value = (unpack_nvfp4(*res_output, heads, dim)
+                 if nvfp4_output else res_output.float())
+    cos = torch.nn.functional.cosine_similarity(
+        stock_value.float(), res_value.float(), dim=-1)
+    min_cos = float(cos.min())
+    median_cos = float(cos.median())
+    rms_error = float((stock_value.float() - res_value.float()).square().mean().sqrt())
+    stock_rms = float(stock_value.float().square().mean().sqrt())
+    reference_diagnostic = None
+    if args.reference_worst_head or args.reference_all_heads:
+        flat_index = int(cos.argmin())
+        batch_index, head_index = divmod(flat_index, heads)
+        kv_head = head_index // args.gqa
+        scores = torch.mv(k_deq[batch_index, :, kv_head],
+                          q[batch_index, head_index].float()) * (dim ** -.5)
+        reference = torch.softmax(scores, dim=0) @ v_deq[
+            batch_index, :, kv_head]
+        stock_head = stock_value[batch_index, head_index].float()
+        res_head = res_value[batch_index, head_index].float()
+        ref_norm = float(reference.square().mean().sqrt())
+        reference_diagnostic = {
+            "batch_index": batch_index, "head_index": head_index,
+            "kv_head_index": kv_head, "reference_rms": ref_norm,
+            "stock_cosine_to_reference": float(
+                torch.nn.functional.cosine_similarity(stock_head, reference,
+                                                      dim=0)),
+            "resattn_cosine_to_reference": float(
+                torch.nn.functional.cosine_similarity(res_head, reference,
+                                                      dim=0)),
+            "stock_rms_error_to_reference": float(
+                (stock_head - reference).square().mean().sqrt()),
+            "resattn_rms_error_to_reference": float(
+                (res_head - reference).square().mean().sqrt()),
+        }
+    if args.reference_all_heads:
+        q_groups = q.view(batch, kv_heads, args.gqa, dim).float()
+        full_reference = torch.empty(batch, kv_heads, args.gqa, dim,
+                                     dtype=torch.float32, device=device)
+        for kv_head in range(kv_heads):
+            scores = torch.bmm(
+                q_groups[:, kv_head],
+                k_deq[:, :, kv_head].transpose(1, 2)) * (dim ** -.5)
+            full_reference[:, kv_head] = torch.bmm(
+                torch.softmax(scores, dim=-1), v_deq[:, :, kv_head])
+        full_reference = full_reference.reshape(batch, heads, dim)
+        stock_to_ref = torch.nn.functional.cosine_similarity(
+            stock_value.float(), full_reference, dim=-1)
+        res_to_ref = torch.nn.functional.cosine_similarity(
+            res_value.float(), full_reference, dim=-1)
+        reference_diagnostic["all_heads"] = {
+            "stock_min_cosine": float(stock_to_ref.min()),
+            "stock_median_cosine": float(stock_to_ref.median()),
+            "resattn_min_cosine": float(res_to_ref.min()),
+            "resattn_median_cosine": float(res_to_ref.median()),
+            "stock_rms_error": float((stock_value.float() - full_reference)
+                                     .square().mean().sqrt()),
+            "resattn_rms_error": float((res_value.float() - full_reference)
+                                       .square().mean().sqrt()),
+            "reference_rms": float(full_reference.square().mean().sqrt()),
+        }
+    if args.reference_all_heads:
+        all_heads = reference_diagnostic["all_heads"]
+        if args.reference_gate_arm == "resattn":
+            relative_rms = (all_heads["resattn_rms_error"] /
+                            all_heads["reference_rms"]
+                            if all_heads["reference_rms"] > 0 else float("inf"))
+            correctness_gate = {
+                "kind": "resattn_vs_dequantized_kv_reference",
+                "min_cosine": args.reference_min_cosine,
+                "min_median_cosine": args.reference_min_median_cosine,
+                "max_relative_rms": args.reference_max_relative_rms,
+                "observed_relative_rms": relative_rms,
+            }
+            failed = (
+                all_heads["resattn_min_cosine"] < args.reference_min_cosine or
+                all_heads["resattn_median_cosine"] <
+                args.reference_min_median_cosine or
+                relative_rms > args.reference_max_relative_rms
+            )
+        else:
+            correctness_gate = {
+                "kind": "both_arms_vs_dequantized_kv_reference",
+                "min_cosine": args.reference_min_cosine,
+            }
+            failed = min(all_heads["stock_min_cosine"],
+                         all_heads["resattn_min_cosine"]) < args.reference_min_cosine
+    else:
+        correctness_gate = {"kind": "cross_arm", "min_cosine": args.min_cosine}
+        failed = min_cos < args.min_cosine
+    if not bool(torch.isfinite(res_value).all()) or failed:
+        print(json.dumps({"status": "CORRECTNESS_FAILED",
+                          "min_cross_cosine": min_cos,
+                          "median_cross_cosine": median_cos,
+                          "rms_error": rms_error, "stock_rms": stock_rms,
+                          "reference_diagnostic": reference_diagnostic,
+                          "correctness_gate": correctness_gate},
+                         sort_keys=True), flush=True)
+        raise RuntimeError(
+            f"cross-arm correctness failed: min_cosine={min_cos} "
+            f"median_cosine={median_cos} rms_error={rms_error} "
+            f"stock_rms={stock_rms}")
+    if ((nvfp4_output and not (
+            torch.equal(stock_snapshot[0], stock_output[0]) and
+            torch.equal(stock_snapshot[1], stock_output[1]))) or
+            (not nvfp4_output and not torch.equal(stock_snapshot, bf16_o))):
+        raise RuntimeError("stock A/A outputs differ")
+    stock_graph = capture(stock, args.warmups)
+    resattn_graph = capture(resattn, args.warmups)
+    # The two A/A samples replay the exact same stock graph and allocations.
+    # Separate captures can differ systematically even with identical calls.
+    graphs = {"stock0": stock_graph, "resattn": resattn_graph,
+              "stock1": stock_graph}
+    raw = {name: [] for name in calls}
+    forward = tuple(calls)
+    for repeat in range(args.repeats):
+        order = forward if repeat % 2 == 0 else tuple(reversed(forward))
+        for name in order:
+            raw[name].append(sample(graphs[name], args.iterations))
+    medians = {name: statistics.median(values) for name, values in raw.items()}
+    return {
+        "status": "SYNTHETIC_CHAIN_OK", "gqa": args.gqa,
+        "output_contract": args.output_contract,
+        "batch": batch, "seq": args.seq, "kv_heads": kv_heads, "dim": dim,
+        "seed": args.seed, "plan": list(plan), "auto_plan": list(auto_plan),
+        "min_cross_cosine": min_cos,
+        "median_cross_cosine": median_cos, "rms_error": rms_error,
+        "stock_rms": stock_rms,
+        "reference_diagnostic": reference_diagnostic,
+        "correctness_gate": correctness_gate,
+        "iterations": args.iterations, "repeats": args.repeats,
+        "raw_us": raw, "median_us": medians,
+        "stock_over_resattn": medians["stock0"] / medians["resattn"],
+        "stock_aa_ratio": medians["stock0"] / medians["stock1"],
+        "scope": f"BF16 Q to {args.output_contract} attention output, synthetic KV",
+        "peak_allocated_bytes": torch.cuda.max_memory_allocated(device),
+        "runtime": {
+            "torch": torch.__version__, "cuda": torch.version.cuda,
+            "vllm": importlib.metadata.version("vllm"),
+            "flashinfer_python": importlib.metadata.version("flashinfer-python"),
+            "gpu_name": torch.cuda.get_device_name(device),
+            "gpu_capability": list(torch.cuda.get_device_capability(device)),
+            "flashinfer_cubin_dir": os.getenv("FLASHINFER_CUBIN_DIR"),
+        },
+    }
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--gqa", type=int, choices=(4, 6), required=True)
+    ap.add_argument("--output-contract", choices=("bf16", "nvfp4"),
+                    default="nvfp4")
+    ap.add_argument("--batch", type=int, required=True)
+    ap.add_argument("--seq", type=int, required=True)
+    ap.add_argument("--seed", type=int, default=17)
+    ap.add_argument("--iterations", type=int, default=30)
+    ap.add_argument("--repeats", type=int, default=6)
+    ap.add_argument("--warmups", type=int, default=3)
+    ap.add_argument("--min-cosine", type=float, default=.97)
+    ap.add_argument("--reference-worst-head", action="store_true",
+                    help="compare the lowest cross-cosine head to dequantized-KV BF16-Q reference")
+    ap.add_argument("--reference-all-heads", action="store_true",
+                    help="compare every head to dequantized-KV BF16-Q reference")
+    ap.add_argument("--reference-min-cosine", type=float, default=.98,
+                    help="minimum per-head cosine for each arm against independent reference")
+    ap.add_argument("--reference-gate-arm", choices=("both", "resattn"),
+                    default="both")
+    ap.add_argument("--reference-min-median-cosine", type=float,
+                    default=.98)
+    ap.add_argument("--reference-max-relative-rms", type=float,
+                    default=.15)
+    ap.add_argument("--plan", choices=("auto", "1/none", "2/kernel",
+                                         "4/gmem_fused", "8/gmem_fused",
+                                         "16/gmem_fused"),
+                    default="auto")
+    args = ap.parse_args()
+    if (not 0 < args.reference_min_cosine <= 1 or
+            not 0 < args.reference_min_median_cosine <= 1 or
+            args.reference_max_relative_rms <= 0):
+        ap.error("reference thresholds must be positive and cosines at most 1")
+    print(json.dumps(run(args), sort_keys=True), flush=True)
+
+
+if __name__ == "__main__":
+    main()

@@ -1147,12 +1147,16 @@ class ResAttnImpl(AttentionImpl[ResAttnMetadata]):
                 raise RuntimeError(
                     "[residue] ResAttn decode kernel unavailable for fused output"
                 )
+            qk_residue = _qk_residue_for_geometry(
+                self.num_heads, self.num_kv_heads
+            )
             direct_plan = host.plan_qmul4_decode_nvfp4(
                 num_dec,
                 self.num_heads,
                 self.num_kv_heads,
                 md.max_seq_len,
                 q_all.device,
+                residue_fold=qk_residue,
             )
             direct_nvfp4 = direct_plan[1] in (
                 "none",

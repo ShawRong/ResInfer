@@ -21,8 +21,8 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
     cfg = config.get("text_config", config)
     hq, hkv = cfg["num_attention_heads"], cfg["num_key_value_heads"]
     dim = cfg.get("head_dim", cfg["hidden_size"] // hq)
-    if dim != 128 or hq != 8 * hkv:
-        raise ValueError("current QK-residue dispatch requires D128 and GQA8")
+    if hkv <= 0 or hq % hkv or dim != 128 or hq // hkv not in (4, 6, 8):
+        raise ValueError("QK-residue dispatch requires D128 and GQA4/6/8")
     if hq % tp or hkv % tp:
         raise ValueError("this initial experiment requires TP to divide Q/KV heads")
     devices = gpu.split(",")
@@ -50,7 +50,7 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
     if eager:
         common.append("--enforce-eager")
     if kv_cache_bytes is not None:
-        common += ["--kv-cache-memory", str(kv_cache_bytes)]
+        common += ["--kv-cache-memory-bytes", str(kv_cache_bytes)]
     if attn_quant_fusion:
         common += ["--compilation-config", json.dumps(
             {"pass_config": {"fuse_attn_quant": True}})]
@@ -68,14 +68,17 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
     unset = sorted(set(unset + ["VLLM_PLUGINS", "VLLM_ATTENTION_BACKEND",
                                "VLLM_BATCH_INVARIANT"]))
     arms = {}
-    for arm, backend in (("trt", "FLASHINFER"), ("resattn", "CUSTOM")):
+    for arm in ("stock", "resattn"):
         env = dict(common_env)
         if arm == "resattn":
             env.update(RESIDUE_ATTN="1", RESIDUE_ATTN_REDUCTION="auto")
             if not eager:
                 env["RESIDUE_ATTN_CUDAGRAPH"] = "1"
         arms[arm] = {"env_set": env, "env_unset": unset,
-                     "server_argv": common + ["--attention-backend", backend]}
+                     "server_argv": (
+                         common + ["--attention-backend", "CUSTOM"]
+                         if arm == "resattn" else list(common)
+                     )}
     bench = [python, "-m", "vllm.entrypoints.cli.main", "bench", "serve",
              "--backend", "vllm", "--base-url", "http://127.0.0.1:8123",
              "--model", "resattn-e2e", "--tokenizer", model,
@@ -84,24 +87,29 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
              "--num-prompts", str(max(32, concurrency * 8)),
              "--num-warmups", "8",
              "--max-concurrency", str(concurrency), "--request-rate", "inf",
-             "--ignore-eos", "--seed", "17", "--save-result", "--save-detailed",
+             "--ignore-eos", "--temperature", "0", "--seed", "17",
+             "--save-result", "--save-detailed",
              "--percentile-metrics", "ttft,tpot,itl,e2el"]
     return {
         "status": "PLAN_ONLY_NOT_RUN", "model": model,
         "model_config_sha256": hashlib.sha256(
             json.dumps(config, sort_keys=True).encode()).hexdigest(),
         "geometry": {"head_dim": dim, "q_heads": hq, "kv_heads": hkv},
+        "output_contract": "nvfp4" if attn_quant_fusion else "bf16",
         "mode": "eager_smoke" if eager else "graph_candidate_after_smoke",
         "arms": arms, "benchmark_argv": bench,
-        "round_orders": [["trt", "resattn"], ["resattn", "trt"]] * 2,
+        "round_orders": [["stock", "resattn"], ["resattn", "stock"]] * 2,
         "launch_requirements": [
             "Explicit model/task selection and freshly verified free GPU ownership",
             "Isolated validated Runtime, project plugin and hashed source snapshot",
+            "Confirm the residue-vllm-plugin entry point exists in spawned workers",
             "Unset all RESIDUE_*/NVFP4_* vars at execution time before env_set",
             "Inspect other inherited vLLM overrides; keep identical across arms",
             "Verify installed CLI flags before launch; this file does not execute",
-            "Diagnostic proof of TRT decode and CUSTOM QK residue engagement",
-            "Both arms use TRT FP4 context; verify output fusion and graph replay",
+            "Record the actual vLLM-selected stock backend and kernel, not an assumed TRT label",
+            "Diagnostic proof of stock decode and CUSTOM QK residue engagement",
+            "Both arms use stock FP4 context; verify output fusion and graph replay",
+            "For NVFP4 output, verify the downstream O-projection consumes packed data and scales",
             "Fix equal KV capacity before formal A/B; log capacity/preemptions",
             "Warm up outside timed requests; record actual batch/length distribution",
             "Use fresh per-round result directories; run arms sequentially",

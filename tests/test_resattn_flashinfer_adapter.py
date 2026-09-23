@@ -4,7 +4,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 HAS_RUNTIME = all(importlib.util.find_spec(m) for m in ("torch", "vllm"))
 if HAS_RUNTIME:
@@ -43,6 +43,7 @@ class AdapterTests(unittest.TestCase):
             impl = adapter.ResAttnFlashInferImpl()
         self.assertFalse(impl.supports_quant_query_input)
         self.assertFalse(impl.fused_output_quant_supported(None))
+        self.assertTrue(impl.fused_output_quant_supported(adapter.kNvfp4Dynamic))
 
     def test_constructor_accepts_supported_gqa_ratios(self):
         def fake_init(obj):
@@ -182,6 +183,28 @@ class AdapterTests(unittest.TestCase):
         stock_forward.assert_not_called()
         self.assertIs(result, output)
         self.assertTrue((output == 1).all())
+
+    def test_fused_pure_decode_uses_packed_output_and_physical_plan(self):
+        impl = adapter.ResAttnFlashInferImpl.__new__(adapter.ResAttnFlashInferImpl)
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 32, 8, 128
+        q = torch.zeros(2, 32, 128, dtype=torch.bfloat16)
+        output = torch.empty(2, 32 * 128 // 2, dtype=torch.uint8)
+        output_scale = torch.ones(1, dtype=torch.float32)
+        block_scale = torch.empty(128, 256, dtype=torch.float8_e4m3fn)
+        decode_md = SimpleNamespace(num_decode_tokens=2, max_seq_len=8192)
+        md = SimpleNamespace(num_prefill_tokens=0, residue_decode=decode_md)
+        host = SimpleNamespace(plan_qmul4_decode_nvfp4=Mock(return_value=(4, 'gmem_fused')))
+        with patch.object(adapter, '_load_decode_kernel', return_value=host), \
+             patch.object(impl, '_pool_for', return_value=object()), \
+             patch.object(impl, '_decode_forward_nvfp4') as decode, \
+             patch.object(adapter.FlashInferImpl, 'forward') as stock:
+            result = impl.forward(object(), q, q, q, object(), md,
+                                  output, output_scale, block_scale)
+        self.assertIs(result, output)
+        host.plan_qmul4_decode_nvfp4.assert_called_once_with(
+            2, 32, 8, 8192, q.device, residue_fold=True)
+        self.assertEqual(decode.call_args.args[-1], (4, 'gmem_fused'))
+        stock.assert_not_called()
 
     def test_prefill_build_never_touches_decode_pages(self):
         with patch.object(adapter.FlashInferMetadataBuilder, 'build',
