@@ -2,6 +2,8 @@
 """SM100 MXFP4 loading for explicit ModelOpt packed checkpoints."""
 from __future__ import annotations
 
+import os
+
 import torch
 from torch.nn import Parameter
 
@@ -118,16 +120,41 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
 
         n = sum(output_partition_sizes)
         k = input_size_per_partition
-        if input_size != k or output_size != n:
-            raise ValueError("MXFP4 linear currently supports unsharded/TP1 weights only")
         if params_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("MXFP4 output dtype must be fp16 or bf16")
         if k <= 0 or k % 128 or n <= 0 or n % 32:
-            raise ValueError("MXFP4 linear requires positive K%128==0 and N%32==0")
+            raise ValueError("MXFP4 rank-local linear requires positive K%128==0 and N%32==0")
         validate_layer(self.spec)
-        if (k, n) != (self.spec["input_size"], self.spec["output_size"]):
+        if (input_size, output_size) != (
+            self.spec["input_size"], self.spec["output_size"]
+        ):
             raise ValueError("checkpoint dimensions do not match this runtime linear")
+        row_parallel = k != input_size
+        column_parallel = n != output_size
+        if (row_parallel or column_parallel) and os.environ.get(
+            "RESIDUE_MXFP4_TP_EXPERIMENTAL", "0"
+        ) != "1":
+            raise ValueError(
+                "MXFP4 TP loading is experimental; set "
+                "RESIDUE_MXFP4_TP_EXPERIMENTAL=1 to opt in"
+            )
+        if row_parallel and column_parallel:
+            raise ValueError("MXFP4 cannot shard both input and output axes in one linear")
+        if row_parallel and self.mode == "selective":
+            raise ValueError(
+                "MXFP4 selective row-parallel loading requires rank-local "
+                "salient indices and packed extended-K reordering"
+            )
+        if row_parallel and (input_size % k or output_size != n):
+            raise ValueError("MXFP4 row-parallel partition does not match global shape")
+        if column_parallel and (input_size != k or n > output_size):
+            raise ValueError("MXFP4 column-parallel partition does not match global shape")
 
+        # vLLM's row-parallel loader slices the parameter's physical width.
+        # For packed FP4 that width is K/2 bytes; for raw E8M0 scales it is
+        # K/32 blocks. K_local%128 keeps both slices on the GEMM scale grid.
+        # The output-parallel loaders slice rows, including fused QKV shards.
+        # Swizzle scales only after loading this rank's raw linear slice.
         kp = padded_k(k, len(self.indices))
         loader = extra_weight_attrs.pop("weight_loader")
         layer._mxfp4_loaded = {"weight": set(), "weight_scale": set()}
