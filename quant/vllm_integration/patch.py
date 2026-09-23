@@ -254,9 +254,18 @@ def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
     try:
         import torch
 
-        from .residue_linear_op import _SM120_FOLD_SHAPES
+        from .mxfp4_fold_tuner import vllm_warmup_requested
 
-        if _SM120_FOLD_SHAPES:
+        mx_warmup = vllm_warmup_requested()
+        try:
+            from .residue_linear_op import _SM120_FOLD_SHAPES
+        except Exception:
+            if not mx_warmup:
+                raise
+            # The independent residue_mxfp4 config does not need a working
+            # NVFP4 ModelOpt/runtime op stack for its own warmup buckets.
+            _SM120_FOLD_SHAPES = ()
+        if _SM120_FOLD_SHAPES or mx_warmup:
             
             
             
@@ -285,6 +294,12 @@ def _fold_tune_sizes(runner, warmup_tok: int) -> list[int]:
             if major == 10 and any(bool(shape[3]) for shape in _SM120_FOLD_SHAPES):
                 buckets.update(_MEXT_BIGM_FOLD_BUCKETS)
             sizes |= {_cap(b) for b in buckets}
+            if mx_warmup:
+                # MXFP4 preflights and caches one *exact logical M* profile at
+                # a time. Capping a larger bucket to mnbt would tune only the
+                # smaller M while claiming the larger size was covered.
+                mx_buckets = set(_FOLD_DECODE_BUCKETS) | set(_MEXT_BIGM_FOLD_BUCKETS)
+                sizes |= {b for b in mx_buckets if not mnbt or b <= mnbt}
     except Exception as e:                                # noqa: BLE001
         print(f"[residue] fold bucket probe failed "
               f"({type(e).__name__}: {str(e)[:70]}); tuning the given decode "

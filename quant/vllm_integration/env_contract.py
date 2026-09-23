@@ -71,6 +71,10 @@ KNOWN: dict[str, tuple] = {
                                  "sm10x decode-fold FlashInfer tactic tuner "
                                  "(default ON since task-014 passed on B200; "
                                  "0 = the legacy in-process tuner path)"),
+    "RESIDUE_MXFP4_FOLD_TUNER": ("enum", {"0", "1"},
+                                 "SM100 MXFP4 group-32 Fold FlashInfer tactic "
+                                 "tuner (experimental; default off pending "
+                                 "GPU validation)"),
     "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
                                    "kill the sm10x fold (mext_r1 layers then "
                                    "refuse to serve, by design)"),

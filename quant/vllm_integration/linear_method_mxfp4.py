@@ -47,6 +47,18 @@ class ResidueMxfp4Config(QuantizationConfig):
             validate_layer(spec)
             if spec.get("mode") not in _MODES:
                 raise ValueError(f"unknown MXFP4 mode for {prefix}")
+        # This independent config does not run patch_vllm_modelopt(). Install
+        # the existing vLLM FlashInfer warmup wrapper only for an explicitly
+        # enabled MExt model, before vLLM constructs the model runner.
+        from . import mxfp4_fold_tuner
+
+        if mxfp4_fold_tuner.tuner_enabled() and any(
+            spec["mode"] == "mext_r1" for spec in self.layers.values()
+        ):
+            mxfp4_fold_tuner.request_vllm_warmup()
+            from .patch import _install_fold_decode_autotune_warmup
+
+            _install_fold_decode_autotune_warmup()
 
     @classmethod
     def get_name(cls):

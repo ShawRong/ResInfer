@@ -46,13 +46,50 @@ def mxfp4_linear(
             out_dtype=output_dtype,
         )
     elif mode == "mext_r1":
-        activation, activation_scale = quantize_mext(
-            source, recipe=activation_recipe
-        )
-        output = fold_gemm(
-            activation, weight, activation_scale, weight_scale,
-            out_dtype=output_dtype,
-        )
+        def fixed_fold():
+            activation, activation_scale = quantize_mext(
+                source, recipe=activation_recipe
+            )
+            return fold_gemm(
+                activation, weight, activation_scale, weight_scale,
+                out_dtype=output_dtype,
+            )
+
+        # The independent residue_mxfp4 config installs the shared vLLM warmup
+        # wrapper only when this opt-in route is enabled. Only an actual
+        # FlashInfer tuning window may preflight/profile tactics; a normal
+        # request without this process's preflight keeps the existing Fold.
+        from quant.vllm_integration import mxfp4_fold_tuner as fold_tuner
+
+        if not fold_tuner.tuner_enabled() or activation_recipe != "ceil":
+            fold_tuner.record_static_fallback()
+            output = fixed_fold()
+        else:
+            args = (source, weight, weight_scale)
+            pdl_mode = "early"
+            checked = fold_tuner.preflighted(
+                args, pdl_mode=pdl_mode, out_dtype=output_dtype,
+                strict_reference=True)
+            fixed_reference = None
+            if fold_tuner.is_tuning_mode() and not checked:
+                # This is the *existing* MXFP4 path's output, not an FP32
+                # ideal. Preflight never runs during ordinary serving/capture.
+                fixed_reference = fixed_fold()
+                try:
+                    fold_tuner.preflight_tactics(
+                        args, fixed_reference, pdl_mode=pdl_mode,
+                        out_dtype=output_dtype, strict_reference=True)
+                    checked = True
+                except Exception as exc:  # keep the known fixed path available
+                    print("[residue] MXFP4 Fold tuner preflight failed: "
+                          f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            if checked:
+                output = fold_tuner.tuned_mxfp4_fold(
+                    source, weight, weight_scale, pdl_mode=pdl_mode,
+                    out_dtype=output_dtype)
+            else:
+                fold_tuner.record_static_fallback()
+                output = fixed_reference if fixed_reference is not None else fixed_fold()
     else:
         activation, activation_scale = quantize(source, recipe=activation_recipe)
         output = gemm(
