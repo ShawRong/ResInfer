@@ -41,12 +41,7 @@ def _single_request_indptr(device_str: str) -> torch.Tensor:
 
 
 def _quantize_k_major(x: torch.Tensor):
-    """``(rows, K)`` → ``(packed (rows, K/2) uint8, sf_atom (rows*K/16) uint8)``。
-
-    收缩轴 K 最内(K-major)—— ``mxf4nvf4`` 的硬约束(坑28)。SF 走
-    ``sf_atom_scatter``,与 KV 池、与 ``tile_atom_to_shape_SF`` 同一套序
-    (三者等价性由 tests/test_res_attn_prefill_reference.py 的 atom 序门守着)。
-    """
+    '``(rows, K)`` → ``(packed (rows, K/2) uint8, sf_atom (rows*K/16) uint8)``。'
     rows, k = x.shape
     assert k % SF_VEC == 0, (rows, k)
     nib, sf = _quant_groups(x.float().reshape(rows, k // SF_VEC, SF_VEC))

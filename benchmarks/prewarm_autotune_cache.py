@@ -202,7 +202,7 @@ def main() -> int:
     if after == before:
         print("\nWARNING: nothing was added. Either every shape was already "
               "cached, or the operand ranks no longer match what the server "
-              "looks up -- check tests/test_autotune_prewarm.py.",
+              "looks up -- check dev/tests/test_autotune_prewarm.py.",
               file=sys.stderr)
         return 1
     print("\nServers must run with RESIDUE_SHARE_AUTOTUNE_CACHE=1 "

@@ -192,5 +192,7 @@ exclude = [
     "tests.*",
     "tools",
     "tools.*",
+    "dev",
+    "dev.*",
 ]
 
