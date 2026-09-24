@@ -13,7 +13,6 @@ from typing import Optional
 import torch
 from torch.nn.parameter import Parameter
 
-from vllm._custom_ops import cutlass_scaled_fp4_mm
 from vllm.model_executor.kernels.linear import (
     CutlassNvFp4LinearKernel,
     FbgemmNvFp4LinearKernel,
@@ -239,10 +238,10 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         ) if cls is not None
     )
 
-    def _uses_cutlass_nvfp4_kernel(self) -> bool:
-        # The kernel's differing ACTIVATION quant contract is irrelevant:
-        # every path this gate opens runs OUR prep and OUR op, never the
-        # kernel object's apply.
+    def _uses_cutlass_compatible_layout(self) -> bool:
+        # Infer weight/scale layout compatibility from the selected backend
+        # class; this does not validate tensor shapes or strides. Residue/MExt
+        # layers reuse its prepared layout but execute through our custom op.
         return isinstance(self.kernel, self._CUTLASS_LAYOUT_KERNELS)
 
     def _has_decode_mext_layout(self, layer: torch.nn.Module) -> bool:
@@ -262,7 +261,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         if getattr(layer, "_is_residue_layer", False):
             return True
         return (
-            self._uses_cutlass_nvfp4_kernel()
+            self._uses_cutlass_compatible_layout()
             and self._has_decode_mext_layout(layer)
         )
 
@@ -442,7 +441,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # `layer.weight_scale` in place. The decode-mext layout prep needs the
         # un-swizzled FP8 scale to slice off the base-K prefix in raw layout.
         raw_weight_scale_ext = None
-        if _DECODE_MEXT_ENABLED and self._uses_cutlass_nvfp4_kernel():
+        if _DECODE_MEXT_ENABLED and self._uses_cutlass_compatible_layout():
             raw_weight_scale_ext = layer.weight_scale.detach()
 
         salient_indices = None
@@ -505,7 +504,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
 
         layer._runtime_mode = runtime_mode
         layer._decode_mext_layout_enabled = False
-        if _DECODE_MEXT_ENABLED and self._uses_cutlass_nvfp4_kernel():
+        if _DECODE_MEXT_ENABLED and self._uses_cutlass_compatible_layout():
             if (
                 getattr(layer, "_is_residue_layer", False)
                 and raw_weight_scale_ext is not None
@@ -531,7 +530,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 "[residue:post_process_weights] "
                 f"layer_name={layer_name!r} "
                 f"is_residue={getattr(layer, '_is_residue_layer', False)} "
-                f"uses_cutlass={self._uses_cutlass_nvfp4_kernel()} "
+                f"uses_cutlass={self._uses_cutlass_compatible_layout()} "
                 f"decode_mext_enabled={_DECODE_MEXT_ENABLED} "
                 f"decode_layout={getattr(layer, '_decode_mext_layout_enabled', False)} "
                 f"has_weight_scale_base={hasattr(layer, 'weight_scale_base')} "
@@ -548,7 +547,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         `_mext_decode_k_base` and `weight_scale_base = weight_scale` (i.e. the
         whole scale doubles as its own prefix scale).
         """
-        if not self._uses_cutlass_nvfp4_kernel():
+        if not self._uses_cutlass_compatible_layout():
             raise RuntimeError(
                 "mext_r1 layers need a cutlass-layout NVFP4 kernel; vLLM "
                 f"selected {type(self.kernel).__name__!r} for layer "
@@ -647,7 +646,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         non-residue layers do not enter this method and are delegated directly
         to vLLM's selected backend.
         """
-        if self._uses_cutlass_nvfp4_kernel():
+        if self._uses_cutlass_compatible_layout():
             return self._apply_residue_via_op(layer, x, bias)
         return self._apply_residue_inline(layer, x, bias)
 
@@ -675,9 +674,8 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         M-extension layouts (pure mext_r1 layers) and K-extension + prepare-
         time mext attrs (extended_k layers) end up with the same set of
         attributes: `_decode_mext_layout_enabled = True`, `weight_scale_base`,
-        and `_mext_decode_k_base`. The MExt subclass's PWAL is responsible
-        for normalising both into that shape so we have a single dispatch
-        condition here.
+        and `_mext_decode_k_base`. Weight preparation normalizes both into
+        that shape so we have a single dispatch condition here.
         """
         # `fold_eligible` is a per-layer constant (does the layer have a
         # base-K scale and a valid prefix k_base?). The op's body uses this
@@ -787,21 +785,9 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         )
 
         kernel = self.kernel
-        if isinstance(kernel, CutlassNvFp4LinearKernel):
-            out = self._apply_cutlass_residue(
-                layer, x_fp4, x_sf_block, output_dtype
-            )
-        elif isinstance(kernel, FlashInferCutlassNvFp4LinearKernel):
-            out = self._apply_flashinfer_residue(
-                layer, x_fp4, x_sf_block, output_dtype, backend="cutlass"
-            )
-        elif isinstance(kernel, FlashInferCudnnNvFp4LinearKernel):
+        if isinstance(kernel, FlashInferCudnnNvFp4LinearKernel):
             out = self._apply_flashinfer_residue(
                 layer, x_fp4, x_sf_block, output_dtype, backend="cudnn"
-            )
-        elif _is_kernel_instance(kernel, FlashInferCuteDslNvFp4LinearKernel):
-            out = self._apply_flashinfer_residue(
-                layer, x_fp4, x_sf_block, output_dtype, backend="cute-dsl"
             )
         elif _is_kernel_instance(kernel, FlashInferB12xNvFp4LinearKernel):
             out = self._apply_flashinfer_residue(
@@ -833,26 +819,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         return out.view(*output_shape)
 
     @staticmethod
-    def _apply_cutlass_residue(
-        layer: torch.nn.Module,
-        x_fp4: torch.Tensor,
-        x_sf_block: torch.Tensor,
-        output_dtype: torch.dtype,
-    ) -> torch.Tensor:
-        x_fp4 = pad_nvfp4_activation_for_cutlass(
-            x_fp4, getattr(layer, "weights_padding_cols", 0)
-        )
-        out = cutlass_scaled_fp4_mm(
-            x_fp4,
-            layer.weight,
-            x_sf_block,
-            layer.weight_scale,
-            layer.alpha,
-            output_dtype,
-        )
-        return slice_nvfp4_output(out, layer.output_size_per_partition)
-
-    @staticmethod
     def _apply_flashinfer_residue(
         layer: torch.nn.Module,
         x_fp4: torch.Tensor,
@@ -861,7 +827,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         *,
         backend: str,
     ) -> torch.Tensor:
-        if backend in {"cutlass", "cudnn", "cute-dsl", "b12x"}:
+        if backend in {"cudnn", "b12x"}:
             x_fp4 = pad_nvfp4_activation_for_cutlass(
                 x_fp4, getattr(layer, "weights_padding_cols", 0)
             )
