@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 from pathlib import Path
 
 import torch
 import torch.nn as nn
+
+from .metadata import read_residue_metadata_json
 
 _RESIDUE_METADATA_CACHE: dict[str, dict] = {}
 
@@ -70,8 +71,7 @@ def load_residue_metadata_json(metadata_path: str | Path) -> dict:
         return cached
 
     try:
-        with open(metadata_path) as f:
-            data = json.load(f)
+        data = read_residue_metadata_json(metadata_path)
     except Exception as e:
         print(f"[residue] Warning: Failed to load metadata: {e}")
         data = {}

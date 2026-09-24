@@ -1,34 +1,29 @@
-"""Metadata loading utilities for residue quantization.
+"""Shared sidecar reader and compatibility helpers for residue metadata.
 
-INACTIVE: All functions in this file are unused by the main vLLM path.
-The main path uses patch.py + linear_utils.py for metadata loading. Kept as
-reference for potential future use.
-
-Handles loading salient_indices and other residue-specific metadata
-from exported model directories.
+Readers keep format-specific validation and caching in their callers. Importing
+this module does not initialize PyTorch or a quantization backend.
 """
 
+from __future__ import annotations
+
 import json
-import os
-from typing import Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
 
-import torch
+if TYPE_CHECKING:
+    import torch
 
 
-def load_residue_metadata(model_dir: str) -> dict:
-    """Load residue_kernel_metadata.json from model directory.
+def read_residue_metadata_json(metadata_path: str | Path) -> dict:
+    """Read one sidecar; propagate file and JSON errors without caching."""
+    with open(metadata_path) as f:
+        return json.load(f)
 
-    Args:
-        model_dir: Path to exported model directory
 
-    Returns:
-        Metadata dict with layer-specific salient indices, or empty dict if not found
-    """
-    path = os.path.join(model_dir, "residue_kernel_metadata.json")
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {}
+def load_residue_metadata(model_dir: str | Path) -> dict:
+    """Load a model's optional sidecar; plain checkpoints may omit it."""
+    path = Path(model_dir) / "residue_kernel_metadata.json"
+    return read_residue_metadata_json(path) if path.exists() else {}
 
 
 def get_salient_indices(
@@ -46,6 +41,8 @@ def get_salient_indices(
     Returns:
         1D int64 tensor of salient channel indices
     """
+    import torch
+
     layers = metadata.get("layers", {})
     layer_meta = layers.get(layer_name, {})
     indices = layer_meta.get("salient_indices", [])

@@ -63,9 +63,8 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
     def _load_metadata(self):
         if self._metadata is not None:
             return self._metadata
-        import json
-        import os
         from pathlib import Path
+        from .metadata import load_residue_metadata
 
         model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
         if not model_dir:
@@ -74,9 +73,8 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
         if not Path(model_dir).is_dir():
             raise ValueError("MXFP4 residue metadata requires a local model directory; "
                              "set RESIDUE_VLLM_MODEL_DIR to the checkpoint directory")
-        path = Path(model_dir) / "residue_kernel_metadata.json"
         # Native non-residue checkpoints need no sidecar. Parse errors must fail.
-        self._metadata = json.loads(path.read_text()) if path.exists() else {}
+        self._metadata = load_residue_metadata(model_dir)
         return self._metadata
 
     def get_quant_method(self, layer, prefix):
