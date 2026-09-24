@@ -24,10 +24,13 @@ def export_residue_checkpoint(
     MXFP4 validation checks native output; it never rewrites weights or config.
     """
     from modelopt.torch.export import export_hf_checkpoint
-    from .kernel_metadata import save_kernel_metadata as save_metadata
+    from .kernel_metadata import _collect_export_metadata, _write_kernel_metadata
 
     path = Path(export_dir)
     mxfp4 = has_mxfp4_weights(model)
+    metadata, mask_dims = _collect_export_metadata(
+        model, residue_ratio, block_size, save_channel_masks, calibration,
+    )
     hf_layers, preserved, source_record = {}, {}, None
     if mxfp4:
         _require_modelopt_export_api(export_hf_checkpoint)
@@ -36,7 +39,7 @@ def export_residue_checkpoint(
             raise ValueError("Qwen3.5 requires the source checkpoint to preserve vision/MTP")
         if path.exists() and any(path.iterdir()):
             raise FileExistsError(f"refusing to overwrite export: {path}")
-        hf_layers = _collect_mxfp4_layers(model)
+        hf_layers = _collect_mxfp4_layers(model, metadata["layers"])
         # Validate fused activation contracts before writing anything.
         runtime_layer_specs(hf_layers, model_type)
     if source_checkpoint is not None or mxfp4:
@@ -57,12 +60,8 @@ def export_residue_checkpoint(
 
     path.mkdir(parents=True, exist_ok=True)
     # Required residue state must never depend on an optional debug flag.
-    from .kernel_metadata import collect_kernel_metadata, collect_extended_linear_dims
-    metadata = collect_kernel_metadata(model, residue_ratio, block_size)
-    dims = collect_extended_linear_dims(model)
-    if save_kernel_metadata or metadata["layers"] or dims:
-        save_metadata(model, path, residue_ratio, block_size,
-                      save_channel_masks=save_channel_masks, calibration=calibration)
+    if save_kernel_metadata or metadata["layers"] or metadata["extended_linear_dims"]:
+        _write_kernel_metadata(metadata, mask_dims, path)
     export_kwargs.setdefault("save_modelopt_state", False if mxfp4 else True)
     if mxfp4:
         export_kwargs["save_modelopt_state"] = False
@@ -199,10 +198,8 @@ def has_mxfp4_weights(model):
                for module in model.modules() for q in [getattr(module, "weight_quantizer", None)])
 
 
-def _collect_mxfp4_layers(model):
+def _collect_mxfp4_layers(model, metadata):
     from modelopt.torch.export.quant_utils import get_quantization_format
-    from .kernel_metadata import collect_kernel_metadata
-    metadata = collect_kernel_metadata(model)["layers"]
     layers = {}
     for name, module in model.named_modules():
         wq = getattr(module, "weight_quantizer", None)

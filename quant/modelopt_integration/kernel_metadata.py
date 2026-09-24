@@ -175,43 +175,55 @@ def save_kernel_metadata(
     downgraded. Absent stays absent -- the pod inventory prints NOT RECORDED
     for those rather than letting the gap read as fine.
     """
-    export_dir = Path(export_dir)
-    export_dir.mkdir(parents=True, exist_ok=True)
-    saved_files: dict[str, Path] = {}
+    metadata, mask_dims = _collect_export_metadata(
+        model, residue_ratio, block_size, save_channel_masks, calibration,
+    )
+    return _write_kernel_metadata(metadata, mask_dims, export_dir)
 
-    metadata = collect_kernel_metadata(
-        model, residue_ratio, block_size=block_size)
+
+def _collect_export_metadata(
+    model, residue_ratio, block_size, save_channel_masks, calibration,
+):
+    """Capture JSON values and logical mask dimensions before weight packing."""
+    from copy import deepcopy
+
+    metadata = collect_kernel_metadata(model, residue_ratio, block_size)
     metadata["extended_linear_dims"] = collect_extended_linear_dims(model)
     if calibration:
-        metadata["calibration"] = calibration
-    metadata_path = export_dir / "residue_kernel_metadata.json"
-    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
-    saved_files["metadata_json"] = metadata_path
-
+        metadata["calibration"] = deepcopy(calibration)
+    mask_dims = {}
     if save_channel_masks:
-        masks: dict[str, torch.Tensor] = {}
         modules = dict(model.named_modules())
         for name, layer_data in metadata["layers"].items():
-            if "salient_indices" not in layer_data:
-                continue
             module = modules.get(name)
-            if module is None:
-                continue
-            num_channels = _infer_mask_in_features(module, layer_data["salient_indices"])
-            if num_channels is None:
-                continue
-            indices = torch.tensor(layer_data["salient_indices"], dtype=torch.long)
-            if indices.numel() == 0 or int(indices.max().item()) >= int(num_channels):
-                continue
-            mask = torch.zeros(int(num_channels), dtype=torch.bool)
-            mask[indices] = True
-            masks[name] = mask
+            if module is not None and "salient_indices" in layer_data:
+                mask_dims[name] = _infer_mask_in_features(
+                    module, layer_data["salient_indices"],
+                )
+    return metadata, mask_dims
 
-        if masks:
-            masks_path = export_dir / "channel_masks.pt"
-            torch.save(masks, masks_path)
-            saved_files["channel_masks"] = masks_path
 
+def _write_kernel_metadata(metadata, mask_dims, export_dir) -> dict[str, Path]:
+    """Serialize a collected snapshot without reading the model again."""
+    export_dir = Path(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+    metadata_path = export_dir / "residue_kernel_metadata.json"
+    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    saved_files = {"metadata_json": metadata_path}
+    masks = {}
+    for name, num_channels in mask_dims.items():
+        if num_channels is None:
+            continue
+        indices = torch.tensor(metadata["layers"][name]["salient_indices"], dtype=torch.long)
+        if indices.numel() == 0 or int(indices.max().item()) >= int(num_channels):
+            continue
+        mask = torch.zeros(int(num_channels), dtype=torch.bool)
+        mask[indices] = True
+        masks[name] = mask
+    if masks:
+        masks_path = export_dir / "channel_masks.pt"
+        torch.save(masks, masks_path)
+        saved_files["channel_masks"] = masks_path
     return saved_files
 
 
