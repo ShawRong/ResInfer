@@ -26,7 +26,6 @@ from ..scale_layout import swizzle_scales
 from .plan import QMUL4_KERNEL_REDUCTION_MIN_SEQ, select_decode_plan
 
 E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
-SFP = 0.171875  # P 的常数 SF(e4m3 精确)
 N_PAD = 128  # Q-SF 缓冲的 N 垫高(UTCCP 按 N=128 粒度)
 
 Qmul4ReductionWorkspace = Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -484,7 +483,7 @@ def _compiled(
     compile_options = "--enable-tvm-ffi --opt-level 3"
     return cute.compile(
         fmha, Int32(1), q_fake, k_fake, v_fake,
-        sf_flat(), k_sf_fake, v_sf_fake, sf_flat(),
+        sf_flat(), k_sf_fake, v_sf_fake,
         o_fake, o_sf_fake, o_global_scale_fake,
         None, None, o_partial_fake, l_partial_fake, m_partial_fake,
         completion_fake,
@@ -492,15 +491,6 @@ def _compiled(
         stream_fake, True, Int32(0),
         options=compile_options,
     )
-
-
-@functools.lru_cache(maxsize=4)
-def _psf_buffer(device_str: str):
-    sfp_byte = int(torch.tensor(SFP).to(torch.float8_e4m3fn).view(torch.uint8).item())
-    return torch.full((65536,), sfp_byte, dtype=torch.uint8, device=device_str).view(
-        torch.float8_e4m3fn
-    )
-
 
 
 
@@ -801,7 +791,6 @@ def run_paged_fp4_decode_qmul4_tmem(
             else pool.k_sf.reshape(-1).view(torch.float8_e4m3fn)
         ),
         v_sf_bthd,
-        _psf_buffer(str(q.device)),
         out_eff.view(B, 1, HQ if direct_output else H * g_pad, D),
         None, None, None, None, o_partial, l_partial, m_partial, None,
         Float32(sm_scale),
@@ -1231,7 +1220,6 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
             else pool.k_sf.reshape(-1).view(torch.float8_e4m3fn)
         ),
         v_sf_bthd,
-        _psf_buffer(str(q.device)),
         out.view(B, 1, HQ, D // 2).view(torch.float4_e2m1fn_x2),
         output_block_scale.reshape(-1),
         output_global_scale_inv.reshape(1),
