@@ -24,6 +24,30 @@ def _warn_once_fold_register(tag, exc):
           f"{type(exc).__name__}: {exc}", flush=True)
 
 
+def register_fold_shape_for(layer, *, is_mext_r1: bool, context: str) -> None:
+    """Register the same base-K view and physical stride used by the op.
+
+    Extended-K, plain decode-MExt and mext_r1 preparation share this entry.
+    Registration failures warn once per context and never block weight loading.
+    """
+    try:
+        from .residue_linear_op import (
+            _base_k_weight_view,
+            register_sm120_fold_shape,
+        )
+
+        k_base = int(getattr(layer, "_mext_decode_k_base", 0))
+        if k_base <= 0:
+            return
+        view = _base_k_weight_view(layer.weight, k_base)
+        register_sm120_fold_shape(
+            int(view.shape[0]), k_base, int(view.stride(0)) * 2,
+            is_mext_r1=is_mext_r1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _warn_once_fold_register(context, exc)
+
+
 def derive_decode_mext_weight_layout(
     weight_ext: torch.Tensor,
     weight_scale_ext: torch.Tensor,
@@ -65,36 +89,16 @@ def prepare_decode_mext_weight_layout_from_raw_scale(
     checkpoint layout captured before that swizzle.
     """
 
-    weight_base_view, weight_scale_base_raw = derive_decode_mext_weight_layout(
+    _, weight_scale_base_raw = derive_decode_mext_weight_layout(
         layer.weight,
         raw_weight_scale_ext,
         layer.original_in_features,
     )
 
-    layer.weight_base_view = weight_base_view
     layer.weight_scale_base = Parameter(
         swizzle_blockscale(weight_scale_base_raw),
         requires_grad=False,
     )
     layer._mext_decode_k_base = int(layer.original_in_features)
     layer._decode_mext_layout_enabled = True
-    # Tell the SM120 CuTeDSL warmup this shape exists. k_ext is the STORED
-    # width, which differs from k_base here and selects a different compiled
-    # kernel (strided weight read), so both numbers matter.
-    try:
-        from .residue_linear_op import (_base_k_weight_view,
-                                        register_sm120_fold_shape)
-
-        # Derive the warmup key from the SAME tensor the op will hand the
-        # kernel. This is the ext-K branch; the plain-NVFP4 and mext_r1
-        # branches register from linear_method_v2 (_register_fold_shape_for).
-        k_base = int(layer.original_in_features)
-        view = _base_k_weight_view(layer.weight, k_base)
-        register_sm120_fold_shape(
-            int(view.shape[0]), k_base, int(view.stride(0)) * 2,
-            is_mext_r1=False)   # ext-K layer: keeps the decode-band threshold
-    except Exception as e:                                # noqa: BLE001
-        # Never block weight loading -- but do not swallow it either: a silent
-        # miss here leaves the warmup with nothing to compile, and the only
-        # symptom is a slow cudagraph capture.
-        _warn_once_fold_register("extended_k", e)
+    register_fold_shape_for(layer, is_mext_r1=False, context="extended_k")

@@ -42,7 +42,10 @@ except ImportError:
         swizzle_blockscale,
     )
 
-from .layout_utils import prepare_decode_mext_weight_layout_from_raw_scale
+from .layout_utils import (
+    prepare_decode_mext_weight_layout_from_raw_scale,
+    register_fold_shape_for,
+)
 from .linear_debug import maybe_tap_tensor
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
 from .residue_tp import (
@@ -113,44 +116,6 @@ def _log_selected_kernel_once(method) -> None:
               "decode-MExt layout) will be disabled or fail on this kernel. "
               "Pin a compatible one: --linear-backend cutlass "
               "(or flashinfer_cutlass / flashinfer_cutedsl).", flush=True)
-
-
-_FOLD_REGISTER_WARNED = set()
-
-
-def _warn_once_fold_register(tag, exc):
-    if tag in _FOLD_REGISTER_WARNED:
-        return
-    _FOLD_REGISTER_WARNED.add(tag)
-    print(f"[residue] sm120 fold shape registration failed ({tag}): "
-          f"{type(exc).__name__}: {exc}", flush=True)
-
-
-def _register_fold_shape_for(layer, tag: str) -> None:
-    """Pre-compile the SM120 CuTeDSL fold for this layer's shape.
-
-    There are THREE places that mark a layer fold-eligible -- ext-K prefix
-    (layout_utils), plain NVFP4 with activation-side mext, and mext_r1 -- and
-    every one of them must register or the warmup silently under-covers.
-    Missing just the plain-NVFP4 branch left 4 of 9 live shapes uncompiled,
-    which showed up only as cudagraph capture taking 46 s instead of 5 s.
-
-    The key is derived from the SAME view the op will pass the kernel, so the
-    warmup and the runtime cannot disagree about the row stride.
-    """
-    try:
-        from .residue_linear_op import (_base_k_weight_view,
-                                        register_sm120_fold_shape)
-
-        k_base = int(getattr(layer, "_mext_decode_k_base", 0))
-        if k_base <= 0:
-            return
-        view = _base_k_weight_view(layer.weight, k_base)
-        register_sm120_fold_shape(
-            int(view.shape[0]), k_base, int(view.stride(0)) * 2,
-            is_mext_r1=(tag == "mext_r1"))
-    except Exception as e:                                # noqa: BLE001
-        _warn_once_fold_register(tag, e)
 
 
 class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
@@ -524,7 +489,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 layer._decode_mext_layout_enabled = True
                 layer.weight_scale_base = layer.weight_scale
                 layer._mext_decode_k_base = int(layer.original_in_features)
-                _register_fold_shape_for(layer, "plain_nvfp4")
+                register_fold_shape_for(layer, is_mext_r1=False, context="plain_nvfp4")
         if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
             print(
                 "[residue:post_process_weights] "
@@ -580,7 +545,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # layer was ever recorded, which starved both the sm120 pre-compile and
         # the sm10x tuning-bucket ladder -- found live by the sm100 e2e warmup
         # audit (registry empty, tune_sizes=[128], prefill on the static table).
-        _register_fold_shape_for(layer, "mext_r1")
+        register_fold_shape_for(layer, is_mext_r1=True, context="mext_r1")
 
         input_global_scale = layer.input_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
@@ -683,11 +648,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # to actually take the fold branch — so a residue layer is "fold-able
         # for small M, legacy for large M" automatically, with each captured
         # cudagraph specialising to the right path for its capture size.
-        fold_eligible = (
-            getattr(layer, "_decode_mext_layout_enabled", False)
-            and hasattr(layer, "weight_scale_base")
-            and hasattr(layer, "_mext_decode_k_base")
-        )
+        fold_eligible = self._has_decode_mext_layout(layer)
 
         if fold_eligible:
             weight_scale_for_fold = layer.weight_scale_base
