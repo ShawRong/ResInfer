@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import functools
 import math
-import os
 from typing import Tuple
 
 import torch
@@ -20,8 +19,9 @@ from .kv_layout import (
     PAGE_SIZE,
     SF_VEC,
     NvFp4PagedKVPool,
-    sf_atom_scatter,
 )
+
+from ..scale_layout import swizzle_scales
 
 from .plan import QMUL4_KERNEL_REDUCTION_MIN_SEQ, select_decode_plan
 
@@ -290,9 +290,7 @@ def _compiled(
     head_dim: int,
     prediction: int,
     reduction: str,
-    v_mode: str = "native_token",
-    qmul4_skip: str = "none",
-    v_fp8: bool = False,
+    v_mode: str = "qmul4_tmem",
     k_sf_mode: str = "atom",
     output_nvfp4: bool = False,
     output_num_qo_heads: int | None = None,
@@ -302,19 +300,11 @@ def _compiled(
     smem_correction_broadcast: bool = False,
     blocks_per_sm: int = 1,
     residue_fold: bool = False,
-    native_qmul4_ptxas: str | None = None,
     qmul4_interleave: int = 0,
 ):
     """num_qo_heads 此处是**垫后**的头数(= num_kv_heads × padded group size)。"""
-    # Keep the SASS-only marker contract local to this specialization.  The
-    # process-wide loader hook is idempotent, but leaving N6420 enabled would
-    # reinterpret unrelated RZ instructions in kernels compiled afterwards.
-    _n6420_had_value = "RESATTN_QMUL4_N6420_PATCH" in os.environ
-    _n6420_old_value = os.environ.get("RESATTN_QMUL4_N6420_PATCH")
-    if v_mode == "qmul4_tmem":
-        from .qmul4_cubin_patch import install_qmul4_loader_patch
-
-        install_qmul4_loader_patch()
+    if v_mode != "qmul4_tmem":
+        raise ValueError("production decode supports qmul4_tmem only")
     grouped_head_tile, prediction_tile = _pick_tile_shape(
         num_qo_heads // num_kv_heads, prediction
     )
@@ -349,7 +339,6 @@ def _compiled(
         smem_correction_broadcast=smem_correction_broadcast,
         qmul4_interleave=qmul4_interleave,
         residue_fold=residue_fold,
-        qmul4_skip=qmul4_skip,  # type: ignore[arg-type]
         
         
         
@@ -364,7 +353,6 @@ def _compiled(
         )
     sym_batch = cute.sym_int()
     sym_pages = cute.sym_int()
-    sym_total_logical = cute.sym_int()
     sym_prediction = cute.sym_int()
     q_fake = cute.runtime.make_fake_compact_tensor(
         in_dtype, (sym_batch, sym_prediction, num_qo_heads, head_dim),
@@ -399,37 +387,22 @@ def _compiled(
         )
     else:
         k_sf_fake = sf_flat()
-    if v_mode in ("qmul4_d", "qmul4_tmem"):
-        # Conventional HND V: D is contiguous. The separate standard scale
-        # tensor has one e4m3 byte per adjacent 16-D block.
-        v_fake = cute.runtime.make_fake_tensor(
-            in_dtype, (sym_pages, 128, num_kv_heads, head_dim),
-            stride=(_sd2(), head_dim, _sd2(), 1), assumed_align=16)
-        # 坑44:trtllm 契约 [P, H, ps, S] —— 每 (page,head) 的 SF tile 连续,
-        # 才能开出 ≥16B 的合法 TMA box。线性契约 [P, ps, H, S] 在 H>1 时
-        # tile 跨步、内跑只有 8B,描述符非法(真机 illegal instruction)。
-        v_sf_fake = cute.runtime.make_fake_tensor(
-            cutlass.Float8E4M3FN,
-            (sym_pages, num_kv_heads, 128, head_dim // SF_VEC),
-            stride=(
-                cute.sym_int(divisibility=16),
-                128 * (head_dim // SF_VEC),
-                head_dim // SF_VEC,
-                1,
-            ),
-            assumed_align=16,
-        )
-    else:
-        # Native V: token is contiguous for blockscaled VP.
-        # v_fp8=True 走 **Phase 1**(普通 fp8 VP MMA)—— 生产路径从不走它
-        # (池里的 V 恒为 e2m1 ⇒ use_nvfp4_vp 恒 True),所以它长期无人使用、
-        # 无门覆盖。qmul4_d 把 vp_dtype 设成 fp8 等于复活了这条路径,
-        # 这个开关让它在**不带任何 qmul4 机器**的情况下单独受检。
-        v_dt = cutlass.Float8E4M3FN if v_fp8 else in_dtype
-        v_fake = cute.runtime.make_fake_tensor(
-            v_dt, (sym_pages, 128, num_kv_heads, head_dim),
-            stride=(_sd2(), 1, _sd2(), _sd2()), assumed_align=16)
-        v_sf_fake = sf_flat()
+    # Conventional HND V: D is contiguous. Each scale byte covers 16 D.
+    v_fake = cute.runtime.make_fake_tensor(
+        in_dtype, (sym_pages, 128, num_kv_heads, head_dim),
+        stride=(_sd2(), head_dim, _sd2(), 1), assumed_align=16)
+    # TRT-LLM contract [P, H, ps, S] keeps each scale tile contiguous for TMA.
+    v_sf_fake = cute.runtime.make_fake_tensor(
+        cutlass.Float8E4M3FN,
+        (sym_pages, num_kv_heads, 128, head_dim // SF_VEC),
+        stride=(
+            cute.sym_int(divisibility=16),
+            128 * (head_dim // SF_VEC),
+            head_dim // SF_VEC,
+            1,
+        ),
+        assumed_align=16,
+    )
     if output_nvfp4 and (
         reduction not in ("none", "kernel", "gmem_fused")
         or v_mode != "qmul4_tmem"
@@ -500,38 +473,25 @@ def _compiled(
                 stride_order=(0,),
                 assumed_align=16,
             )
-    i32 = lambda n: cute.runtime.make_fake_compact_tensor(Int32, (n,), assumed_align=16)
+    seq_lens_fake = cute.runtime.make_fake_compact_tensor(
+        Int32, (sym_batch,), assumed_align=4,
+    )
+    block_tables_fake = cute.runtime.make_fake_tensor(
+        Int32, (sym_batch, cute.sym_int()),
+        stride=(cute.sym_int(), 1), assumed_align=4,
+    )
     stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     compile_options = "--enable-tvm-ffi --opt-level 3"
-    from contextlib import nullcontext
-    from .native_compile import native_qmul4_compilation
-    if native_qmul4_ptxas is not None and v_mode != "qmul4_tmem":
-        raise ValueError("native ptxas specialization requires qmul4_tmem")
-    compile_scope = (
-        native_qmul4_compilation(native_qmul4_ptxas)
-        if native_qmul4_ptxas is not None else nullcontext()
+    return cute.compile(
+        fmha, Int32(1), q_fake, k_fake, v_fake,
+        sf_flat(), k_sf_fake, v_sf_fake, sf_flat(),
+        o_fake, o_sf_fake, o_global_scale_fake,
+        None, None, o_partial_fake, l_partial_fake, m_partial_fake,
+        completion_fake,
+        Float32(1.0), Float32(1.0), seq_lens_fake, block_tables_fake,
+        stream_fake, True, Int32(0),
+        options=compile_options,
     )
-    if v_mode == "qmul4_tmem":
-        os.environ["RESATTN_QMUL4_N6420_PATCH"] = "1"
-    try:
-        with compile_scope:
-            return cute.compile(
-                fmha, Int32(1), q_fake, k_fake, v_fake,
-                sf_flat(), k_sf_fake, v_sf_fake, sf_flat(),
-                o_fake, o_sf_fake, o_global_scale_fake,
-                None, None, o_partial_fake, l_partial_fake, m_partial_fake,
-                completion_fake,
-                Float32(1.0), Float32(1.0), stream_fake, True, Int32(0),
-                i32(sym_batch), i32(sym_batch), i32(sym_total_logical),
-                options=compile_options,
-            )
-    finally:
-        if v_mode == "qmul4_tmem":
-            if _n6420_had_value:
-                assert _n6420_old_value is not None
-                os.environ["RESATTN_QMUL4_N6420_PATCH"] = _n6420_old_value
-            else:
-                os.environ.pop("RESATTN_QMUL4_N6420_PATCH", None)
 
 
 @functools.lru_cache(maxsize=4)
@@ -553,22 +513,7 @@ def _psf_buffer(device_str: str):
 
 
 
-_Q_SCRATCH: dict = {}
 _Q_RESIDUE_SCRATCH: dict = {}
-
-
-def _q_scratch(b: int, h_kv: int, g: int, d: int, device):
-    key = (b, h_kv, g, d, str(device))
-    hit = _Q_SCRATCH.get(key)
-    if hit is None:
-        q_pack = torch.empty(b, h_kv, g, d // 2, dtype=torch.uint8, device=device)
-        # 唯一一次清零:此后垫行不再被触碰
-        q_sf = torch.zeros(
-            b * h_kv * N_PAD * (d // SF_VEC), dtype=torch.uint8, device=device
-        )
-        hit = (q_pack, q_sf)
-        _Q_SCRATCH[key] = hit
-    return hit
 
 
 def _q_residue_scratch(b: int, h_kv: int, g: int, d: int, device):
@@ -595,41 +540,6 @@ def _q_residue_scratch(b: int, h_kv: int, g: int, d: int, device):
         hit = (q_pack, q_sf)
         _Q_RESIDUE_SCRATCH[key] = hit
     return hit
-
-
-def _quantize_q_cuda(
-    q: torch.Tensor,
-    num_kv_heads: int,
-    out_to_zero: torch.Tensor | None = None,
-):
-    """融合 CUDA 版(torch.ops.nvfp4.nvfp4_quantize_q);不可用时返回 None。
-
-    与 ``_quantize_q`` 逐字节等价(同一比较树 / e4m3 舍入),但省掉 torch 版
-    的 ~6 次 kernel launch —— decode 时 q 很小,launch 开销与注意力本身同量级。
-    """
-    if not (
-        q.is_cuda
-        and hasattr(torch.ops, "nvfp4")
-        and hasattr(torch.ops.nvfp4, "nvfp4_quantize_q")
-    ):
-        return None
-    B, HQ, D = q.shape
-    g = HQ // num_kv_heads
-    q4 = q.reshape(B, num_kv_heads, g, D).contiguous()
-    q_pack, q_sf = _q_scratch(B, num_kv_heads, g, D, q.device)
-    if (
-        out_to_zero is not None
-        and hasattr(torch.ops.nvfp4, "nvfp4_quantize_q_and_zero")
-    ):
-        torch.ops.nvfp4.nvfp4_quantize_q_and_zero(
-            q4, q_pack, q_sf, out_to_zero
-        )
-    else:
-        torch.ops.nvfp4.nvfp4_quantize_q(q4, q_pack, q_sf)
-        if out_to_zero is not None:
-            # Compatibility fallback for an older extension binary.
-            out_to_zero.zero_()
-    return q_pack.reshape(B, 1, HQ, D // 2), q_sf.view(torch.float8_e4m3fn)
 
 
 def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
@@ -660,22 +570,9 @@ def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
         B, num_kv_heads, g, D, q.device
     )
     physical_g = q_pack.shape[2]
-    if hasattr(torch.ops.nvfp4, "nvfp4_quantize_q_residue"):
-        torch.ops.nvfp4.nvfp4_quantize_q_residue(q4, q_pack, q_sf)
-    elif (
-        g == 8
-        and physical_g == 16
-        and hasattr(torch.ops.nvfp4, "scaled_fp4_quant_mext_r1")
-    ):
-        # Compatibility with an older extension. Flattened MExt attn_tile8 is
-        # correct only when every logical group already contains eight rows.
-        input_scale = torch.ones(1, dtype=torch.float32, device=q.device)
-        torch.ops.nvfp4.scaled_fp4_quant_mext_r1(
-            q_pack, q4.reshape(B * num_kv_heads * g, D), q_sf,
-            input_scale, 0, 4
-        )
-    else:
+    if not hasattr(torch.ops.nvfp4, "scaled_fp4_quant_mext_r1_grouped_q"):
         return None
+    torch.ops.nvfp4.scaled_fp4_quant_mext_r1_grouped_q(q4, q_pack, q_sf)
     return (
         q_pack.reshape(B, 1, num_kv_heads * physical_g, D // 2),
         q_sf.view(torch.float8_e4m3fn),
@@ -703,24 +600,44 @@ def _quantize_q(q: torch.Tensor, num_kv_heads: int):
     # SF → N_PAD 行的 atom 序 tile(垫零)
     sf_pad = torch.zeros(B, num_kv_heads, N_PAD, D // SF_VEC, dtype=torch.uint8, device=dev)
     sf_pad[:, :, :g] = sf.view(torch.uint8)
-    q_sf = sf_atom_scatter(sf_pad).reshape(-1)
+    q_sf = swizzle_scales(sf_pad.flatten(0, 1)).reshape(-1)
     return q_pack, q_sf.view(torch.float8_e4m3fn)
 
 
-def run_paged_fp4_decode_qmul4_v(
+def _check_decode_metadata(block_tables, seq_lens, batch, device):
+    """Validate borrowed page metadata without casting, copying or GPU reads."""
+    if (
+        block_tables.dtype != torch.int32
+        or block_tables.device != device
+        or block_tables.ndim != 2
+        or block_tables.shape[0] != batch
+        or block_tables.shape[1] < 1
+        or block_tables.stride(1) != 1
+        or block_tables.stride(0) < block_tables.shape[1]
+    ):
+        raise ValueError(
+            "block_tables must be int32 [batch, max_pages_per_seq] on the Q "
+            "device, with unit column stride and non-overlapping rows"
+        )
+    if (
+        seq_lens.dtype != torch.int32
+        or seq_lens.device != device
+        or tuple(seq_lens.shape) != (batch,)
+        or not seq_lens.is_contiguous()
+    ):
+        raise ValueError("seq_lens must be contiguous int32 [batch] on the Q device")
+
+
+def run_paged_fp4_decode_qmul4_tmem(
     q: torch.Tensor,
     pool: NvFp4PagedKVPool,
     v_data_hnd: torch.Tensor,
     v_sf_bthd: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
+    block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     sm_scale: float,
     out: torch.Tensor,
     max_seq_len: int = 0,
-    qmul4_skip: str = "none",
-    force_single_split: bool = False,
-    v_mode: str = "qmul4_d",
     k_sf_mode: str = "atom",
     value_scale: float = 1.0,
     reduction_workspace: Qmul4ReductionWorkspace | None = None,
@@ -728,7 +645,7 @@ def run_paged_fp4_decode_qmul4_v(
     direct_output: bool = False,
     plan: tuple[int, str] | None = None,
 ) -> torch.Tensor:
-    """Experimental conventional-V decode path.
+    """Decode with conventional V and the LDSM/QMUL4/TMEM conversion.
 
     K and K scales still come from ``pool`` (the native blockscaled KQ
     contract). V uses the context/TRT-friendly contract:
@@ -737,15 +654,14 @@ def run_paged_fp4_decode_qmul4_v(
     - ``v_sf_bthd``: e4m3 ``[page, head, token, D/16]``,tile 内按 TRT-LLM 的
       4-token interleave 排布(``append.quantize_paged_trtllm_format`` 产出)。
 
-    The decode kernel expands each V page to E4M3 in shared memory with
-    QMUL4, then executes the ordinary FP8 VP MMA. This wrapper is kept
-    separate from the production native-token entry until the B200 numerical
-    and performance gates are complete.
+    The decode kernel converts V to E4M3 in TMEM using QMUL4, then runs the
+    ordinary FP8 VP MMA.
     """
     B, HQ, D = q.shape
     H = pool.num_kv_heads
     g = HQ // H
     check_shape_supported(HQ, H, D, prediction=1)
+    _check_decode_metadata(block_tables, seq_lens, B, q.device)
     if v_data_hnd.shape != (pool.k_data.shape[0], H, PAGE_SIZE, D // 2):
         raise ValueError(
             "v_data_hnd must be [page, head, 128, D/2], got "
@@ -796,20 +712,14 @@ def run_paged_fp4_decode_qmul4_v(
         splits, reduction = plan_qmul4_decode(B, H, max_len, q.device)
     else:
         splits, reduction = plan
-    if force_single_split:
-        # 诊断用:关掉 split-K。split 下 kernel 按**每 split 局部 max** 归一化
-        # 后量化 P,参考用全局 max —— 量化标度不同,残差自然不同。
-        splits, reduction = 1, "none"
     if direct_output and reduction not in ("none", "atomic", "kernel"):
         # CGA has unpredicated scalar stores to all physical heads; the
         # gmem-fused reducer currently has an NVFP4-specific output contract.
         raise NotImplementedError(f"direct BF16 output: unsupported {reduction=}")
-    if v_mode not in ("qmul4_d", "qmul4_tmem"):
-        raise ValueError(f"unsupported conventional-V mode: {v_mode}")
     if k_sf_mode not in ("atom", "linear"):
         raise ValueError(f"unsupported K-scale mode: {k_sf_mode}")
     single_softmax_wg = _use_single_softmax_scheduler(
-        g_pad, reduction, v_mode, splits
+        g_pad, reduction, "qmul4_tmem", splits
     )
     f = _compiled(
         H * g_pad,
@@ -817,9 +727,7 @@ def run_paged_fp4_decode_qmul4_v(
         D,
         1,
         reduction,
-        v_mode,
-        qmul4_skip,
-        False,
+        "qmul4_tmem",
         k_sf_mode,
         single_softmax_wg=single_softmax_wg,
         partial_o_dtype=_reduction_workspace_partial_o_dtype(
@@ -837,17 +745,14 @@ def run_paged_fp4_decode_qmul4_v(
             )
         q_pack, q_sf = fused
     else:
-        fused = _quantize_q_cuda(
-            q_eff, H, out_eff if reduction == "atomic" else None
-        )
-        q_pack, q_sf = fused if fused is not None else _quantize_q(q_eff, H)
+        q_pack, q_sf = _quantize_q(q_eff, H)
     o_partial = l_partial = m_partial = None
     if direct_output and reduction == "none":
         # Empty/inactive rows skip the main kernel's output store. Preserve
         # the zero-row contract of the old padded torch.zeros allocation.
         # Atomic already clears below; the separate reducer writes zero.
         out_eff.zero_()
-    if reduction == "atomic" and (fused is None or residue_fold):
+    if reduction == "atomic":
         out_eff.zero_()
     elif reduction == "kernel":
         if reduction_workspace is None:
@@ -901,11 +806,10 @@ def run_paged_fp4_decode_qmul4_v(
         None, None, None, None, o_partial, l_partial, m_partial, None,
         Float32(sm_scale),
         Float32(value_scale),
-        v_mode != "qmul4_tmem",
+        seq_lens,
+        block_tables,
+        False,
         Int32(0),
-        seq_lens.int().contiguous(),
-        kv_indptr[:B].int().contiguous(),
-        kv_indices.int().contiguous(),
     )
     if out_eff is not out:
         out.view(B, H, g, D).copy_(
@@ -978,7 +882,7 @@ def plan_decode_compile_variants(
                 g_pad, reduction, "qmul4_tmem", splits
             )
             args = (num_kv_heads * g_pad, num_kv_heads, head_dim, 1,
-                    reduction, "qmul4_tmem", "none", False, "linear")
+                    reduction, "qmul4_tmem", "linear")
             kwargs = dict(
                 single_softmax_wg=ssw,
                 partial_o_dtype=_reduction_workspace_partial_o_dtype(None),
@@ -1056,8 +960,6 @@ def plan_decode_nvfp4_compile_variants(
                 1,
                 reduction,
                 "qmul4_tmem",
-                "none",
-                False,
                 "linear",
                 True,
                 num_qo_heads,
@@ -1092,57 +994,12 @@ def compile_decode_variant(plan: dict) -> None:
     _compiled(*plan["args"], **plan["kwargs"])
 
 
-def run_paged_fp4_decode_qmul4_tmem(
-    q: torch.Tensor,
-    pool: NvFp4PagedKVPool,
-    v_data_hnd: torch.Tensor,
-    v_sf_bthd: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
-    seq_lens: torch.Tensor,
-    sm_scale: float,
-    out: torch.Tensor,
-    max_seq_len: int = 0,
-    qmul4_skip: str = "none",
-    force_single_split: bool = False,
-    k_sf_mode: str = "atom",
-    value_scale: float = 1.0,
-    reduction_workspace: Qmul4ReductionWorkspace | None = None,
-    residue_fold: bool = False,
-    direct_output: bool = False,
-    plan: tuple[int, str] | None = None,
-) -> torch.Tensor:
-    """TRT-style conventional-V decode with converted V resident in TMEM."""
-    return run_paged_fp4_decode_qmul4_v(
-        q,
-        pool,
-        v_data_hnd,
-        v_sf_bthd,
-        kv_indices,
-        kv_indptr,
-        seq_lens,
-        sm_scale,
-        out,
-        max_seq_len=max_seq_len,
-        qmul4_skip=qmul4_skip,
-        force_single_split=force_single_split,
-        v_mode="qmul4_tmem",
-        k_sf_mode=k_sf_mode,
-        value_scale=value_scale,
-        reduction_workspace=reduction_workspace,
-        residue_fold=residue_fold,
-        direct_output=direct_output,
-        plan=plan,
-    )
-
-
 def run_paged_fp4_decode_qmul4_tmem_nvfp4(
     q: torch.Tensor,
     pool: NvFp4PagedKVPool,
     v_data_hnd: torch.Tensor,
     v_sf_bthd: torch.Tensor,
-    kv_indices: torch.Tensor,
-    kv_indptr: torch.Tensor,
+    block_tables: torch.Tensor,
     seq_lens: torch.Tensor,
     sm_scale: float,
     output_global_scale_inv: torch.Tensor,
@@ -1179,6 +1036,7 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
     if HQ % H:
         raise ValueError(f"H_q={HQ} must be divisible by H_kv={H}")
     check_shape_supported(HQ, H, D, prediction=1)
+    _check_decode_metadata(block_tables, seq_lens, B, q.device)
     g = HQ // H
     g_pad = (
         _residue_padded_group_size(HQ, H)
@@ -1283,8 +1141,6 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         1,
         reduction,
         "qmul4_tmem",
-        "none",
-        False,
         k_sf_mode,
         True,
         HQ,
@@ -1310,10 +1166,7 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
             )
         q_pack, q_sf = fused_q
     else:
-        fused_q = _quantize_q_cuda(q_eff, H)
-        q_pack, q_sf = (
-            fused_q if fused_q is not None else _quantize_q(q_eff, H)
-        )
+        q_pack, q_sf = _quantize_q(q_eff, H)
     k_arg = pool.k_data.view(torch.float4_e2m1fn_x2).permute(0, 2, 1, 3)
     v_arg = v_data_hnd.view(torch.float4_e2m1fn_x2).permute(0, 2, 1, 3)
     o_partial = l_partial = m_partial = completion_counter = None
@@ -1390,10 +1243,9 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         completion_counter,
         Float32(sm_scale),
         Float32(value_scale),
+        seq_lens,
+        block_tables,
         False,
         Int32(0),
-        seq_lens.int().contiguous(),
-        kv_indptr[:B].int().contiguous(),
-        kv_indices.int().contiguous(),
     )
     return out, output_block_scale

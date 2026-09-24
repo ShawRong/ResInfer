@@ -56,8 +56,7 @@ class ResidueDecodeMetadata:
     num_decode_tokens: int
     max_seq_len: int
     seq_lens: torch.Tensor
-    kv_indices: torch.Tensor
-    kv_indptr: torch.Tensor
+    block_tables: torch.Tensor
 
 
 @dataclass
@@ -80,8 +79,6 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
             raise NotImplementedError("ResAttn decode does not support DCP")
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self._init_reorder_batch_threshold(1, supports_spec_as_decode=False)
-        self._residue_offsets = {}
-        self._residue_max_reqs = vllm_config.scheduler_config.max_num_seqs
         self._cg_capture_seq_len = int(
             os.environ.get("RESIDUE_ATTN_CG_CAPTURE_LEN", "0")
         ) or vllm_config.model_config.max_model_len
@@ -101,22 +98,16 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
                 raise NotImplementedError("ResAttn requires one token per decode")
             cam = common_attn_metadata
             table = cam.block_table_tensor[:n]
-            if table.dtype != torch.int32 or not table.is_contiguous():
-                raise ValueError("Expected contiguous int32 stock block table")
-            width = table.shape[1]
-            key = (width, str(table.device))
-            offsets = self._residue_offsets.get(key)
-            if offsets is None:
-                offsets = torch.arange(
-                    self._residue_max_reqs + 1,
-                    dtype=torch.int32, device=table.device,
-                ) * width
-                self._residue_offsets[key] = offsets
-            # The frozen kernel uses only indptr[b] and seq_lens[b], NOT
-            # indptr[b+1]-indptr[b]. Padded rows therefore need no compaction.
+            if (
+                table.dtype != torch.int32 or table.ndim != 2
+                or table.shape[0] != n or table.shape[1] < 1
+                or table.stride(1) != 1 or table.stride(0) < table.shape[1]
+            ):
+                raise ValueError("Expected int32 block table with unit column stride")
             decode = ResidueDecodeMetadata(
-                n, n, cam.max_seq_len, cam.seq_lens[:n],
-                table.view(-1), offsets[:n + 1],
+                num_decodes=n, num_decode_tokens=n,
+                max_seq_len=cam.max_seq_len, seq_lens=cam.seq_lens[:n],
+                block_tables=table,
             )
         return ResAttnFlashInferMetadata(
             **{f.name: getattr(stock, f.name) for f in fields(FlashInferMetadata)},
@@ -185,8 +176,7 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             self._residue_pool = NvFp4PagedKVPool(
                 num_kv_heads=self.num_kv_heads, head_dim=self.head_size,
                 k_data=kd, v_data=vd, k_sf=ks, v_sf=vs,
-                v_staging=torch.empty(0, dtype=torch.bfloat16, device=kv_cache.device),
-                page_size=128, layout_profile="trtllm",
+                page_size=128,
                 k_global_scale=key[-2], v_global_scale=key[-1],
             )
             self._residue_pool_key = key

@@ -1,13 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'ResAttn:MMA-native paged NVFP4 KV cache 管理层 + decode attention 接入。'
+"ResAttn decode kernels and borrowed views of vLLM's NVFP4 KV cache."
 
-from .kv_layout import (  # noqa: F401
-    PAGE_SIZE,
-    PI16,
-    SF_VEC,
-    NvFp4PagedKVPool,
-    sf_atom_gather,
-    sf_atom_offsets,
-    sf_atom_scatter,
-)
+from .kv_layout import PAGE_SIZE, SF_VEC, NvFp4PagedKVPool  # noqa: F401

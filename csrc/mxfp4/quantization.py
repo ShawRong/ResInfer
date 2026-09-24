@@ -5,6 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from ..scale_layout import swizzle_scales
+
 
 def _ceildiv(value, divisor):
     return (value + divisor - 1) // divisor
@@ -79,31 +81,3 @@ def quantize_mext(source, *, layout="128x4", recipe="ceil",
     return quantize_residue(source, layout=layout,
                           mext_layout=mext_layout,
                           m_pad_multiple=m_pad_multiple, pdl_mode=pdl_mode)
-
-
-def swizzle_scales(scales):
-    if (scales.ndim not in (2, 3) or scales.dtype != torch.uint8
-            or not scales.is_cuda or not scales.is_contiguous()):
-        raise ValueError(
-            "expected contiguous CUDA uint8 [M,K/32] or [E,M,K/32]"
-        )
-    rows, groups = scales.shape[-2:]
-    if groups <= 0:
-        raise ValueError("scale K extent must be nonempty")
-    padded_rows = _ceildiv(rows, 128) * 128
-    padded_groups = _ceildiv(groups, 4) * 4
-    batched = scales.ndim == 3
-    experts = scales.shape[0] if batched else 1
-    padded = F.pad(
-        scales.reshape(experts, rows, groups),
-        (0, padded_groups - groups, 0, padded_rows - rows),
-    )
-    result = (
-        padded.reshape(
-            experts, padded_rows // 128, 4, 32, padded_groups // 4, 4
-        )
-        .permute(0, 1, 4, 3, 2, 5)
-        .contiguous()
-        .reshape(experts, padded_rows * padded_groups)
-    )
-    return result if batched else result[0]

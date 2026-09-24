@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors (modifications)
 # SPDX-License-Identifier: BSD-3-Clause
-"ResAttn: paged NVFP4 GQA decode attention (Blackwell tcgen05, CuTeDSL).\n\nDerived from FlashInfer's ``flashinfer/cute_dsl/attention/gqa_decode.py``\n(NVIDIA, BSD-3-Clause), which this file keeps the license of. Current production mode is ``qmul4_tmem``: FP4 QK with optional Q\nresidue, conventional token-major V, QMUL4 conversion, and BF16 or packed\nNVFP4 output. Paged addressing, padded/residue head mapping and fused output\nreducers are local extensions."
+"ResAttn: paged NVFP4 GQA decode attention (Blackwell tcgen05, CuTeDSL).\n\nDerived from FlashInfer's ``flashinfer/cute_dsl/attention/gqa_decode.py``\n(NVIDIA, BSD-3-Clause). The production mode is ``qmul4_tmem``: FP4 QK with optional Q\nresidue, conventional token-major V, QMUL4 conversion, and BF16 or packed\nNVFP4 output. Paged addressing, padded/residue head mapping and fused output\nreducers are local extensions."
 
 import math
 import os
@@ -33,7 +33,6 @@ from cutlass.cute.typing import (
 )
 
 from .qmul4 import (
-    dequantize_nvfp4_tile_d,
     dequantize_nvfp4x8_ldsm,
 )
 
@@ -85,28 +84,15 @@ class GroupedQueryAttentionDecodePagedFp4:
         *,
         page_size=128,
         tma_mask=False,
-        # Experimental decode-only R1. Production host.py does not currently
-        # enable this flag; RESIDUE_ATTN=1 selects the backend, not this tactic.
-        # It is structurally compatible with the active qmul4_tmem path, whose
-        # converted V and P use the ordinary FP8 VP MMA.  Only the retired
-        # native_token path needs a separate FP4 P/VP fragment fold.
         residue_fold=False,
-        perf_probe=0,
         blocks_per_sm=1,
-        v_mode: Literal[
-            "native_token", "qmul4_d", "qmul4_tmem"
-        ] = "native_token",
+        v_mode: Literal["qmul4_tmem"] = "qmul4_tmem",
         k_sf_mode: Literal["atom", "linear"] = "atom",
         logical_grouped_heads: int | None = None,
         reg_reconfig_q16: bool = False,
         single_softmax_wg: bool = False,
         smem_correction_broadcast: bool = False,
         qmul4_interleave: int = 0,
-        # 诊断用 qmul4 分段消融:"none" 全量 / "conv" 跳过转换 /
-        # "mma" 跳过 VP MMA。每级只摘掉**一个**嫌疑、保持流水线握手完整,
-        # 所以 trap 是否消失能直接归因。生产路径恒为 "none";
-        # 编译期常量(坑38:绝不再走运行期参数)。
-        qmul4_skip: Literal["none", "conv", "mma"] = "none",
     ):
         """
         Parameters
@@ -156,18 +142,10 @@ class GroupedQueryAttentionDecodePagedFp4:
         # 后半程是 FP8 P/VP，结构上不受下面的 native-token 断言限制；但 host
         # 尚未生成该 Q 布局，也未把此 flag 放入编译键，因此 serving 并未启用。
         self.residue_fold = residue_fold
-        # perf 分解:1=跳过 P 字节写(保留转换);2=跳过整个 P 量化+写
-        self.perf_probe = perf_probe
         # 2 CTA/SM 实验:smem/寄存器预算均分 + launch bound(延迟型节拍的跨 CTA 填缝)
         self.blocks_per_sm = blocks_per_sm
-        # ``native_token`` keeps the original blockscaled VP path and its
-        # token-contiguous V page. ``qmul4_d`` consumes conventional
-        # D-contiguous NVFP4 pages, expands them to an FP8-ready SMEM FIFO,
-        # and executes the ordinary FP8 VP MMA. ``qmul4_tmem`` keeps the same
-        # cache contract but follows TRT-LLM decode: LDSM.U4 -> QMUL4 -> STTM,
-        # with converted V used as the TMEM A operand of VP. This must be
-        # explicit: all three cache modes carry e2m1 bytes but have different
-        # layout and pipeline ownership.
+        # The cache uses D-contiguous NVFP4 pages. V is converted through
+        # LDSM.U4 -> QMUL4 -> STTM before the VP MMA.
         self.v_mode = v_mode
         # ``atom`` is the historical ResAttn cache contract. ``linear`` is
         # vLLM/FlashInfer's TRT-LLM Gen NVFP4 contract: one scale byte per
@@ -208,7 +186,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             raise ValueError("qmul4_interleave must be 0, 1, 2, 4 or 8")
         if qmul4_interleave and v_mode != "qmul4_tmem":
             raise ValueError("atom-level interleave requires qmul4_tmem")
-        self.qmul4_skip = qmul4_skip
         # The direct-to-TMEM path needs a conversion warpgroup in addition to
         # the historical MMA/TMA, 2x softmax, and correction warpgroups.
         self.threads_per_cta = (
@@ -239,7 +216,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                 self.do_none_red,
             )
         ) == 1
-        assert v_mode in ("native_token", "qmul4_d", "qmul4_tmem"), v_mode
+        assert v_mode == "qmul4_tmem", v_mode
         if self.do_cga_red and v_mode != "qmul4_tmem":
             raise ValueError("cga_sharded is implemented only for qmul4_tmem")
         if self.do_gmem_fused_red and (
@@ -262,7 +239,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 and single_softmax_wg
                 and grouped_head_tile in (8, 16)
             )
-        assert qmul4_skip in ("none", "conv", "mma"), qmul4_skip
         if residue_fold:
             # R1 范围:decode(s_q=1),folded 宽度 = grouped_head_tile/2
             assert prediction_tile == 1 and grouped_head_tile % 2 == 0
@@ -415,12 +391,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         completion_counter: Optional[cute.Tensor],
         scale_s: Float32,
         scale_o: Float32,
+        seq_lens: cute.Tensor,
+        block_tables: cute.Tensor,
         stream: cuda.CUstream,
         enable_pdl: bool = True,
         sfq_tx: Int32 = Int32(0),  # DEBUG: SFQ expect 字节覆盖(0=用布局账)
-        seqlens: Optional[cute.Tensor] = None,  # 必填:per-batch kv 长度 (Int32, (B,))
-        table_offsets: Optional[cute.Tensor] = None,  # 必填:kv_indptr[:B] (Int32, (B,))
-        page_table: Optional[cute.Tensor] = None,  # 必填:扁平物理页号 (Int32, (Ltot,))
     ):
         """
         Parameters
@@ -430,13 +405,14 @@ class GroupedQueryAttentionDecodePagedFp4:
         q_bshd
             Q tensor in BSHD logical view.
         k_bshd, v_bshd
-            分页 KV 池的逻辑视图,shape 均为 (P, page_size, h_k, d):
-            K 物理 (P, h_k, page_size, d/2) HND fp4;V 物理 (P, h_k, d,
-            page_size/2)(页内 token-innermost,坑28)。gemm_view 之后分别成
-            (page_size, d, (h_k, P)) 与 (d, page_size, (h_k, P)) ——
-            页号是 l 模坐标,页表在 kernel 内换算。
-        seqlens / table_offsets / page_table
-            变长 + 分页元数据(flashinfer indptr/indices 约定);三者必填。
+            Paged KV views with logical shape (pages, page_size, h_k, d).
+            Both borrow conventional HND packed-FP4 storage. The block table
+            maps each request's logical pages to physical cache pages.
+        seq_lens
+            Int32 KV lengths, shape (batch,). Only live pages are read.
+        block_tables
+            Int32 physical page IDs, shape (batch, max_pages_per_seq).
+            Columns have unit stride; the row stride may include padding.
         o_bshd
             Output tensor. Must be zero initialized for atomic reduction. A
             Float4E2M1FN tensor selects the fused NVFP4 epilogue in either the
@@ -469,10 +445,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         enable_pdl
             Programmatic Dependent Launch. Runtime-dynamic — no recompile on
             toggle.
-        seqlens
-            变长(varlen)模式:per-batch 真实 kv 长度 (Int32, shape (B,))。
-            None = 等长,取 ``k_bshd.shape[1]``。非 None 时 K/V/SF 缓冲仍按
-            padded S_max 布局,尾部掩码/exit_early 由各 CTA 的运行时长度驱动。
         """
         ##############################
         # TiledMma creation
@@ -599,9 +571,8 @@ class GroupedQueryAttentionDecodePagedFp4:
             self.v_mode == "native_token"
             and v_cache_dtype == cutlass.Float4E2M1FN
         )
-        if cutlass.const_expr(use_qmul4_v):
-            assert v_cache_dtype == cutlass.Float4E2M1FN
-            assert v_sf is not None
+        assert v_cache_dtype == cutlass.Float4E2M1FN
+        assert v_sf is not None
         vp_dtype = cutlass.Float8E4M3FN if use_qmul4_v else v_cache_dtype
         # 分页变体:mma_tile_k_vp 固定 128 = page_size ⇒ V/SFV 每 stage 恰好
         # 一页,TMA box 不跨页。dense 曾用 256(128B/行),但坑32 记录表明
@@ -617,55 +588,25 @@ class GroupedQueryAttentionDecodePagedFp4:
         mma_tile_mnk_vp = (mma_tile_m_vp, mma_tile_n, mma_tile_k_vp)
         tiles_sk_host = blk_tile_s // mma_tile_k_vp
         tiles_dm = math.ceil(blk_tile_d / mma_tile_m_vp)  # e2m1(Phase2)或 fp8(Phase1)
-        if cutlass.const_expr(use_nvfp4_vp):
-            # 坑24:tcgen05 fp4 操作数只能 K-major(坑18 正主)。布局函数会静默
-            # 翻转,但 MMA 的 major 声明必须手动跟上 —— 否则硬件按 MN 语义解释
-            # 描述符,B 侧读数出区(B200 六轮探针:P 区任意写均不影响输出)。
-            # KQ 的 fp4 MMA 声明 K ✓ 正常,此处曾漏改。
-            tiled_mma_vp = sm100_utils.make_blockscaled_trivial_tiled_mma(
-                vp_dtype,
-                OperandMajorMode.K,  # V
-                OperandMajorMode.K,  # P
-                sf_dtype,
-                sf_vec_size,
-                tcgen05.CtaGroup.ONE,
-                (mma_tile_m_vp, mma_tile_n),
-            )
-            tiled_mma_vp_sfb = sm100_utils.make_blockscaled_trivial_tiled_mma(
-                vp_dtype,
-                OperandMajorMode.K,
-                OperandMajorMode.K,
-                sf_dtype,
-                sf_vec_size,
-                tcgen05.CtaGroup.ONE,
-                (mma_tile_mnk[0], max(128, mma_tile_n)),
-            )
-        else:
-            
-            
-            
-            
-            
-            
-            tiled_mma_vp = sm100_utils.make_trivial_tiled_mma(
-                mma_dtype,
-                mma_dtype,
-                OperandMajorMode.K,   # V:token 最内(收缩轴)
-                (
-                    OperandMajorMode.K
-                    if self.swap_ab_for_gen
-                    else OperandMajorMode.MN
-                ),  # P: generation Q8 uses K-major to make N8 legal
-                acc_dtype,
-                tcgen05.CtaGroup.ONE,
-                mma_tile_mnk[:2],
-                (
-                    tcgen05.OperandSource.TMEM
-                    if use_qmul4_v_tmem
-                    else tcgen05.OperandSource.SMEM
-                ),
-            )
-            tiled_mma_vp_sfb = None
+        tiled_mma_vp = sm100_utils.make_trivial_tiled_mma(
+            mma_dtype,
+            mma_dtype,
+            OperandMajorMode.K,   # V:token 最内(收缩轴)
+            (
+                OperandMajorMode.K
+                if self.swap_ab_for_gen
+                else OperandMajorMode.MN
+            ),  # P: generation Q8 uses K-major to make N8 legal
+            acc_dtype,
+            tcgen05.CtaGroup.ONE,
+            mma_tile_mnk[:2],
+            (
+                tcgen05.OperandSource.TMEM
+                if use_qmul4_v_tmem
+                else tcgen05.OperandSource.SMEM
+            ),
+        )
+        tiled_mma_vp_sfb = None
 
         ##############################
         # Calculate stage counts
@@ -686,21 +627,17 @@ class GroupedQueryAttentionDecodePagedFp4:
             # SF TMEM 列(cutlass 示例 :373 公式:tile/sf_atom_mn(=32) × mma_inst_tile_k(=4))
             sf_cols += (mma_tile_m // 32) * 4  # SFK
             sf_cols += (mma_tile_n_sfb // 32) * 4  # SFQ
-        if cutlass.const_expr(use_nvfp4_vp):
-            sf_cols += (mma_tile_m_vp // 32) * 4  # SFV
-            sf_cols += (mma_tile_n_sfb // 32) * 4  # SFP
         # TRT-style direct conversion stores one FP8 V stage in TMEM.  A
         # 128x128 E4M3 tile consumes 128*8/32 = 32 TMEM columns.  Reserve this
         # ring before allowing S to consume the remaining columns; otherwise
         # the old greedy S-stage calculation leaves no legal V allocation.
         self.cvt_stages = cvt_stages = 0
         cvt_stage_cols = mma_tile_k_vp * vp_dtype.width // 32
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            cvt_budget = tmem_capacity_cols - tmem_alloc_cols - sf_cols
-            cvt_stages = min(8, cvt_budget // cvt_stage_cols)
-            assert cvt_stages >= 2
-            self.cvt_stages = cvt_stages
-            tmem_alloc_cols += cvt_stages * cvt_stage_cols
+        cvt_budget = tmem_capacity_cols - tmem_alloc_cols - sf_cols
+        cvt_stages = min(8, cvt_budget // cvt_stage_cols)
+        assert cvt_stages >= 2
+        self.cvt_stages = cvt_stages
+        tmem_alloc_cols += cvt_stages * cvt_stage_cols
         # po2 向上取整会再吃一截,故按 po2 后的额度反推 S 的可用列
         _budget = tmem_capacity_cols - tmem_alloc_cols - sf_cols
         max_s_stages = max(1, _budget // tmem_s_stage_cols)
@@ -719,10 +656,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         # FP8 and a separate packed raw-V stage is accounted below.
         mk_stage_bits = mma_tile_m_vp * mma_tile_k_vp * vp_dtype.width
         v_raw_stage_bits = 0
-        if cutlass.const_expr(use_qmul4_v_smem):
-            v_raw_stage_bits = (
-                mma_tile_m_vp * mma_tile_k_vp * v_cache_dtype.width
-            )
         k_stage_bits = mma_tile_m * mma_tile_k * kq_dtype.width  # K stage(fp4 时减半)
         nk_stage_bits = mma_tile_n * mma_tile_k * kq_dtype.width  # Q(与 K 同 dtype)
         mn_stage_bits = mma_tile_m * mma_tile_n * mma_dtype.width
@@ -770,24 +703,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         
         sfv_stage_bits = 0
         sfp_total_bits = 0
-        if cutlass.const_expr(use_nvfp4_vp):
-            sfv_stage_bits = (
-                mma_tile_m_vp * (mma_tile_k_vp // sf_vec_size) * sf_dtype.width
-            )
-            sfp_total_bits = (
-                mma_tile_n_sfb
-                * (mma_tile_k_vp // sf_vec_size)
-                * sf_dtype.width
-                * (blk_tile_s // mma_tile_k_vp)
-            )
-        elif cutlass.const_expr(use_qmul4_v):
-            # Conventional V has one D-scale for every 16 adjacent values.
-            # A raw 128x128 page therefore carries 128/16 * 128 = 1024 B.
-            sfv_stage_bits = (
-                (mma_tile_m_vp // sf_vec_size)
-                * mma_tile_k_vp
-                * sf_dtype.width
-            )
+        sfv_stage_bits = (
+            (mma_tile_m_vp // sf_vec_size)
+            * mma_tile_k_vp
+            * sf_dtype.width
+        )
         # Q(+SFQ), S, P, O
         smem_alloc_bits += tiles_dk * nk_stage_bits + mbarrier_bits  # 1 mbar for Q
         smem_alloc_bits += sfq_total_bits
@@ -795,10 +715,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         smem_alloc_bits += s_stages * pipe_stage_bits  # s in tmem
         smem_alloc_bits += p_stages * (tiles_sm * mn_stage_bits + pipe_stage_bits)
         smem_alloc_bits += o_stages * pipe_stage_bits  # o in tmem
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            # TMEM-ready V owns an independent AsyncUmma barrier ring whose
-            # depth is ``cvt_stages``, not the raw SMEM/K stage count.
-            smem_alloc_bits += cvt_stages * pipe_stage_bits
+        smem_alloc_bits += cvt_stages * pipe_stage_bits
         alignment_bits = 1024 - (smem_alloc_bits % 1024)
         # K(+SFK)与 V:两条独立流水线,等 stage 数(坑1:拆分决策见 plan doc)
         smem_capacity_bits = (
@@ -884,91 +801,23 @@ class GroupedQueryAttentionDecodePagedFp4:
         # mixed-input decode geometry: sub-byte V is carried in 8-bit SMEM
         # containers and unpacked by LDSM.U4 before STTM. The legacy qmul4_d
         # path keeps its compact FP4 raw tile plus separate FP8-ready tile.
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            smem_layout_v = sm100_utils.make_smem_layout_a(
-                tiled_mma_vp,
-                mma_tile_mnk_vp,
-                cutlass.Int8,
-                kv_stages,
-                is_k_major=False,
-            )
-        else:
-            smem_layout_v = sm100_utils.make_smem_layout_a(
-                tiled_mma_vp, mma_tile_mnk_vp, vp_dtype, kv_stages
-            )
+        smem_layout_v = sm100_utils.make_smem_layout_a(
+            tiled_mma_vp,
+            mma_tile_mnk_vp,
+            cutlass.Int8,
+            kv_stages,
+            is_k_major=False,
+        )
         smem_layout_v_raw = None
         smem_layout_v_raw_tma = None
         smem_layout_v_ready = None
         smem_layout_v_sf_d = None
-        if cutlass.const_expr(use_qmul4_v_smem):
-            # Both aliases are logical (D, token, stage) views. The ready
-            # layout is physically identical to ``smem_layout_v`` above but
-            # exposes complete 16-D slices to the conversion warp. The MMA
-            # still consumes the partitioned alias made by make_smem_layout_a.
-            raw_atom = tcgen05.make_smem_layout_atom(
-                tcgen05.mma.SmemLayoutAtomKind.MN_SW64, v_cache_dtype
-            )
-            ready_atom = tcgen05.make_smem_layout_atom(
-                tcgen05.mma.SmemLayoutAtomKind.MN_SW128, vp_dtype
-            )
-            smem_layout_v_raw = cute.tile_to_shape(
-                raw_atom,
-                (mma_tile_m_vp, mma_tile_k_vp, kv_stages),
-                order=(1, 0, 2),
-            )
-            # TMA describes packed bytes, not sub-byte logical scalars. Keep
-            # a byte-shaped alias for the transfer while LDS sees the FP4
-            # logical alias above; both carry the same 128B MN swizzle.
-            raw_tma_atom = tcgen05.make_smem_layout_atom(
-                tcgen05.mma.SmemLayoutAtomKind.MN_SW64, cutlass.Uint8
-            )
-            smem_layout_v_raw_tma = cute.tile_to_shape(
-                raw_tma_atom,
-                (mma_tile_m_vp // 2, mma_tile_k_vp, kv_stages),
-                order=(1, 0, 2),
-            )
-            smem_layout_v_ready = cute.tile_to_shape(
-                ready_atom,
-                (mma_tile_m_vp, mma_tile_k_vp, kv_stages),
-                order=(1, 0, 2),
-            )
-        if cutlass.const_expr(use_qmul4_v):
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            
-            _sf_blocks = mma_tile_m_vp // 16
-            _tile_sf = _sf_blocks * mma_tile_k_vp
-            smem_layout_v_sf_d = cute.make_layout(
-                (16, _tile_sf // 16, kv_stages),
-                stride=(1, 16, _tile_sf),
-            )
+        _sf_blocks = mma_tile_m_vp // 16
+        _tile_sf = _sf_blocks * mma_tile_k_vp
+        smem_layout_v_sf_d = cute.make_layout(
+            (16, _tile_sf // 16, kv_stages),
+            stride=(1, 16, _tile_sf),
+        )
         # SF smem 布局(仅 nvfp4;SFQ 单份、SFK 随 K stage)
         smem_layout_sfk = None
         smem_layout_sfk_raw = None
@@ -999,18 +848,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             )
         # Phase2:SFV(V-scale 沿 token,VP 的 A 侧)随 V stage
         smem_layout_sfv = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            smem_layout_sfv = blockscaled_utils.make_smem_layout_sfa(
-                tiled_mma_vp, mma_tile_mnk_vp, sf_vec_size, kv_stages
-            )
         smem_layout_sfp = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            smem_layout_sfp = blockscaled_utils.make_smem_layout_sfb(
-                tiled_mma_vp_sfb,
-                (mma_tile_mnk_vp[0], mma_tile_n_sfb, mma_tile_mnk_vp[2]),
-                sf_vec_size,
-                blk_tile_s // mma_tile_mnk_vp[2],
-            )
 
         # In the no-split specialization the otherwise-idle TMA warp owns the
         # quantizer.  Split-K must first publish FP32 partials, so only its
@@ -1055,63 +893,36 @@ class GroupedQueryAttentionDecodePagedFp4:
         )
         tma_tile_mnk_vp = (mma_tile_m_vp, tma_tile_n, mma_tile_k_vp)
         tma_atom_v_sf_d = tma_tensor_v_sf_d = None
-        if cutlass.const_expr(use_qmul4_v_smem):
-            # Standard HND page: mV=(D, token, (head,page)), D contiguous.
-            # TMA lands in the raw MN-swizzled alias; no tensor-core operand
-            # descriptor is constructed until after the QMUL4 transform.
-            mV_bytes = cute.recast_tensor(mV_mkl, cutlass.Uint8)
-            tma_atom_v, tma_tensor_v = cute.nvgpu.cpasync.make_tiled_tma_atom(
-                tma_load_op,
-                mV_bytes,
-                cute.slice_(smem_layout_v_raw_tma, (None, None, 0)),
-                (mma_tile_m_vp // 2, mma_tile_k_vp),
-            )
-        elif cutlass.const_expr(use_qmul4_v_tmem):
-            # NVIDIA mixed-input decode keeps packed FP4 in an 8-bit SMEM
-            # carrier layout, then LDSM.U4 unpacks it into registers.  Using
-            # make_tiled_tma_atom_A here is important: its partition matches
-            # the later LDSM -> STTM copy geometry exactly.
-            tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mV_mkl,
-                cute.select(smem_layout_v, mma_modes),
-                tma_tile_mnk_vp,
-                tiled_mma_vp,
-                internal_type=cutlass.Int8,
-            )
-        else:
-            tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mV_mkl,
-                cute.select(smem_layout_v, mma_modes),
-                tma_tile_mnk_vp,
-                tiled_mma_vp,
-            )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mV_mkl,
+            cute.select(smem_layout_v, mma_modes),
+            tma_tile_mnk_vp,
+            tiled_mma_vp,
+            internal_type=cutlass.Int8,
+        )
 
-        if cutlass.const_expr(use_qmul4_v):
-            # v_sf 是 trtllm 契约 [P, H, ps, S](tile 内 4-token interleave)。
-            # 每 (page,head) 的 tile 连续 ⇒ 直接按扁平 (16, tile/16) 视图搬。
-            _tsf = (self.headdim // 16) * self.page_size
-            _hkv = v_sf.shape[1]
-            mVSF_d = cute.make_tensor(
-                v_sf.iterator,
-                cute.make_layout(
-                    (16, _tsf // 16, (_hkv, v_sf.shape[0])),
-                    stride=(
-                        1,
-                        16,
-                        (v_sf.stride[1], v_sf.stride[0]),
-                    ),
+        _tsf = (self.headdim // 16) * self.page_size
+        _hkv = v_sf.shape[1]
+        mVSF_d = cute.make_tensor(
+            v_sf.iterator,
+            cute.make_layout(
+                (16, _tsf // 16, (_hkv, v_sf.shape[0])),
+                stride=(
+                    1,
+                    16,
+                    (v_sf.stride[1], v_sf.stride[0]),
                 ),
+            ),
+        )
+        tma_atom_v_sf_d, tma_tensor_v_sf_d = (
+            cute.nvgpu.cpasync.make_tiled_tma_atom(
+                tma_load_op,
+                mVSF_d,
+                cute.slice_(smem_layout_v_sf_d, (None, None, 0)),
+                (16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
             )
-            tma_atom_v_sf_d, tma_tensor_v_sf_d = (
-                cute.nvgpu.cpasync.make_tiled_tma_atom(
-                    tma_load_op,
-                    mVSF_d,
-                    cute.slice_(smem_layout_v_sf_d, (None, None, 0)),
-                    (16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
-                )
-            )
+        )
         # SF gmem 视图 + TMA(仅 nvfp4)。k_sf/q_sf 为平铺 e4m3 缓冲,按 SF-atom 布局解释:
         # K-SF Shape=(S, D, (h_k,b));Q-SF Shape=(N_pad, D, (h_k,b)),N_pad=mma_tile_n_sfb。
         tma_atom_sfk = tma_tensor_sfk = None
@@ -1173,33 +984,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         # (M=D, K=S, l) 解释(VP 的收缩轴 = token)。
         tma_atom_sfv = tma_tensor_sfv = None
         tma_atom_sfp = tma_tensor_sfp = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            sfv_layout = self._sf_layout_hb(
-                mV_mkl.shape[0], mV_mkl.shape[1], mV_mkl.shape[2], sf_vec_size
-            )
-            mSFV = cute.make_tensor(v_sf.iterator, sfv_layout)
-            tma_atom_sfv, tma_tensor_sfv = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mSFV,
-                cute.select(smem_layout_sfv, mma_modes),
-                tma_tile_mnk_vp,
-                tiled_mma_vp,
-            )
-            sfp_layout = blockscaled_utils.tile_atom_to_shape_SF(
-                (mma_tile_n_sfb, blk_tile_s, 1), sf_vec_size
-            )
-            mSFP = cute.make_tensor(p_sf.iterator, sfp_layout)
-            sfb_op_vp = sm100_utils.cluster_shape_to_tma_atom_SFB(
-                (1, 1), tiled_mma_vp_sfb.thr_id
-            )
-            tma_atom_sfp, tma_tensor_sfp = cute.nvgpu.make_tiled_tma_atom_B(
-                sfb_op_vp,
-                mSFP,
-                cute.select(smem_layout_sfp, mma_modes),
-                (mma_tile_mnk_vp[0], mma_tile_n_sfb, mma_tile_mnk_vp[2]),
-                tiled_mma_vp_sfb,
-                internal_type=cutlass.Int16,
-            )
 
         tma_atom_o = tma_tensor_o = None
         if cutlass.const_expr(not quantize_o_main):
@@ -1318,10 +1102,9 @@ class GroupedQueryAttentionDecodePagedFp4:
             completion_counter,
             scale_s_log2_e,
             scale_o,
+            seq_lens,
+            block_tables,
             sfq_tx,
-            seqlens,
-            table_offsets,
-            page_table,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1389,37 +1172,33 @@ class GroupedQueryAttentionDecodePagedFp4:
 
                 mmas_k = cute.size(tAtV_cvt.shape[2])
                 for mma_k in cutlass.range_constexpr(mmas_k):
-                    mma_selected = cutlass.const_expr(
-                        self.qmul4_skip != "mma"
+                    tiled_mma_vp.set(
+                        tcgen05.Field.ACCUMULATE,
+                        not (
+                            initialize_o
+                            and sk == 0
+                            and dm == 0
+                            and mma_k == 0
+                        ),
                     )
-                    if mma_selected:
-                        tiled_mma_vp.set(
-                            tcgen05.Field.ACCUMULATE,
-                            not (
-                                initialize_o
-                                and sk == 0
-                                and dm == 0
-                                and mma_k == 0
-                            ),
-                        )
-                        cute.gemm(
-                            tiled_mma_vp,
-                            tCtO[mma_dice + (dm, o_handle.index)],
-                            tAtV_cvt[
-                                None,
-                                None,
-                                mma_k,
-                                v_mma_handle.index,
-                            ],
-                            tBsP_desc[
-                                None,
-                                None,
-                                mma_k,
-                                sk,
-                                p_handle.index,
-                            ],
-                            tCtO[mma_dice + (dm, o_handle.index)],
-                        )
+                    cute.gemm(
+                        tiled_mma_vp,
+                        tCtO[mma_dice + (dm, o_handle.index)],
+                        tAtV_cvt[
+                            None,
+                            None,
+                            mma_k,
+                            v_mma_handle.index,
+                        ],
+                        tBsP_desc[
+                            None,
+                            None,
+                            mma_k,
+                            sk,
+                            p_handle.index,
+                        ],
+                        tCtO[mma_dice + (dm, o_handle.index)],
+                    )
                 # PipelineAsyncUmma's empty arrival is ordered after all
                 # tensor-core reads of this converted V slot.
                 v_mma_handle.release()
@@ -1491,10 +1270,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         mCompletion: Optional[cute.Tensor],
         scale_s_log2_e: Float32,
         scale_o: Float32,
+        mSeqLens: cute.Tensor,
+        mBlockTables: cute.Tensor,
         sfq_tx: Int32 = Int32(0),
-        mSeqlens: Optional[cute.Tensor] = None,
-        mTableOffsets: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,
     ):
         ##############################
         # Static variables
@@ -1567,9 +1345,8 @@ class GroupedQueryAttentionDecodePagedFp4:
         warpgroup_id += 1
 
         conversion_warpgroup_id = -1
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            conversion_warpgroup_id = warpgroup_id
-            warpgroup_id += 1
+        conversion_warpgroup_id = warpgroup_id
+        warpgroup_id += 1
 
         softmax_warpgroups = 1 if self.single_softmax_wg else 2
         softmax_warpgroup_ids = tuple(
@@ -1698,11 +1475,9 @@ class GroupedQueryAttentionDecodePagedFp4:
                         code
                     )
 
-        # 分页 + 变长:per-batch 元数据直读(均匀地址 4B,L1 广播;host 预写,
-        # 不依赖 PDL 护栏 —— 与 K/V 数据读不同)。mK.shape[0] 现在是 page_size,
-        # 序列长度唯一来源是 seqlens;table_offset 定位本序列在页表中的起点。
-        seqlen = mSeqlens[coord_b]
-        table_offset = mTableOffsets[coord_b]
+        # Lengths bound the live pages in each row. CuTe preserves the source
+        # block table's row stride, including any unused trailing columns.
+        seqlen = mSeqLens[coord_b]
         page_size = self.page_size
         pages_s = blk_tile_s // page_size  # 每 blk tile 页数(256/128 = 2)
         page_count = cute.ceil_div(seqlen, page_size)
@@ -1721,8 +1496,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
-            if cutlass.const_expr(use_qmul4_v):
-                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v_sf_d)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v_sf_d)
             if cutlass.const_expr(not quantize_o):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
         init_warp += 1
@@ -1833,8 +1607,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 cute.arch.mbarrier_init(q_load_mbar, 1)
                 if cutlass.const_expr(use_nvfp4_kq):
                     cute.arch.mbarrier_init(sfq_mbar, 1)
-                if cutlass.const_expr(use_nvfp4_vp):
-                    cute.arch.mbarrier_init(sfp_mbar, 1)
                 cute.arch.mbarrier_init_fence()
                 cute.arch.mbarrier_arrive_and_expect_tx(q_load_mbar, expect_tx_bytes)
                 if cutlass.const_expr(use_nvfp4_kq):
@@ -1844,11 +1616,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     if sfq_tx > 0:
                         sfq_expect = sfq_tx
                     cute.arch.mbarrier_arrive_and_expect_tx(sfq_mbar, sfq_expect)
-                if cutlass.const_expr(use_nvfp4_vp):
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        sfp_mbar,
-                        cutlass.Int32(cute.size_in_bytes(sf_dtype, smem_layout_sfp)),
-                    )
         init_warp += 1
 
         # Initialize pipelines. Native-token keeps the historical interleaved
@@ -1861,92 +1628,63 @@ class GroupedQueryAttentionDecodePagedFp4:
                 sf_dtype, cute.select(smem_layout_sfk, mma_modes)
             )
         v_stage_bytes = mma_tile_m_vp * mma_tile_k_vp * vp_dtype.width // 8
-        if cutlass.const_expr(use_nvfp4_vp and self.perf_probe != 3):
-            v_stage_bytes += cute.size_in_bytes(
-                sf_dtype, cute.select(smem_layout_sfv, mma_modes)
-            )
         kv_producer = kv_consumer = None
         k_producer = k_consumer = None
         v_raw_producer = v_raw_consumer = None
         v_ready_producer = v_ready_consumer = None
-        if cutlass.const_expr(use_qmul4_v):
-            k_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
-            k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
-                num_stages=kv_stages,
-                producer_group=tma_group,
-                consumer_group=mma_group,
-                tx_count=k_stage_bytes,
-                barrier_storage=k_pipeline_ptr,
-                cta_layout_vmnk=mcast_layout,
-                defer_sync=True,
-            ).make_participants()
-            if cutlass.const_expr(use_qmul4_v_smem):
-                v_raw_stage_bytes = cute.size_in_bytes(
-                    cutlass.Uint8,
-                    cute.slice_(smem_layout_v_raw_tma, (None, None, 0)),
-                )
-            else:
-                # ``smem_layout_v`` is an Int8 carrier layout, but TMA
-                # expands each packed FP4 nibble into that carrier.  Barrier
-                # transaction bytes are counted at the *gmem source* width,
-                # exactly as NVIDIA's mixed-input decode does.  Counting the
-                # carrier width here advertised 16 KiB while TMA only
-                # completed 8 KiB, so the conversion WG waited forever on
-                # the first raw-V stage.
-                v_raw_stage_bytes = cute.size_in_bytes(
-                    cutlass.Float4E2M1FN,
-                    cute.select(smem_layout_v, mma_modes),
-                )
-            v_raw_stage_bytes += cute.size_in_bytes(
-                sf_dtype, cute.slice_(smem_layout_v_sf_d, (None, None, 0))
-            )
-            v_raw_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
-            v_raw_producer, v_raw_consumer = pipeline.PipelineTmaAsync.create(
-                num_stages=kv_stages,
-                producer_group=tma_group,
-                consumer_group=(
-                    warpgroup_cooperative
-                    if use_qmul4_v_tmem
-                    else thr_cg(warp_threads)
-                ),
-                tx_count=v_raw_stage_bytes,
-                barrier_storage=v_raw_pipeline_ptr,
-                cta_layout_vmnk=mcast_layout,
-                # PipelineTmaAsync releases an empty slot from one signaling
-                # lane per consumer warp. Recompute the barrier arrive count
-                # from the full consumer group (4 lanes for qmul4_tmem, 1 for
-                # qmul4_d); otherwise the first raw-V ring reuse waits for
-                # 128/32 arrivals while only 4/1 can ever be issued.
-                enable_multicast_signaling=True,
-                defer_sync=True,
-            ).make_participants()
-            v_ready_stages = (
-                self.cvt_stages if use_qmul4_v_tmem else kv_stages
-            )
-            v_ready_pipeline_ptr = smem.allocate_array(Int64, v_ready_stages * 2)
-            v_ready_producer, v_ready_consumer = pipeline.PipelineAsyncUmma.create(
-                num_stages=v_ready_stages,
-                producer_group=(
-                    warpgroup_cooperative
-                    if use_qmul4_v_tmem
-                    else thr_cg(warp_threads)
-                ),
-                consumer_group=mma_group,
-                barrier_storage=v_ready_pipeline_ptr,
-                cta_layout_vmnk=mcast_layout,
-                defer_sync=True,
-            ).make_participants()
-        else:
-            kv_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
-            kv_producer, kv_consumer = pipeline.PipelineTmaUmma.create(
-                num_stages=kv_stages,
-                producer_group=tma_group,
-                consumer_group=mma_group,
-                tx_count=v_stage_bytes,
-                barrier_storage=kv_pipeline_ptr,
-                cta_layout_vmnk=mcast_layout,
-                defer_sync=True,
-            ).make_participants()
+        k_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
+        k_producer, k_consumer = pipeline.PipelineTmaUmma.create(
+            num_stages=kv_stages,
+            producer_group=tma_group,
+            consumer_group=mma_group,
+            tx_count=k_stage_bytes,
+            barrier_storage=k_pipeline_ptr,
+            cta_layout_vmnk=mcast_layout,
+            defer_sync=True,
+        ).make_participants()
+        v_raw_stage_bytes = cute.size_in_bytes(
+            cutlass.Float4E2M1FN,
+            cute.select(smem_layout_v, mma_modes),
+        )
+        v_raw_stage_bytes += cute.size_in_bytes(
+            sf_dtype, cute.slice_(smem_layout_v_sf_d, (None, None, 0))
+        )
+        v_raw_pipeline_ptr = smem.allocate_array(Int64, kv_stages * 2)
+        v_raw_producer, v_raw_consumer = pipeline.PipelineTmaAsync.create(
+            num_stages=kv_stages,
+            producer_group=tma_group,
+            consumer_group=(
+                warpgroup_cooperative
+                if use_qmul4_v_tmem
+                else thr_cg(warp_threads)
+            ),
+            tx_count=v_raw_stage_bytes,
+            barrier_storage=v_raw_pipeline_ptr,
+            cta_layout_vmnk=mcast_layout,
+            # PipelineTmaAsync releases an empty slot from one signaling
+            # lane per consumer warp. Recompute the barrier arrive count
+            # from the full consumer group (4 lanes for qmul4_tmem, 1 for
+            # qmul4_d); otherwise the first raw-V ring reuse waits for
+            # 128/32 arrivals while only 4/1 can ever be issued.
+            enable_multicast_signaling=True,
+            defer_sync=True,
+        ).make_participants()
+        v_ready_stages = (
+            self.cvt_stages if use_qmul4_v_tmem else kv_stages
+        )
+        v_ready_pipeline_ptr = smem.allocate_array(Int64, v_ready_stages * 2)
+        v_ready_producer, v_ready_consumer = pipeline.PipelineAsyncUmma.create(
+            num_stages=v_ready_stages,
+            producer_group=(
+                warpgroup_cooperative
+                if use_qmul4_v_tmem
+                else thr_cg(warp_threads)
+            ),
+            consumer_group=mma_group,
+            barrier_storage=v_ready_pipeline_ptr,
+            cta_layout_vmnk=mcast_layout,
+            defer_sync=True,
+        ).make_participants()
 
         s_stages = self.s_stages
         s_pipeline_ptr = smem.allocate_array(Int64, s_stages * 2)
@@ -2002,96 +1740,26 @@ class GroupedQueryAttentionDecodePagedFp4:
         tAsVRawTma = None
         tAsVReady = None
         tAsVSFD = None
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            tAsVRaw = tAsV
-        if cutlass.const_expr(use_qmul4_v_smem):
-            # TODO(坑45):ready 缓冲仍是 **d 最内**,而 VP 的收缩轴是 token
-            # —— 与 Phase 1 的 V K-major 修正同源的问题。直接把 stride 翻成
-            # (k_vp, 1, ...) 会让 DSL 编译崩溃(core dump):这个别名叠在
-            # ``tAsV`` 带 swizzle(S<2,4,3>)的布局上,换 stride 序后描述符失效。
-            # 正确做法是让转换按 ``tAsV`` 自身的(带 swizzle 的)布局写,
-            # 而不是另造一个扁平别名。
-            v_logical_layout = cute.make_layout(
-                (mma_tile_m_vp, mma_tile_k_vp, kv_stages),
-                stride=(
-                    1,
-                    mma_tile_m_vp,
-                    mma_tile_m_vp * mma_tile_k_vp,
-                ),
-            )
-            tAsVRawTma = smem.allocate_tensor(
-                cutlass.Uint8,
-                smem_layout_v_raw_tma.outer,
-                stensor_align,
-                smem_layout_v_raw_tma.inner,
-            )
-            # 坑46:TMA 按 ``smem_layout_v_raw_tma.inner``(S<2,4,3>)把 raw V
-            # 落进 SMEM,而这里原本用**不带 swizzle** 的 recast_ptr 去读 ——
-            # 转换一直在读错位的字节。指针类型上直接可见:
-            #   rawtma = ptr<i8, smem, align<1024>, S<2,4,3>>
-            #   raw    = ptr<f4E2M1FN, smem, align<1024>>        (无 swizzle)
-            # 代码里本来就有 fp4 版的布局(``smem_layout_v_raw``,MN_SW64 atom),
-            # 按它建视图即可 —— swizzle 经 recast_ptr 挂回,与 P 的字节视图
-            # (sP_flat)同一手法。
-            _raw_sw = cute.make_tensor(
-                cute.recast_ptr(
-                    tAsVRawTma.iterator,
-                    smem_layout_v_raw.inner,
-                    dtype=cutlass.Float4E2M1FN,
-                ),
-                smem_layout_v_raw.outer,
-            )
-            # 带 swizzle 的布局是嵌套的 ((128,1),(8,16),(1,6)),而转换里的
-            # ``local_tile(src,(16,1),…)`` 的 tiler 是扁平 rank-2 的 ——
-            # 与 ready 缓冲同一个坑。所幸映射同样仿射(128*8 = 1024),
-            # 用 composition 导出扁平 (d, token, stage) 视图即可,swizzle 保留。
-            tAsVRaw = cute.composition(
-                _raw_sw,
-                cute.make_layout(
-                    (mma_tile_m_vp, mma_tile_k_vp, kv_stages),
-                    stride=(1, mma_tile_m_vp, mma_tile_m_vp * mma_tile_k_vp),
-                ),
-            )
-            # Logical D/token alias of the FP8 MMA buffer. Both layouts use
-            # the same MN_SW128 atom and tile order, so no second allocation.
-            # 坑45:不造扁平别名 —— 从 ``tAsV`` **自身**的布局
-            # ((128,32),1,4,stages) 组合出 (d, token) 视图,swizzle 随之保留。
-            # 目标映射:(d, t) → 域内下标 d + 128*(t%32) + 4096*(t//32),
-            # 即 shape (m, (32, k/32)) stride (1, (m, m*32))。
-            # 扁平别名那条路两次都让 DSL 崩(裸 make_tensor / recast_ptr 挂
-            # swizzle 皆然),原因是它绕过了真实布局而不是从中导出。
-            # 目标映射 (d,t) → tAsV 域下标 d + 128*(t%32) + 4096*(t//32)。
-            # 因为 128*32 = 4096,它其实是**仿射**的:= d + 128*t —— 所以可以
-            # 用**扁平** shape 表达,不必嵌套。这很重要:转换里的
-            # ``local_tile(dst, (16,1), …)`` 对嵌套模不能正确分解。
-            _m_v, _k_v = mma_tile_m_vp, mma_tile_k_vp
-            tAsVReady = cute.composition(
-                tAsV,
-                cute.make_layout(
-                    (_m_v, _k_v, kv_stages),
-                    stride=(1, _m_v, _m_v * _k_v),
-                ),
-            )
-        if cutlass.const_expr(use_qmul4_v):
-            tAsVSFD = smem.allocate_tensor(
-                sf_dtype, smem_layout_v_sf_d, stensor_align
-            )
-            # 索引别名:TMA 按 (16, tile/16) 搬字节,转换循环要 (S, token)
-            # 语义。trtllm 的 4-token interleave 在 tile 内是
-            #   offset = (t//4)*4*S + s*4 + t%4
-            # ≡ shape (S,(4,ps/4)) stride (4,(1,4S)) —— CuTe 把扁平 token
-            # 坐标按 colex 拆成 (t%4, t//4),所以 ``scales[d_block, token]``
-            # 的写法一个字都不用改。等价性有离线门盯着
-            # (test_trtllm_v_scale_interleave_matches_flashinfer_recipe)。
-            _sfb = mma_tile_m_vp // 16
-            _tsf_s = _sfb * mma_tile_k_vp
-            tAsVSFD = cute.make_tensor(
-                tAsVSFD.iterator,
-                cute.make_layout(
-                    (_sfb, (4, mma_tile_k_vp // 4), kv_stages),
-                    stride=(4, (1, 4 * _sfb), _tsf_s),
-                ),
-            )
+        tAsVRaw = tAsV
+        tAsVSFD = smem.allocate_tensor(
+            sf_dtype, smem_layout_v_sf_d, stensor_align
+        )
+        # 索引别名:TMA 按 (16, tile/16) 搬字节,转换循环要 (S, token)
+        # 语义。trtllm 的 4-token interleave 在 tile 内是
+        #   offset = (t//4)*4*S + s*4 + t%4
+        # ≡ shape (S,(4,ps/4)) stride (4,(1,4S)) —— CuTe 把扁平 token
+        # 坐标按 colex 拆成 (t%4, t//4),所以 ``scales[d_block, token]``
+        # 的写法一个字都不用改。等价性有离线门盯着
+        # (test_trtllm_v_scale_interleave_matches_flashinfer_recipe)。
+        _sfb = mma_tile_m_vp // 16
+        _tsf_s = _sfb * mma_tile_k_vp
+        tAsVSFD = cute.make_tensor(
+            tAsVSFD.iterator,
+            cute.make_layout(
+                (_sfb, (4, mma_tile_k_vp // 4), kv_stages),
+                stride=(4, (1, 4 * _sfb), _tsf_s),
+            ),
+        )
         tBsQ = smem.allocate_tensor(
             q_dtype, smem_layout_q.outer, stensor_align, smem_layout_q.inner
         )  # (MMA, #MMA_N, #MMA_K, q_stages)
@@ -2134,9 +1802,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             )
         tAsSFV = None
         tBsSFP = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            tAsSFV = smem.allocate_tensor(sf_dtype, smem_layout_sfv, stensor_align)
-            tBsSFP = smem.allocate_tensor(sf_dtype, smem_layout_sfp, stensor_align)
 
         # S
         # (MMA_MN, #MMA_M=1, #MMA_N=1, #TILE_SM, s_stages)
@@ -2155,29 +1820,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         # fp4 分支走 Q 同款直连链(std);nm 仅作分区形状用途,别名到 std 同块
         # 内存(fp4 从不经 nm 寻址)——省 8KB smem。fp8 走原 nm 实分配。
         tBsP_std = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            # 注:v2 的 P store 用手推字节偏移(见下),仅对 blk_tile_s=256 推导过。
-            # tile=512 时 P 缓冲槽数与 v3→槽映射均变 → 需重做 swizzle-aware 推导。
-            assert blk_tile_s == 256, "v2 P store 偏移仅支持 sequence_tile=256"
-            _tiles_sk_p = blk_tile_s // mma_tile_k_vp
-            smem_layout_p_std = sm100_utils.make_smem_layout_b(
-                tiled_mma_vp, mma_tile_mnk_vp, vp_dtype, _tiles_sk_p * p_stages
-            )
-            # 坑27:软件手写 swizzled 操作数,基址对齐 ≥ swizzle 周期
-            tBsP_std = smem.allocate_tensor(
-                vp_dtype,
-                smem_layout_p_std.outer,
-                stensor_align,
-                smem_layout_p_std.inner,
-            )
-            tBsP_nm = cute.make_tensor(
-                cute.recast_ptr(tBsP_std.iterator, dtype=vp_dtype),
-                tBsP_nm_layout,
-            )
-        else:
-            tBsP_nm = smem.allocate_tensor(
-                vp_dtype, tBsP_nm_layout.outer, stensor_align, tBsP_nm_layout.inner
-            )
+        tBsP_nm = smem.allocate_tensor(
+            vp_dtype, tBsP_nm_layout.outer, stensor_align, tBsP_nm_layout.inner
+        )
             
             
 
@@ -2206,11 +1851,10 @@ class GroupedQueryAttentionDecodePagedFp4:
         # come from the TMEM-source MMA atom itself; manufacturing a parallel
         # flat layout would lose the tcgen05 operand addressing contract.
         tAtV_cvt = None
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            tAtV_cvt_shape = tiled_mma_vp.partition_shape_A(
-                (mma_tile_m_vp, mma_tile_k_vp, self.cvt_stages)
-            )
-            tAtV_cvt = thrblk_mma_vp.make_fragment_A(tAtV_cvt_shape)
+        tAtV_cvt_shape = tiled_mma_vp.partition_shape_A(
+            (mma_tile_m_vp, mma_tile_k_vp, self.cvt_stages)
+        )
+        tAtV_cvt = thrblk_mma_vp.make_fragment_A(tAtV_cvt_shape)
 
         # M - colmax
         sM_layout = cute.make_layout(blk_tile_n)
@@ -2299,12 +1943,11 @@ class GroupedQueryAttentionDecodePagedFp4:
         # mixed-input decode.  TMEM-source UMMA addressing is more restricted
         # than an accumulator fragment: placing this ring after S/L/O happened
         # to pass a cold launch but produced stale/NaN data on reuse.
-        if cutlass.const_expr(use_qmul4_v_tmem):
-            tAtV_cvt = cute.make_tensor(
-                cute.recast_ptr(tmem_ptr + tmem_offset, dtype=vp_dtype),
-                tAtV_cvt.layout,
-            )
-            tmem_offset += tcgen05.find_tmem_tensor_col_offset(tAtV_cvt)
+        tAtV_cvt = cute.make_tensor(
+            cute.recast_ptr(tmem_ptr + tmem_offset, dtype=vp_dtype),
+            tAtV_cvt.layout,
+        )
+        tmem_offset += tcgen05.find_tmem_tensor_col_offset(tAtV_cvt)
 
         tCtS = cute.make_tensor(
             cute.recast_ptr(tmem_ptr + tmem_offset, dtype=acc_dtype), tCtS.layout
@@ -2349,29 +1992,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             tmem_offset += tcgen05.find_tmem_tensor_col_offset(tCtSFQ)
         tCtSFV = None
         tCtSFP = None
-        if cutlass.const_expr(use_nvfp4_vp):
-            tCtSFV_layout = blockscaled_utils.make_tmem_layout_sfa(
-                tiled_mma_vp,
-                (mma_tile_m, mma_tile_n, mma_tile_k),
-                16,
-                cute.slice_(smem_layout_sfv, (None, None, None, 0)),
-            )
-            tCtSFV = cute.make_tensor(
-                cute.recast_ptr(tmem_ptr + tmem_offset, dtype=sf_dtype),
-                tCtSFV_layout,
-            )
-            tmem_offset += tcgen05.find_tmem_tensor_col_offset(tCtSFV)
-            tCtSFP_layout = blockscaled_utils.make_tmem_layout_sfb(
-                tiled_mma_vp_sfb,
-                (mma_tile_m, max(128, mma_tile_n), mma_tile_k),
-                16,
-                cute.slice_(smem_layout_sfp, (None, None, None, 0)),
-            )
-            tCtSFP = cute.make_tensor(
-                cute.recast_ptr(tmem_ptr + tmem_offset, dtype=sf_dtype),
-                tCtSFP_layout,
-            )
-            tmem_offset += tcgen05.find_tmem_tensor_col_offset(tCtSFP)
 
         assert tmem_offset <= tmem_alloc_cols, (
             f"\t{tmem_offset} tmem cols used, {tmem_alloc_cols} tmem cols allocated"
@@ -2418,27 +2038,19 @@ class GroupedQueryAttentionDecodePagedFp4:
             )  # (MMA_TILE_M, MMA_TILE_K, #TILE_DK, #P)
             # V:mV (d, page_size, (h,P));K 模 = page_size = mma_tile_k_vp(=128)
             # 恰好一页一 stage。
-            if cutlass.const_expr(use_qmul4_v_smem):
-                gV = cute.local_tile(
-                    mV,
-                    tiler=(mma_tile_m_vp // 2, mma_tile_k_vp),
-                    coord=(None, None, (coord_hk, None)),
-                )
-            else:
-                gV = cute.local_tile(
-                    mV,
-                    tiler=(mma_tile_m_vp, mma_tile_k_vp),
-                    coord=(None, None, (coord_hk, None)),
-                )  # (MMA_TILE_M, MMA_TILE_K, #TILE_DM, #TILE_SK=1, #P)
+            gV = cute.local_tile(
+                mV,
+                tiler=(mma_tile_m_vp, mma_tile_k_vp),
+                coord=(None, None, (coord_hk, None)),
+            )  # (MMA_TILE_M, MMA_TILE_K, #TILE_DM, #TILE_SK=1, #P)
 
             tAgK = thrblk_mma_kq.partition_A(
                 gK
             )  # (MMA, #MMA_M, #MMA_K, #TILE_DK, #P)
             tAgV = None
-            if cutlass.const_expr(not use_qmul4_v_smem):
-                tAgV = thrblk_mma_vp.partition_A(
-                    gV
-                )  # (MMA, #MMA_M, #MMA_K, #TILE_DM, #TILE_SK, #P)
+            tAgV = thrblk_mma_vp.partition_A(
+                gV
+            )  # (MMA, #MMA_M, #MMA_K, #TILE_DM, #TILE_SK, #P)
 
             # #TILE_SM=TILE_S/MMA_TILE_M, #TILE_HN=TILE_H/MMA_TILE_N, #TILE_DK=TILE_D/MMA_TILE_K
             # #TILE_DM=TILE_D/MMA_TILE_M, #TILE_HN=TILE_H/MMA_TILE_N, #TILE_SK=TILE_S/MMA_TILE_K
@@ -2459,37 +2071,25 @@ class GroupedQueryAttentionDecodePagedFp4:
                 gmem_tensor=cute.group_modes(tAgK, 0, 3),
             )
 
-            if cutlass.const_expr(use_qmul4_v_smem):
-                # Generic 2-D TMA partitions preserve the explicit
-                # (D,token) modes used by the conversion helper.
-                tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_v,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(tAsVRawTma, 0, 2),
-                    gmem_tensor=cute.group_modes(gV, 0, 2),
-                )
-            else:
-                tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_v,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(tAsV, 0, 3),
-                    gmem_tensor=cute.group_modes(tAgV, 0, 3),
-                )
-            if cutlass.const_expr(use_qmul4_v):
-                gVSFD = cute.local_tile(
-                    mVSF_d,
-                    tiler=(16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
-                    coord=(None, None, (coord_hk, None)),
-                )
-                tGSsVSFD, tGSgVSFD = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_v_sf_d,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(tAsVSFD, 0, 2),
-                    gmem_tensor=cute.group_modes(gVSFD, 0, 2),
-                )
+            tGSsV, tGSgV = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_v,
+                mcast_coord,
+                mcast_layout,
+                smem_tensor=cute.group_modes(tAsV, 0, 3),
+                gmem_tensor=cute.group_modes(tAgV, 0, 3),
+            )
+            gVSFD = cute.local_tile(
+                mVSF_d,
+                tiler=(16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
+                coord=(None, None, (coord_hk, None)),
+            )
+            tGSsVSFD, tGSgVSFD = cute.nvgpu.cpasync.tma_partition(
+                tma_atom_v_sf_d,
+                mcast_coord,
+                mcast_layout,
+                smem_tensor=cute.group_modes(tAsVSFD, 0, 2),
+                gmem_tensor=cute.group_modes(gVSFD, 0, 2),
+            )
             if cutlass.const_expr(use_nvfp4_kq):
                 if cutlass.const_expr(self.k_sf_mode == "linear"):
                     gSFK = cute.local_tile(
@@ -2522,22 +2122,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     # SF 布局含 stride-0 广播模式,必须滤掉否则 TMA 零发射(坑13,示例 :932)
                     tGSsSFK = cute.filter_zeros(tGSsSFK)
                     tGSgSFK = cute.filter_zeros(tGSgSFK)
-            if cutlass.const_expr(use_nvfp4_vp):
-                gSFV = cute.local_tile(
-                    mSFV,
-                    tiler=(mma_tile_m_vp, mma_tile_k_vp),
-                    coord=(None, None, (coord_hk, None)),
-                )  # (M, K, #TILE_DM, #TILE_SK=1, #P)
-                tAgSFV = thrblk_mma_vp.partition_A(gSFV)
-                tGSsSFV, tGSgSFV = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_sfv,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(tAsSFV, 0, 3),
-                    gmem_tensor=cute.group_modes(tAgSFV, 0, 3),
-                )
-                tGSsSFV = cute.filter_zeros(tGSsSFV)
-                tGSgSFV = cute.filter_zeros(tGSgSFV)
 
             cute.arch.griddepcontrol_wait()
 
@@ -2562,16 +2146,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                         logical_k = s * pages_s + sm
                         phys_k = Int32(-1)
                         if logical_k < page_count:
-                            phys_k = mPageTable[table_offset + logical_k]
+                            phys_k = mBlockTables[coord_b, logical_k]
                         for dk in cutlass.range_constexpr(tiles_dk):
-                            if cutlass.const_expr(use_qmul4_v):
-                                k_handle = k_producer.acquire_and_advance(k_token_tma)
-                                k_token_tma = k_producer.try_acquire()
-                            else:
-                                k_handle = kv_producer.acquire_and_advance(
-                                    kv_token, expected_tx=Int32(k_stage_bytes)
-                                )
-                                kv_token = kv_producer.try_acquire()
+                            k_handle = k_producer.acquire_and_advance(k_token_tma)
+                            k_token_tma = k_producer.try_acquire()
                             cute.copy(
                                 tma_atom_k,
                                 tGSgK[None, dk, phys_k],
@@ -2602,45 +2180,24 @@ class GroupedQueryAttentionDecodePagedFp4:
                         logical_v = s_v * pages_s + sk
                         phys_v = Int32(-1)
                         if logical_v < page_count:
-                            phys_v = mPageTable[table_offset + logical_v]
+                            phys_v = mBlockTables[coord_b, logical_v]
                         for dm in cutlass.range_constexpr(tiles_dm):
-                            if cutlass.const_expr(use_qmul4_v):
-                                v_handle = v_raw_producer.acquire_and_advance(
-                                    v_raw_token_tma
-                                )
-                                v_raw_token_tma = v_raw_producer.try_acquire()
-                                cute.copy(
-                                    tma_atom_v,
-                                    tGSgV[None, dm, 0, phys_v],
-                                    tGSsV[None, v_handle.index],
-                                    tma_bar_ptr=v_handle.barrier,
-                                )
-                                cute.copy(
-                                    tma_atom_v_sf_d,
-                                    tGSgVSFD[None, dm, 0, phys_v],
-                                    tGSsVSFD[None, v_handle.index],
-                                    tma_bar_ptr=v_handle.barrier,
-                                )
-                            else:
-                                v_handle = kv_producer.acquire_and_advance(
-                                    kv_token, expected_tx=Int32(v_stage_bytes)
-                                )
-                                kv_token = kv_producer.try_acquire()
-                                cute.copy(
-                                    tma_atom_v,
-                                    tGSgV[None, dm, 0, phys_v],
-                                    tGSsV[None, v_handle.index],
-                                    tma_bar_ptr=v_handle.barrier,
-                                )
-                            if cutlass.const_expr(
-                                use_nvfp4_vp and self.perf_probe != 3
-                            ):
-                                cute.copy(
-                                    tma_atom_sfv,
-                                    tGSgSFV[None, dm, 0, phys_v],
-                                    tGSsSFV[None, v_handle.index],
-                                    tma_bar_ptr=v_handle.barrier,
-                                )
+                            v_handle = v_raw_producer.acquire_and_advance(
+                                v_raw_token_tma
+                            )
+                            v_raw_token_tma = v_raw_producer.try_acquire()
+                            cute.copy(
+                                tma_atom_v,
+                                tGSgV[None, dm, 0, phys_v],
+                                tGSsV[None, v_handle.index],
+                                tma_bar_ptr=v_handle.barrier,
+                            )
+                            cute.copy(
+                                tma_atom_v_sf_d,
+                                tGSgVSFD[None, dm, 0, phys_v],
+                                tGSsVSFD[None, v_handle.index],
+                                tma_bar_ptr=v_handle.barrier,
+                            )
 
         ##############################
         # TMA QO Dispatch
@@ -2705,32 +2262,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     tma_bar_ptr=sfq_mbar,
                 )
             # Load SFP(Phase2 常数 SF;独立 mbar)
-            if cutlass.const_expr(use_nvfp4_vp):
-                gSFP = cute.local_tile(
-                    mSFP,
-                    tiler=(max(128, mma_tile_n), blk_tile_s),
-                    coord=(0, 0, 0),
-                )
-                gSFP_mma = cute.flat_divide(
-                    gSFP, (max(128, mma_tile_n), mma_tile_k_vp)
-                )[None, None, 0, None]
-                thrblk_sfp = tiled_mma_vp_sfb.get_slice(0)
-                tBgSFP = thrblk_sfp.partition_B(gSFP_mma)
-                tBsSFP_tma, tBgSFP_tma = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_sfp,
-                    mcast_coord,
-                    mcast_layout,
-                    smem_tensor=cute.group_modes(tBsSFP, 0, 3),
-                    gmem_tensor=cute.group_modes(tBgSFP, 0, 3),
-                )
-                tBsSFP_tma = cute.filter_zeros(tBsSFP_tma)
-                tBgSFP_tma = cute.filter_zeros(tBgSFP_tma)
-                cute.copy(
-                    tma_atom_sfp,
-                    tBgSFP_tma,
-                    tBsSFP_tma,
-                    tma_bar_ptr=sfp_mbar,
-                )
 
             # Slice and partition O
             # (TILE_D, TILE_H)
@@ -2866,242 +2397,235 @@ class GroupedQueryAttentionDecodePagedFp4:
         # V Convert Dispatch (LDSM.U4 -> QMUL4 -> STTM)
         ##############################
         elif warpgroup_idx == conversion_warpgroup_id:
-            if cutlass.const_expr(use_qmul4_v_tmem):
-                if cutlass.const_expr(use_reg_reconfig):
-                    cute.arch.setmaxregister_decrease(conversion_regs)
+            if cutlass.const_expr(use_reg_reconfig):
+                cute.arch.setmaxregister_decrease(conversion_regs)
 
-                # Match the copy geometry used by NVIDIA's mixed-input decode.
-                # LDSM transposes a D-major packed FP4 tile into eight nibble
-                # containers per lane; QMUL4 applies the independently packed
-                # D-scales; STTM writes the E4M3 fragment into the exact TMEM-A
-                # layout consumed by the VP MMA.
-                mma_k_bits = mma_tile_k_vp * vp_dtype.width
-                # Use the same 16x128b TMEM store atom as NVIDIA's
-                # mixed-input decode.  16x256b happens to cover the same tile
-                # on a cold allocation, but it creates a different TMEM-A
-                # lane/column ownership contract and is not the store shape
-                # paired with this VP MMA operand in the reference pipeline.
-                tmem_store_atom_v = cute.make_copy_atom(
-                    tcgen05.St16x128bOp(
-                        tcgen05.Repetition(self.qmul4_interleave or mma_k_bits // 128)
+            # Match the copy geometry used by NVIDIA's mixed-input decode.
+            # LDSM transposes a D-major packed FP4 tile into eight nibble
+            # containers per lane; QMUL4 applies the independently packed
+            # D-scales; STTM writes the E4M3 fragment into the exact TMEM-A
+            # layout consumed by the VP MMA.
+            mma_k_bits = mma_tile_k_vp * vp_dtype.width
+            # Use the same 16x128b TMEM store atom as NVIDIA's
+            # mixed-input decode.  16x256b happens to cover the same tile
+            # on a cold allocation, but it creates a different TMEM-A
+            # lane/column ownership contract and is not the store shape
+            # paired with this VP MMA operand in the reference pipeline.
+            tmem_store_atom_v = cute.make_copy_atom(
+                tcgen05.St16x128bOp(
+                    tcgen05.Repetition(self.qmul4_interleave or mma_k_bits // 128)
+                ),
+                vp_dtype,
+            )
+            smem_load_atom_v = cute.make_copy_atom(
+                cute.nvgpu.warp.LdMatrix16x16x8bOp(
+                    transpose=True,
+                    num_matrices=1 if self.qmul4_interleave else 2,
+                    unpack_bits=4,
+                ),
+                cutlass.Int8,
+            )
+            tmem_store_v = tcgen05.make_tmem_copy(
+                tmem_store_atom_v, tAtV_cvt[mma_dice + (0,)]
+            )
+            thr_store_v = tmem_store_v.get_slice(warpgroup_tidx)
+            tVrV_cvt_shape = thr_store_v.partition_S(tAtV_cvt).shape[:-1]
+            tVtV_cvt = thr_store_v.partition_D(tAtV_cvt)
+
+            tmem_debug_load_v = thr_debug_load_v = None
+            tVtV_debug = tVrV_debug_shape = None
+            if cutlass.const_expr(
+                os.environ.get("RESATTN_QMUL4_VALUE_DEBUG") == "1"
+            ):
+                tmem_debug_load_atom_v = cute.make_copy_atom(
+                    tcgen05.Ld16x128bOp(
+                        tcgen05.Repetition(mma_k_bits // 128)
                     ),
                     vp_dtype,
                 )
-                smem_load_atom_v = cute.make_copy_atom(
-                    cute.nvgpu.warp.LdMatrix16x16x8bOp(
-                        transpose=True,
-                        num_matrices=1 if self.qmul4_interleave else 2,
-                        unpack_bits=4,
-                    ),
-                    cutlass.Int8,
+                tmem_debug_load_v = tcgen05.make_tmem_copy(
+                    tmem_debug_load_atom_v,
+                    tAtV_cvt[mma_dice + (0,)],
                 )
-                tmem_store_v = tcgen05.make_tmem_copy(
-                    tmem_store_atom_v, tAtV_cvt[mma_dice + (0,)]
+                thr_debug_load_v = tmem_debug_load_v.get_slice(
+                    warpgroup_tidx
                 )
-                thr_store_v = tmem_store_v.get_slice(warpgroup_tidx)
-                tVrV_cvt_shape = thr_store_v.partition_S(tAtV_cvt).shape[:-1]
-                tVtV_cvt = thr_store_v.partition_D(tAtV_cvt)
+                tVtV_debug = thr_debug_load_v.partition_S(tAtV_cvt)
+                tVrV_debug_shape = thr_debug_load_v.partition_D(
+                    tAtV_cvt
+                ).shape[:-1]
 
-                tmem_debug_load_v = thr_debug_load_v = None
-                tVtV_debug = tVrV_debug_shape = None
-                if cutlass.const_expr(
-                    os.environ.get("RESATTN_QMUL4_VALUE_DEBUG") == "1"
-                ):
-                    tmem_debug_load_atom_v = cute.make_copy_atom(
-                        tcgen05.Ld16x128bOp(
-                            tcgen05.Repetition(mma_k_bits // 128)
-                        ),
-                        vp_dtype,
-                    )
-                    tmem_debug_load_v = tcgen05.make_tmem_copy(
-                        tmem_debug_load_atom_v,
-                        tAtV_cvt[mma_dice + (0,)],
-                    )
-                    thr_debug_load_v = tmem_debug_load_v.get_slice(
-                        warpgroup_tidx
-                    )
-                    tVtV_debug = thr_debug_load_v.partition_S(tAtV_cvt)
-                    tVrV_debug_shape = thr_debug_load_v.partition_D(
-                        tAtV_cvt
-                    ).shape[:-1]
-
-                smem_load_v = cute.make_tiled_copy_S(
-                    smem_load_atom_v, tmem_store_v
+            smem_load_v = cute.make_tiled_copy_S(
+                smem_load_atom_v, tmem_store_v
+            )
+            thr_load_v = smem_load_v.get_slice(warpgroup_tidx)
+            tVsV = thr_load_v.partition_S(tAsVRaw)
+            # CuTe 4.6 conservatively drops this partition to 8-byte pointer
+            # alignment even though the NVIDIA LDSM tiling maps every row
+            # start onto the 16-byte-aligned SW128 carrier allocation. Restore
+            # the proven atom precondition so the verifier accepts LDSM.U4.
+            tVsV = cute.make_tensor(tVsV.iterator.align(16), tVsV.layout)
+            tVrV_shape = thr_load_v.partition_D(tAsVRaw).shape[:-1]
+            if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
+                print(
+                    f"[cvt] src={tVrV_shape} ({cute.size(tVrV_shape)}) "
+                    f"dst={tVrV_cvt_shape} "
+                    f"({cute.size(tVrV_cvt_shape)})",
+                    flush=True,
                 )
-                thr_load_v = smem_load_v.get_slice(warpgroup_tidx)
-                tVsV = thr_load_v.partition_S(tAsVRaw)
-                # CuTe 4.6 conservatively drops this partition to 8-byte pointer
-                # alignment even though the NVIDIA LDSM tiling maps every row
-                # start onto the 16-byte-aligned SW128 carrier allocation. Restore
-                # the proven atom precondition so the verifier accepts LDSM.U4.
-                tVsV = cute.make_tensor(tVsV.iterator.align(16), tVsV.layout)
-                tVrV_shape = thr_load_v.partition_D(tAsVRaw).shape[:-1]
-                if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
-                    print(
-                        f"[cvt] src={tVrV_shape} ({cute.size(tVrV_shape)}) "
-                        f"dst={tVrV_cvt_shape} "
-                        f"({cute.size(tVrV_cvt_shape)})",
-                        flush=True,
-                    )
 
-                # Reinterpret the TRT 4-token-interleaved scale tile as a
-                # broadcast D tensor. This is the scale analogue of NVIDIA's
-                # ((block_scaledim, scaledim), token) layout, with the physical
-                # token interleave preserved in the strides.
-                _sfb = mma_tile_m_vp // 16
-                sVS = cute.make_tensor(
-                    tAsVSFD.iterator,
-                    cute.make_layout(
-                        ((16, _sfb), (4, mma_tile_k_vp // 4), kv_stages),
-                        stride=((0, 4), (1, 4 * _sfb), _sfb * mma_tile_k_vp),
-                    ),
+            # Reinterpret the TRT 4-token-interleaved scale tile as a
+            # broadcast D tensor. This is the scale analogue of NVIDIA's
+            # ((block_scaledim, scaledim), token) layout, with the physical
+            # token interleave preserved in the strides.
+            _sfb = mma_tile_m_vp // 16
+            sVS = cute.make_tensor(
+                tAsVSFD.iterator,
+                cute.make_layout(
+                    ((16, _sfb), (4, mma_tile_k_vp // 4), kv_stages),
+                    stride=((0, 4), (1, 4 * _sfb), _sfb * mma_tile_k_vp),
+                ),
+            )
+            sVS_mma = cute.group_modes(
+                cute.flat_divide(sVS, (mma_tile_m_vp, mma_tile_k_vp)),
+                2,
+                4,
+            )
+            tAsVS = thrblk_mma_vp.partition_A(sVS_mma)
+            tVsVS = thr_load_v.partition_D(tAsVS)
+            if cutlass.const_expr(self.qmul4_interleave):
+                # Derive both partitions from NEW x1 atoms. Slicing the
+                # old x8 store/x2 LDSM partitions changes their ownership.
+                tVsV_atoms = cute.group_modes(tVsV, 1, cute.rank(tVsV) - 1)
+                tVsVS_atoms = cute.group_modes(tVsVS, 1, cute.rank(tVsVS) - 1)
+                tVtV_atoms = cute.group_modes(tVtV_cvt, 1, cute.rank(tVtV_cvt) - 1)
+                print(f"[cvt-atoms-preflight] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout} src_size={cute.size(tVsV_atoms, mode=[0])}", flush=True)
+                # Memory-side CPY modes describe warp-wide tiles, not
+                # per-lane register counts. Allocate from RF partitions.
+                assert cute.size(tVrV_shape[0]) == 8 * self.qmul4_interleave
+                assert cute.size(tVrV_cvt_shape[0]) == cute.size(tVrV_shape[0])
+                assert cute.size(tVsV_atoms, mode=[1]) == cute.size(tVtV_atoms, mode=[1])
+                print(f"[cvt-atoms] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout}", flush=True)
+            if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
+                print(
+                    f"[cvt] tVsVS={tVsVS.layout} "
+                    f"logical={cute.size(tVsVS.shape)}",
+                    flush=True,
                 )
-                sVS_mma = cute.group_modes(
-                    cute.flat_divide(sVS, (mma_tile_m_vp, mma_tile_k_vp)),
-                    2,
-                    4,
-                )
-                tAsVS = thrblk_mma_vp.partition_A(sVS_mma)
-                tVsVS = thr_load_v.partition_D(tAsVS)
-                if cutlass.const_expr(self.qmul4_interleave):
-                    # Derive both partitions from NEW x1 atoms. Slicing the
-                    # old x8 store/x2 LDSM partitions changes their ownership.
-                    tVsV_atoms = cute.group_modes(tVsV, 1, cute.rank(tVsV) - 1)
-                    tVsVS_atoms = cute.group_modes(tVsVS, 1, cute.rank(tVsVS) - 1)
-                    tVtV_atoms = cute.group_modes(tVtV_cvt, 1, cute.rank(tVtV_cvt) - 1)
-                    print(f"[cvt-atoms-preflight] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout} src_size={cute.size(tVsV_atoms, mode=[0])}", flush=True)
-                    # Memory-side CPY modes describe warp-wide tiles, not
-                    # per-lane register counts. Allocate from RF partitions.
-                    assert cute.size(tVrV_shape[0]) == 8 * self.qmul4_interleave
-                    assert cute.size(tVrV_cvt_shape[0]) == cute.size(tVrV_shape[0])
-                    assert cute.size(tVsV_atoms, mode=[1]) == cute.size(tVtV_atoms, mode=[1])
-                    print(f"[cvt-atoms] src={tVsV_atoms.layout} sf={tVsVS_atoms.layout} dst={tVtV_atoms.layout}", flush=True)
-                if os.environ.get("RESATTN_DECODE_SMEM_DEBUG") == "1":
-                    print(
-                        f"[cvt] tVsVS={tVsVS.layout} "
-                        f"logical={cute.size(tVsVS.shape)}",
-                        flush=True,
-                    )
 
-                v_token = v_raw_consumer.try_wait()
-                cvt_token = v_ready_producer.try_acquire()
-                for _s in cutlass.range(iters_s):
-                    for _sk in cutlass.range_constexpr(tiles_sk):
-                        for _dm in cutlass.range_constexpr(tiles_dm):
-                            _cvt_flat = (
-                                _s * tiles_sk * tiles_dm
-                                + _sk * tiles_dm
-                                + _dm
+            v_token = v_raw_consumer.try_wait()
+            cvt_token = v_ready_producer.try_acquire()
+            for _s in cutlass.range(iters_s):
+                for _sk in cutlass.range_constexpr(tiles_sk):
+                    for _dm in cutlass.range_constexpr(tiles_dm):
+                        _cvt_flat = (
+                            _s * tiles_sk * tiles_dm
+                            + _sk * tiles_dm
+                            + _dm
+                        )
+                        phase_mark(4, 1 + _cvt_flat)
+                        v_handle = v_raw_consumer.wait_and_advance(v_token)
+                        phase_mark(5, 1 + _cvt_flat)
+                        cvt_handle = v_ready_producer.acquire_and_advance(
+                            cvt_token
+                        )
+                        phase_mark(6, 1 + _cvt_flat)
+
+                        if cutlass.const_expr(self.qmul4_interleave):
+                            atom_count = cute.size(tVsV_atoms, mode=[1])
+                            for atom_idx in cutlass.range_constexpr(atom_count):
+                                src_atom = cute.make_rmem_tensor((tVrV_shape[0],), cutlass.Int8)
+                                scale_atom = cute.make_rmem_tensor((tVsVS_atoms.shape[0],), sf_dtype)
+                                dst_atom = cute.make_rmem_tensor((tVrV_cvt_shape[0],), vp_dtype)
+                                cute.autovec_copy(tVsVS_atoms[None, atom_idx, v_handle.index], scale_atom)
+                                cute.copy(thr_load_v, tVsV_atoms[None, atom_idx, v_handle.index], src_atom)
+                                if cutlass.const_expr(atom_idx == atom_count - 1):
+                                    cute.arch.fence_view_async_shared()
+                                    v_handle.release()
+                                values = cute.size(tVrV_shape[0])
+                                src_flat = cute.make_tensor(src_atom.iterator, cute.make_layout(values))
+                                sf_flat = cute.make_tensor(scale_atom.iterator, cute.make_layout(values))
+                                dst_flat = cute.make_tensor(dst_atom.iterator, cute.make_layout(values))
+                                for part in cutlass.range_constexpr(values // 8):
+                                    src8 = cute.local_tile(src_flat, (8,), (part,))
+                                    sf8 = cute.local_tile(sf_flat, (8,), (part,))
+                                    dst8 = cute.local_tile(dst_flat, (8,), (part,))
+                                    dst8.store(dequantize_nvfp4x8_ldsm(src8, sf8))
+                                cute.copy(thr_store_v, dst_atom, tVtV_atoms[None, atom_idx, cvt_handle.index])
+                            cute.arch.fence_view_async_tmem_store()
+                            cvt_handle.commit()
+                            phase_mark(7, 1 + _cvt_flat)
+                            v_token = v_raw_consumer.try_wait()
+                            cvt_token = v_ready_producer.try_acquire()
+                        else:
+                            tVrVS = cute.make_rmem_tensor_like(
+                                tVsVS[cpy_dice + (None, 0)]
                             )
-                            phase_mark(4, 1 + _cvt_flat)
-                            v_handle = v_raw_consumer.wait_and_advance(v_token)
-                            phase_mark(5, 1 + _cvt_flat)
-                            cvt_handle = v_ready_producer.acquire_and_advance(
-                                cvt_token
+                            cute.autovec_copy(
+                                tVsVS[cpy_dice + (None, v_handle.index)],
+                                tVrVS,
                             )
-                            phase_mark(6, 1 + _cvt_flat)
+                            tVrV = cute.make_rmem_tensor(
+                                tVrV_shape, cutlass.Int8
+                            )
+                            tVrV_cvt = cute.make_rmem_tensor(
+                                tVrV_cvt_shape, vp_dtype
+                            )
+                            # The scale partition contains zero-stride
+                            # broadcasts.  Materialize it into the compact
+                            # register shape paired with the LDSM fragment
+                            # before slicing eight-value QMUL4 vectors.
+                            tVrVS_expanded = cute.make_rmem_tensor(
+                                tVrV_shape, sf_dtype
+                            )
+                            cute.autovec_copy(tVrVS, tVrVS_expanded)
+                            cute.copy(
+                                thr_load_v,
+                                tVsV[cpy_dice + (v_handle.index,)],
+                                tVrV,
+                            )
+                            cute.arch.fence_view_async_shared()
+                            v_handle.release()
 
-                            if cutlass.const_expr(self.qmul4_interleave):
-                                atom_count = cute.size(tVsV_atoms, mode=[1])
-                                for atom_idx in cutlass.range_constexpr(atom_count):
-                                    src_atom = cute.make_rmem_tensor((tVrV_shape[0],), cutlass.Int8)
-                                    scale_atom = cute.make_rmem_tensor((tVsVS_atoms.shape[0],), sf_dtype)
-                                    dst_atom = cute.make_rmem_tensor((tVrV_cvt_shape[0],), vp_dtype)
-                                    cute.autovec_copy(tVsVS_atoms[None, atom_idx, v_handle.index], scale_atom)
-                                    cute.copy(thr_load_v, tVsV_atoms[None, atom_idx, v_handle.index], src_atom)
-                                    if cutlass.const_expr(atom_idx == atom_count - 1):
-                                        cute.arch.fence_view_async_shared()
-                                        v_handle.release()
-                                    if cutlass.const_expr(self.qmul4_skip != "conv"):
-                                        values = cute.size(tVrV_shape[0])
-                                        src_flat = cute.make_tensor(src_atom.iterator, cute.make_layout(values))
-                                        sf_flat = cute.make_tensor(scale_atom.iterator, cute.make_layout(values))
-                                        dst_flat = cute.make_tensor(dst_atom.iterator, cute.make_layout(values))
-                                        for part in cutlass.range_constexpr(values // 8):
-                                            src8 = cute.local_tile(src_flat, (8,), (part,))
-                                            sf8 = cute.local_tile(sf_flat, (8,), (part,))
-                                            dst8 = cute.local_tile(dst_flat, (8,), (part,))
-                                            dst8.store(dequantize_nvfp4x8_ldsm(src8, sf8))
-                                    else:
-                                        dst_atom.fill(0)
-                                    cute.copy(thr_store_v, dst_atom, tVtV_atoms[None, atom_idx, cvt_handle.index])
-                                cute.arch.fence_view_async_tmem_store()
-                                cvt_handle.commit()
-                                phase_mark(7, 1 + _cvt_flat)
-                                v_token = v_raw_consumer.try_wait()
-                                cvt_token = v_ready_producer.try_acquire()
-                            else:
-                                tVrVS = cute.make_rmem_tensor_like(
-                                    tVsVS[cpy_dice + (None, 0)]
+                            _frag_values = cute.size(tVrV_shape)
+                            assert _frag_values % 8 == 0
+                            _src_flat = cute.make_tensor(
+                                tVrV.iterator,
+                                cute.make_layout(_frag_values),
+                            )
+                            _sf_flat = cute.make_tensor(
+                                tVrVS_expanded.iterator,
+                                cute.make_layout(_frag_values),
+                            )
+                            _dst_flat = cute.make_tensor(
+                                tVrV_cvt.iterator,
+                                cute.make_layout(_frag_values),
+                            )
+                            for _block in cutlass.range_constexpr(
+                                _frag_values // 8
+                            ):
+                                _src8 = cute.local_tile(
+                                    _src_flat, (8,), (_block,)
                                 )
-                                cute.autovec_copy(
-                                    tVsVS[cpy_dice + (None, v_handle.index)],
-                                    tVrVS,
+                                _sf8 = cute.local_tile(
+                                    _sf_flat, (8,), (_block,)
                                 )
-                                tVrV = cute.make_rmem_tensor(
-                                    tVrV_shape, cutlass.Int8
+                                _dst8 = cute.local_tile(
+                                    _dst_flat, (8,), (_block,)
                                 )
-                                tVrV_cvt = cute.make_rmem_tensor(
-                                    tVrV_cvt_shape, vp_dtype
+                                _dst8.store(
+                                    dequantize_nvfp4x8_ldsm(_src8, _sf8)
                                 )
-                                # The scale partition contains zero-stride
-                                # broadcasts.  Materialize it into the compact
-                                # register shape paired with the LDSM fragment
-                                # before slicing eight-value QMUL4 vectors.
-                                tVrVS_expanded = cute.make_rmem_tensor(
-                                    tVrV_shape, sf_dtype
-                                )
-                                cute.autovec_copy(tVrVS, tVrVS_expanded)
-                                cute.copy(
-                                    thr_load_v,
-                                    tVsV[cpy_dice + (v_handle.index,)],
-                                    tVrV,
-                                )
-                                cute.arch.fence_view_async_shared()
-                                v_handle.release()
-
-                                if cutlass.const_expr(self.qmul4_skip != "conv"):
-                                    _frag_values = cute.size(tVrV_shape)
-                                    assert _frag_values % 8 == 0
-                                    _src_flat = cute.make_tensor(
-                                        tVrV.iterator,
-                                        cute.make_layout(_frag_values),
-                                    )
-                                    _sf_flat = cute.make_tensor(
-                                        tVrVS_expanded.iterator,
-                                        cute.make_layout(_frag_values),
-                                    )
-                                    _dst_flat = cute.make_tensor(
-                                        tVrV_cvt.iterator,
-                                        cute.make_layout(_frag_values),
-                                    )
-                                    for _block in cutlass.range_constexpr(
-                                        _frag_values // 8
-                                    ):
-                                        _src8 = cute.local_tile(
-                                            _src_flat, (8,), (_block,)
-                                        )
-                                        _sf8 = cute.local_tile(
-                                            _sf_flat, (8,), (_block,)
-                                        )
-                                        _dst8 = cute.local_tile(
-                                            _dst_flat, (8,), (_block,)
-                                        )
-                                        _dst8.store(
-                                            dequantize_nvfp4x8_ldsm(_src8, _sf8)
-                                        )
-                                else:
-                                    tVrV_cvt.fill(0)
-                                cute.copy(
-                                    thr_store_v,
-                                    tVrV_cvt,
-                                    tVtV_cvt[cpy_dice + (cvt_handle.index,)],
-                                )
-                                cute.arch.fence_view_async_tmem_store()
-                                cvt_handle.commit()
-                                phase_mark(7, 1 + _cvt_flat)
-                                v_token = v_raw_consumer.try_wait()
-                                cvt_token = v_ready_producer.try_acquire()
+                            cute.copy(
+                                thr_store_v,
+                                tVrV_cvt,
+                                tVtV_cvt[cpy_dice + (cvt_handle.index,)],
+                            )
+                            cute.arch.fence_view_async_tmem_store()
+                            cvt_handle.commit()
+                            phase_mark(7, 1 + _cvt_flat)
+                            v_token = v_raw_consumer.try_wait()
+                            cvt_token = v_ready_producer.try_acquire()
 
         ##############################
         # MMA KQ (BMM1) Dispatch
@@ -3135,25 +2659,13 @@ class GroupedQueryAttentionDecodePagedFp4:
             for s in cutlass.range(iters_s):
                 s_token = s_producer.try_acquire()
 
-                if cutlass.const_expr(use_qmul4_v):
-                    k_token = k_consumer.try_wait()
-                else:
-                    # Advance over V entries in the historical interleaved
-                    # FIFO, then hand ownership back to KQ.
-                    if s >= prefetch_iters + 1:
-                        for _ in cutlass.range_constexpr(tiles_dm * tiles_sk):
-                            kv_consumer.advance()
-                    mma_order_vp_nbar.arrive_and_wait()
-                    k_token = kv_consumer.try_wait()
+                k_token = k_consumer.try_wait()
 
                 s_handle = s_producer.acquire_and_advance(s_token)
                 for sm in cutlass.range_constexpr(tiles_sm):
                     tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
                     for dk in cutlass.range_constexpr(tiles_dk):
-                        if cutlass.const_expr(use_qmul4_v):
-                            k_handle = k_consumer.wait_and_advance(k_token)
-                        else:
-                            k_handle = kv_consumer.wait_and_advance(k_token)
+                        k_handle = k_consumer.wait_and_advance(k_token)
                         # SFK → TMEM(每 K stage)
                         if cutlass.const_expr(use_nvfp4_kq):
                             sf_stage = k_handle.index
@@ -3191,13 +2703,9 @@ class GroupedQueryAttentionDecodePagedFp4:
                             )
                         is_last_iter = sm == tiles_sm - 1 and dk == tiles_dk - 1
                         if is_last_iter:
-                            if cutlass.const_expr(not use_qmul4_v):
-                                mma_order_kq_nbar.arrive()
+                            pass
                         else:
-                            if cutlass.const_expr(use_qmul4_v):
-                                k_token = k_consumer.try_wait()
-                            else:
-                                k_token = kv_consumer.try_wait()
+                            k_token = k_consumer.try_wait()
 
                         mmas_k = cute.size(tAsK.shape[2])
                         for mma_k in cutlass.range_constexpr(mmas_k):
@@ -3225,10 +2733,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 s_handle.commit()
 
             # Tail loop
-            if cutlass.const_expr(not use_qmul4_v):
-                for _s in cutlass.range_constexpr(prefetch_iters):
-                    mma_order_vp_nbar.arrive_and_wait()
-                    mma_order_kq_nbar.arrive()
 
         ##############################
         # MMA VP (BMM2) Dispatch
@@ -3238,13 +2742,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             # 坑26 候选:set() 必须在 make_fragment 之后(KQ 的顺序)——
             # set 先行会破坏 fp4 desc 原型推导(probe4:双侧 mma_k 偏移失效)
             tAsV_desc = None
-            if cutlass.const_expr(not use_qmul4_v_tmem):
-                tAsV_desc = thrblk_mma_vp.make_fragment_A(tAsV)
-            if cutlass.const_expr(use_nvfp4_vp):
-                # 坑23:desc 直接建在分配张量上(Q 同款),不经 local_tile 视图
-                tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_std)
-            else:
-                tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
+            tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
             tiled_mma_vp.set(
                 tcgen05.Field.ACCUMULATE,
                 True,
@@ -3254,71 +2752,40 @@ class GroupedQueryAttentionDecodePagedFp4:
                 # (mmas_k = size(tAsV.shape[2]))。两者的 K 分块必须一致,
                 # 否则 token 与 P 的槽位错配 —— Phase 1 的"V token 轴塌缩"
                 # 指纹正需要这一项来证实或排除。
-                if cutlass.const_expr(use_qmul4_v_smem):
-                    # raw 与 ready 是否**重叠**:坑5 记过"流水线拆分后必须
-                    # 独立分配,否则两条流水线并发互踩"。若 raw TMA 落在
-                    # ready 的地址上,转换的产物会被下一次 TMA 冲掉 ——
-                    # 这与"转换惰性、写读 slot 一致"完全吻合。
-                    print(
-                        f"[vp] ptr raw={tAsVRaw.iterator} "
-                        f"ready={tAsV.iterator} "
-                        f"rawtma={tAsVRawTma.iterator}\n"
-                        f"[vp] tAsVRaw={tAsVRaw.layout}\n"
-                        f"[vp] tAsVReady={tAsVReady.layout}\n"
-                        f"[vp] tAsVSFD={tAsVSFD.layout}",
-                        flush=True,
-                    )
-                if cutlass.const_expr(use_qmul4_v_tmem):
-                    print(
-                        f"[vp] tAtV_cvt={tAtV_cvt.layout}\n"
-                        f"[vp] tBsP_desc={tBsP_desc.layout}\n"
-                        f"[vp] mmas_k={cute.size(tAtV_cvt.shape[2])}",
-                        flush=True,
-                    )
-                else:
-                    print(
-                        f"[vp] tAsV={tAsV.layout}\n"
-                        f"[vp] tAsV_desc={tAsV_desc.layout}\n"
-                        f"[vp] tBsP_desc={tBsP_desc.layout}\n"
-                        f"[vp] mmas_k={cute.size(tAsV.shape[2])}",
-                        flush=True,
-                    )
+                print(
+                    f"[vp] tAtV_cvt={tAtV_cvt.layout}\n"
+                    f"[vp] tBsP_desc={tBsP_desc.layout}\n"
+                    f"[vp] mmas_k={cute.size(tAtV_cvt.shape[2])}",
+                    flush=True,
+                )
 
             copy_sfv = tCsSFV_s2t = tCtSFV_s2t = None
-            if cutlass.const_expr(use_nvfp4_vp):
-                copy_sfv, tCsSFV_s2t, tCtSFV_s2t = _sf_s2t_partition(
-                    sf_dtype, tAsSFV, tCtSFV
-                )
-                copy_sfp, tCsSFP_s2t, tCtSFP_s2t = _sf_s2t_partition(
-                    sf_dtype, tBsSFP, tCtSFP
-                )
-                # SFP → TMEM(常数,一次)
-                cute.arch.mbarrier_wait(sfp_mbar, phase=0)
-                cute.copy(
-                    copy_sfp,
-                    tCsSFP_s2t[None, None, None, None, 0],
-                    tCtSFP_s2t,
-                )
 
-            if cutlass.const_expr(use_qmul4_v_tmem):
-                phase_mark(3, 90, True)
-                o_init_nbar.arrive_and_wait()
-                phase_mark(3, 91, True)
+            phase_mark(3, 90, True)
+            o_init_nbar.arrive_and_wait()
+            phase_mark(3, 91, True)
 
             # Prefetch loop
-            if cutlass.const_expr(not use_qmul4_v):
-                mma_order_vp_nbar.arrive()
-                for s in cutlass.range_constexpr(prefetch_iters):
-                    if s < iters_s:
-                        for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
-                            kv_consumer.advance()
-                    mma_order_kq_nbar.arrive_and_wait()
-                    mma_order_vp_nbar.arrive()
 
-            if cutlass.const_expr(use_qmul4_v_tmem):
-                # Every non-empty split has phase 0. Phase 1 exists only when
-                # there is a second sequence tile; later iterations reuse the
-                # corrected ring contents and therefore accumulate.
+            (
+                tiled_mma_vp,
+                p_consumer,
+                o_producer,
+                v_ready_consumer,
+            ) = self.mma_vp_qmul4_tmem_step(
+                True,
+                tiled_mma_vp,
+                tAtV_cvt,
+                tBsP_desc,
+                tCtO,
+                p_consumer,
+                o_producer,
+                v_ready_consumer,
+                tiles_sk,
+                tiles_dm,
+            )
+            phase_mark(3, 92, True)
+            if iters_s > 1:
                 (
                     tiled_mma_vp,
                     p_consumer,
@@ -3336,244 +2803,28 @@ class GroupedQueryAttentionDecodePagedFp4:
                     tiles_sk,
                     tiles_dm,
                 )
-                phase_mark(3, 92, True)
-                if iters_s > 1:
-                    (
-                        tiled_mma_vp,
-                        p_consumer,
-                        o_producer,
-                        v_ready_consumer,
-                    ) = self.mma_vp_qmul4_tmem_step(
-                        True,
-                        tiled_mma_vp,
-                        tAtV_cvt,
-                        tBsP_desc,
-                        tCtO,
-                        p_consumer,
-                        o_producer,
-                        v_ready_consumer,
-                        tiles_sk,
-                        tiles_dm,
-                    )
-                    phase_mark(3, 93, True)
-                for _s in cutlass.range(2, iters_s):
-                    (
-                        tiled_mma_vp,
-                        p_consumer,
-                        o_producer,
-                        v_ready_consumer,
-                    ) = self.mma_vp_qmul4_tmem_step(
-                        False,
-                        tiled_mma_vp,
-                        tAtV_cvt,
-                        tBsP_desc,
-                        tCtO,
-                        p_consumer,
-                        o_producer,
-                        v_ready_consumer,
-                        tiles_sk,
-                        tiles_dm,
-                    )
-                    phase_mark(3, 94 + _s, True)
+                phase_mark(3, 93, True)
+            for _s in cutlass.range(2, iters_s):
+                (
+                    tiled_mma_vp,
+                    p_consumer,
+                    o_producer,
+                    v_ready_consumer,
+                ) = self.mma_vp_qmul4_tmem_step(
+                    False,
+                    tiled_mma_vp,
+                    tAtV_cvt,
+                    tBsP_desc,
+                    tCtO,
+                    p_consumer,
+                    o_producer,
+                    v_ready_consumer,
+                    tiles_sk,
+                    tiles_dm,
+                )
+                phase_mark(3, 94 + _s, True)
 
             # Sequence loop
-            vp_iters_s = 0 if use_qmul4_v_tmem else iters_s
-            for s in cutlass.range(vp_iters_s):
-                p_token = p_consumer.try_wait()
-                o_token = o_producer.try_acquire()
-
-                if cutlass.const_expr(use_qmul4_v_smem):
-                    v_token = v_raw_consumer.try_wait()
-                    v_ready_token = v_ready_producer.try_acquire()
-                elif cutlass.const_expr(use_qmul4_v_tmem):
-                    v_ready_token = v_ready_consumer.try_wait()
-                else:
-                    # Advance over K entries in the historical interleaved
-                    # FIFO, then hand ownership back to VP.
-                    if s < iters_s - prefetch_iters:
-                        for _ in cutlass.range_constexpr(tiles_sm * tiles_dk):
-                            kv_consumer.advance()
-                    mma_order_kq_nbar.arrive_and_wait()
-                    v_token = kv_consumer.try_wait()
-
-                p_handle = p_consumer.wait_and_advance(p_token)
-                o_handle = o_producer.acquire_and_advance(o_token)
-                for sk in cutlass.range_constexpr(tiles_sk):
-                    for dm in cutlass.range_constexpr(tiles_dm):
-                        if cutlass.const_expr(use_qmul4_v_smem):
-                            v_handle = v_raw_consumer.wait_and_advance(v_token)
-                            v_ready_handle = v_ready_producer.acquire_and_advance(
-                                v_ready_token
-                            )
-                        elif cutlass.const_expr(use_qmul4_v_tmem):
-                            v_mma_handle = v_ready_consumer.wait_and_advance(
-                                v_ready_token
-                            )
-                        else:
-                            v_handle = kv_consumer.wait_and_advance(v_token)
-                        is_last_iter = sk == tiles_sk - 1 and dm == tiles_dm - 1
-                        if is_last_iter:
-                            if cutlass.const_expr(not use_qmul4_v):
-                                mma_order_vp_nbar.arrive()
-                        else:
-                            if cutlass.const_expr(use_qmul4_v_smem):
-                                v_token = v_raw_consumer.try_wait()
-                                v_ready_token = v_ready_producer.try_acquire()
-                            elif cutlass.const_expr(use_qmul4_v_tmem):
-                                v_ready_token = v_ready_consumer.try_wait()
-                            else:
-                                v_token = kv_consumer.try_wait()
-
-                        if cutlass.const_expr(use_qmul4_v_smem):
-                            # qmul4_skip="conv":只摘掉转换,握手/MMA 全留 ——
-                            # ready 缓冲里是垃圾值,数值必错,但**不应该 trap**;
-                            # 若 trap 随之消失,嫌疑就锁定在转换的访存几何上。
-                            if cutlass.const_expr(self.qmul4_skip != "conv"):
-                                dequantize_nvfp4_tile_d(
-                                    tAsVRaw[None, None, v_handle.index],
-                                    tAsVSFD[None, None, v_handle.index],
-                                    tAsVReady[None, None, v_ready_handle.index],
-                                    lane_idx,
-                                    warp_threads,
-                                )
-                            # Orders every lane's STS.128 before its full-bar
-                            # arrival. The one-lane UMMA consumer cannot pass
-                            # wait until all 32 producer arrivals are visible.
-                            cute.arch.fence_view_async_shared()
-                            v_handle.release()
-                            v_ready_handle.commit()
-                            v_mma_handle = v_ready_consumer.wait_and_advance()
-                            if cutlass.const_expr(
-                                os.environ.get("RESATTN_QMUL4_IDX_DEBUG") == "1"
-                            ):
-                                # 决定性测量:转换写的 slot 与 MMA 读的 slot
-                                # 是否同一个。消融已证明"转换产物惰性、而 MMA
-                                # 是 O 的唯一写入者" —— 同内存同布局下,只剩
-                                # stage 下标不一致这一种解释。
-                                if lane_idx == 0:
-                                    cute.printf(
-                                        "IDX write=%d read=%d\n",
-                                        v_ready_handle.index,
-                                        v_mma_handle.index,
-                                    )
-
-                        # SFV → TMEM(每 V stage)
-                        # perf_probe=4:跳过此 UTCCP(读 TMEM 陈值,数值废、时序真)
-                        # —— 给"单 slot 强迫 UTCCP 与 gemm 串行"单独标价
-                        if cutlass.const_expr(use_nvfp4_vp and self.perf_probe != 4):
-                            cute.copy(
-                                copy_sfv,
-                                tCsSFV_s2t[None, None, None, None, v_handle.index],
-                                tCtSFV_s2t,
-                            )
-                        mmas_k = (
-                            cute.size(tAtV_cvt.shape[2])
-                            if use_qmul4_v_tmem
-                            else cute.size(tAsV.shape[2])
-                        )
-                        for mma_k in cutlass.range_constexpr(mmas_k):
-                            if cutlass.const_expr(use_nvfp4_vp):
-                                tiled_mma_vp.set(
-                                    tcgen05.Field.SFA,
-                                    tCtSFV[None, None, mma_k].iterator,
-                                )
-                                tiled_mma_vp.set(
-                                    tcgen05.Field.SFB,
-                                    tCtSFP[None, None, mma_k].iterator,
-                                )
-                                # 坑25(probe2/3:每 stage 4 个 gemm 仅 1 个入账):
-                                # 显式每 gemm 重申 ACCUMULATE(KQ 同款防御),
-                                # 防 set(SF*)/desc 路径隐性复位
-                                tiled_mma_vp.set(tcgen05.Field.ACCUMULATE, True)
-                            if cutlass.const_expr(use_nvfp4_vp):
-                                _pdesc = tBsP_desc[
-                                    None, None, mma_k,
-                                    sk + tiles_sk * p_handle.index,
-                                ]
-                            else:
-                                _pdesc = tBsP_desc[None, None, mma_k, sk, p_handle.index]
-                            # qmul4_skip="mma":只摘掉 VP MMA,转换与全部握手
-                            # 保留 —— 若 trap 随之消失,嫌疑锁定在 FP8 VP MMA
-                            # 的 descriptor / TMEM 几何上。
-                            if cutlass.const_expr(self.qmul4_skip != "mma"):
-                                if cutlass.const_expr(use_qmul4_v_tmem):
-                                    _voperand = tAtV_cvt[
-                                        None,
-                                        None,
-                                        mma_k,
-                                        v_mma_handle.index,
-                                    ]
-                                else:
-                                    _voperand = tAsV_desc[
-                                        None,
-                                        None,
-                                        mma_k,
-                                        (
-                                            v_mma_handle.index
-                                            if use_qmul4_v_smem
-                                            else v_handle.index
-                                        ),
-                                    ]
-                                if cutlass.const_expr(
-                                    use_qmul4_v_tmem
-                                    and sk == 0
-                                    and dm == 0
-                                    and mma_k == 0
-                                ):
-                                    # Each O ring phase is initialized once.
-                                    # Branch around two constant ``set`` calls
-                                    # on the *same* MMA object: this emits
-                                    # literal !UPT/UPT while preserving the
-                                    # accumulator descriptor.  A second MMA
-                                    # object writes through distinct idesc
-                                    # state and therefore cannot initialize
-                                    # the accumulator used below.
-                                    if s < o_stages:
-                                        tiled_mma_vp.set(
-                                            tcgen05.Field.ACCUMULATE,
-                                            False,
-                                        )
-                                        cute.gemm(
-                                            tiled_mma_vp,
-                                            tCtO[mma_dice + (dm, o_handle.index)],
-                                            _voperand,
-                                            _pdesc,
-                                            tCtO[mma_dice + (dm, o_handle.index)],
-                                        )
-                                    else:
-                                        tiled_mma_vp.set(
-                                            tcgen05.Field.ACCUMULATE,
-                                            True,
-                                        )
-                                        cute.gemm(
-                                            tiled_mma_vp,
-                                            tCtO[mma_dice + (dm, o_handle.index)],
-                                            _voperand,
-                                            _pdesc,
-                                            tCtO[mma_dice + (dm, o_handle.index)],
-                                        )
-                                else:
-                                    if cutlass.const_expr(use_qmul4_v_tmem):
-                                        tiled_mma_vp.set(
-                                            tcgen05.Field.ACCUMULATE,
-                                            True,
-                                        )
-                                    cute.gemm(
-                                        tiled_mma_vp,
-                                        tCtO[mma_dice + (dm, o_handle.index)],
-                                        _voperand,
-                                        _pdesc,
-                                        tCtO[mma_dice + (dm, o_handle.index)],
-                                    )
-                        if cutlass.const_expr(use_qmul4_v):
-                            # PipelineAsyncUmma's empty arrival is tied to the
-                            # tensor-core scoreboard, so this protects the
-                            # ready slot even though release follows issue.
-                            v_mma_handle.release()
-                        else:
-                            v_handle.release()
-                p_handle.release()
-                o_handle.commit()
 
             # Wait for signal to dealloc tmem, then dealloc
             if iters_s == 1:
@@ -3635,15 +2886,9 @@ class GroupedQueryAttentionDecodePagedFp4:
             # 列"),掩码/colmax/colsum/L 写回全须按新几何重写 + P/V π 重排,级联
             # 数百行 —— 正确性优先,decode 先走 v1(shfl 拼字节),v2 留待数值基线
             # 建立后作为独立实验(R2 加宽 N 后收益更大)。
-            if cutlass.const_expr(use_nvfp4_vp):
-                # v2:16-dp 原子,1 线程持 2 行(距8);rep 单位=256bit=8 列 → //8
-                tmem_load_op_s = tcgen05.Ld16x256bOp(
-                    tcgen05.Repetition(tmem_repeat_op_s // 8)
-                )
-            else:
-                tmem_load_op_s = tcgen05.Ld32x32bOp(
-                    tcgen05.Repetition(tmem_repeat_op_s)
-                )
+            tmem_load_op_s = tcgen05.Ld32x32bOp(
+                tcgen05.Repetition(tmem_repeat_op_s)
+            )
             tmem_load_atom_s = cute.make_copy_atom(tmem_load_op_s, acc_dtype)
             # Tile atom and slice
             tCtS_stage = tCtS[mma_dice + (None, 0)]
@@ -3654,46 +2899,13 @@ class GroupedQueryAttentionDecodePagedFp4:
             tStS = thr_load_s.partition_S(tCtS)
             tSsP = thr_load_s.partition_D(tCsP)
             # Slice unused modes
-            if cutlass.const_expr(use_nvfp4_vp):
-                # v2:mode1=GRP=2(两个 16-dp 实例 = 两个 16-token SF 组),必须保留。
-                # 所有权几何(identity-tensor 破译,详见 plan doc "v2 所有权几何"):
-                #   token = 32*w + t1 + 8*v1 + 16*grp + mma_tile_m*v3
-                #   col   = 2*t0 + v0 + 8*v2      (lane = t0 + 4*t1, w = warp)
-                tStS = tStS[None, None, 0, 0, None, None]  # (CPY, GRP, #CPY_SM, s_stages)
-                tSsP = tSsP[None, None, 0, 0, None, None]
-                # perf:u32 视图(裸指针,手工 XOR)—— 向量化 P store 用
-                _sPb32 = cute.recast_tensor(tBsP_std, cutlass.Int32)
-                sP_u32 = cute.make_tensor(
-                    _sPb32.iterator, cute.make_layout(cute.size(_sPb32.layout))
-                )
-                # v2 P store 用字节视图直写(π 槽位),不经 tSsP 寻址
-                # 坑22/23:写路径与 desc 必须同源。tBsP_std(S<2,4,3>)的字节视图,
-                # recast 丢 swizzle 后经 recast_ptr 挂回 —— 标量写应用指针 swizzle
-                # (本地 5090 探针 1024/1024 实证,字节空间)。
-                _sPb = cute.recast_tensor(tBsP_std, cutlass.Int8)
-                sP_flat = cute.make_tensor(
-                    cute.recast_ptr(
-                        _sPb.iterator,
-                        smem_layout_p_std.inner,  # 布局自带的 swizzle(k_vp 决定)
-                        dtype=cutlass.Int8,
-                    ),
-                    cute.make_layout(cute.size(_sPb.layout)),
-                )
-            else:
-                tStS = tStS[None, 0, 0, 0, None, None]  # (CPY, #CPY_SM, s_stages)
-                tSsP = tSsP[None, 0, 0, 0, None, None]  # (CPY, #CPY_SM, p_stages)
+            tStS = tStS[None, 0, 0, 0, None, None]  # (CPY, #CPY_SM, s_stages)
+            tSsP = tSsP[None, 0, 0, 0, None, None]  # (CPY, #CPY_SM, p_stages)
 
             # Construct copy atom for L
-            if cutlass.const_expr(use_nvfp4_vp):
-                # v2:L 与 S 同 16-dp 几何(rep 单位 256bit=8 列),colsum 只归约
-                # v3(SM tile),保留 (v1,grp) → 每 warp 写满 32 DP,correction 零改动
-                tmem_repeat_op_l = tcgen05.Repetition(blk_tile_n // 8)
-                tmem_load_op_l = tcgen05.Ld16x256bOp(tmem_repeat_op_l)
-                tmem_store_op_l = tcgen05.St16x256bOp(tmem_repeat_op_l)
-            else:
-                tmem_repeat_op_l = tcgen05.Repetition(blk_tile_n)
-                tmem_load_op_l = tcgen05.Ld32x32bOp(tmem_repeat_op_l)
-                tmem_store_op_l = tcgen05.St32x32bOp(tmem_repeat_op_l)
+            tmem_repeat_op_l = tcgen05.Repetition(blk_tile_n)
+            tmem_load_op_l = tcgen05.Ld32x32bOp(tmem_repeat_op_l)
+            tmem_store_op_l = tcgen05.St32x32bOp(tmem_repeat_op_l)
             tmem_load_atom_l = cute.make_copy_atom(tmem_load_op_l, acc_dtype)
             tmem_store_atom_l = cute.make_copy_atom(tmem_store_op_l, acc_dtype)
             # Tile atom and slice
@@ -3710,21 +2922,12 @@ class GroupedQueryAttentionDecodePagedFp4:
             tSrL_shape = thr_load_l.partition_D(tCtL_phase).shape
             # Slice unused modes
             # (CPY,)
-            if cutlass.const_expr(use_nvfp4_vp):
-                
-                tStL = (
-                    tStL[None, None, 0, 0, None]
-                    if cutlass.const_expr(softmax_warpgroups == 1)
-                    else tStL[None, None, 0, 0]
-                )
-                tSrL_shape = tSrL_shape[:2]
-            else:
-                tStL = (
-                    tStL[None, 0, 0, 0, None]
-                    if cutlass.const_expr(softmax_warpgroups == 1)
-                    else tStL[None, 0, 0, 0]
-                )
-                tSrL_shape = tSrL_shape[:1]
+            tStL = (
+                tStL[None, 0, 0, 0, None]
+                if cutlass.const_expr(softmax_warpgroups == 1)
+                else tStL[None, 0, 0, 0]
+            )
+            tSrL_shape = tSrL_shape[:1]
 
             # Causal masking for spec decode verification
             masked_iters_s = masked_start_s = masked_coord_s = 0
@@ -3786,59 +2989,14 @@ class GroupedQueryAttentionDecodePagedFp4:
 
                     # Load S from tmem and notify BMM1
                     s_handle = s_consumer.wait_and_advance(s_token)
-                    if cutlass.const_expr(use_nvfp4_vp):
-                        tStS_s = tStS[None, None, None, s_handle.index]
-                    else:
-                        tStS_s = tStS[None, None, s_handle.index]
+                    tStS_s = tStS[None, None, s_handle.index]
                     tSrS_s = cute.make_rmem_tensor(tSsP.shape[:-1], acc_dtype)
                     cute.copy(tmem_load_atom_s, tStS_s, tSrS_s)
                     cute.arch.fence_view_async_tmem_load()
                     s_handle.release()
 
                     # Apply causal mask
-                    if cutlass.const_expr(use_nvfp4_vp):
-                        # ---- v2 几何(identity 破译,见 plan doc):线程持有
-                        # token = 32*w + t1 + 8*v1 + 16*grp + mma_tile_m*v3
-                        # col   = 2*t0 + v0 + 8*v2
-                        _lane = warpgroup_tidx % 32
-                        _t0 = _lane % 4
-                        _t1 = _lane // 4
-                        _w = warpgroup_tidx // 32
-                        _tok_base = _w * 32 + _t1
-                        _col_base = 2 * _t0
-                        _b4 = _t1 % 4   # 4x4 转置组内位置
-                        _k4 = _t1 // 4  # 组序(每组 4 个连续 token 字节)
-                        # v3(SM tile)模在 tiles_sm=4 时被 DSL 拆成嵌套 (2,2)
-                        # → 用 flat 视图统一成一维,索引照旧线性
-                        _fshape = tSrS_s.shape[0][0]
-                        _v0e, _v1e, _v2e = _fshape[0], _fshape[1], _fshape[2]
-                        _v3e = cute.size(_fshape[3])
-                        _tSrS_f = cute.make_tensor(
-                            tSrS_s.iterator,
-                            cute.make_layout(
-                                (((_v0e, _v1e, _v2e, _v3e), 1), tSrS_s.shape[1], 1)
-                            ),
-                        )
-                        tSrS_s = _tSrS_f
-                        _grpe = tSrS_s.shape[1]
-                        assert _v1e == 2, "v1 应为 16-dp 行对"
-                        if cutlass.const_expr(is_masked_loop):
-                            _off_s = (masked_coord_s + s) * blk_tile_s + _tok_base
-                            offset_p = seqlen - prediction + coord_p * blk_tile_p
-                            for _g in cutlass.range_constexpr(_grpe):
-                                for _v3 in cutlass.range_constexpr(_v3e):
-                                    for _v1 in cutlass.range_constexpr(_v1e):
-                                        _tok = _off_s + 8 * _v1 + 16 * _g + mma_tile_m * _v3
-                                        for _v2 in cutlass.range_constexpr(_v2e):
-                                            for _v0 in cutlass.range_constexpr(_v0e):
-                                                _p = (_col_base + _v0 + 8 * _v2) // blk_tile_h
-                                                _oob = _tok > offset_p + _p
-                                                _m = -Float32.inf if _oob else Float32(0)
-                                                tSrS_s[((_v0, _v1, _v2, _v3), 0), _g, 0] = (
-                                                    tSrS_s[((_v0, _v1, _v2, _v3), 0), _g, 0] + _m
-                                                )
-                        scores = tSrS_s.load()
-                    elif cutlass.const_expr(is_masked_loop):
+                    if cutlass.const_expr(is_masked_loop):
                         masked = cute.make_rmem_tensor(
                             (blk_tile_h, blk_tile_p, tiles_sm), acc_dtype
                         )
@@ -3872,268 +3030,124 @@ class GroupedQueryAttentionDecodePagedFp4:
                         _dup_r.store(_fold)
                         scores = _dup.load().reshape((blk_tile_n, tiles_sm))
 
-                    if cutlass.const_expr(use_nvfp4_vp):
-                        # v2 colmax:线程内归约 8 个 token 槽/列(v1,v3,grp)
-                        _rmax = cute.make_rmem_tensor((_v0e, _v2e), acc_dtype)
-                        _rmax.fill(-Float32.inf)
-                        for _v0 in cutlass.range_constexpr(_v0e):
-                            for _v2 in cutlass.range_constexpr(_v2e):
-                                for _g in cutlass.range_constexpr(_grpe):
-                                    for _v3 in cutlass.range_constexpr(_v3e):
-                                        for _v1 in cutlass.range_constexpr(_v1e):
-                                            _x = tSrS_s[((_v0, _v1, _v2, _v3), 0), _g, 0]
-                                            _cur = _rmax[_v0, _v2]
-                                            _rmax[_v0, _v2] = _x if _x > _cur else _cur
-                        # t1 组蝶式归约(lane = t0 + 4*t1;offset 16/8/4 = t1 的三个位,
-                        # t0 位不混 → 4 个列组各自独立归约,FA2 Allreduce 的跨步版)
-                        for _off in (16, 8, 4):
-                            for _v0 in cutlass.range_constexpr(_v0e):
-                                for _v2 in cutlass.range_constexpr(_v2e):
-                                    _cur = _rmax[_v0, _v2]
-                                    _oth = cute.arch.shuffle_sync_bfly(_cur, offset=_off)
-                                    _rmax[_v0, _v2] = _oth if _oth > _cur else _cur
-
-                        # smem 归约(跨 warp/跨 warpgroup):t1==0 的 lane 写自己的 4 列
-                        phase_mark(softmax_phase, 20 + s)
-                        if cutlass.const_expr(softmax_warpgroups > 1):
-                            sM_acquire_nbar.arrive_and_wait()
-                        phase_mark(softmax_phase, 30 + s)
-                        sM_consumer_nbar.arrive_and_wait()
-                        if _t1 == 0:
-                            for _v0 in cutlass.range_constexpr(_v0e):
-                                for _v2 in cutlass.range_constexpr(_v2e):
-                                    smem_fmax(
-                                        sM.iterator + sM.layout(_col_base + _v0 + 8 * _v2),
-                                        _rmax[_v0, _v2] * scale_s_log2_e,
-                                    )
-
-                        # 等 colmax 就绪,按动态列号从 smem 读 4 列(避免寄存器动态索引)
-                        sM_producer_nbar.arrive_and_wait()
-                        _cmax = cute.make_rmem_tensor((_v0e, _v2e), acc_dtype)
-                        for _v0 in cutlass.range_constexpr(_v0e):
-                            for _v2 in cutlass.range_constexpr(_v2e):
-                                _cmax[_v0, _v2] = sM[_col_base + _v0 + 8 * _v2]
-                        if cutlass.const_expr(softmax_warpgroups > 1):
-                            sM_release_nbar.arrive()
-
-                        # Handle if we never saw any in-bounds values
-                        if cutlass.const_expr(is_masked_loop and do_atomic_red):
-                            if check_safe_max:
-                                for _v0 in cutlass.range_constexpr(_v0e):
-                                    for _v2 in cutlass.range_constexpr(_v2e):
-                                        _c = _cmax[_v0, _v2]
-                                        _cmax[_v0, _v2] = (
-                                            Float32(0) if _c == -Float32.inf else _c
-                                        )
-
-                        # Wait for empty P buffer
-                        p_handle = p_producer.acquire_and_advance(p_token)
-
-                        # perf:colmax 用 stride-0 广播视图(替代 32 次标量写),
-                        # 直接进 TensorSSA 向量 exp2
-                        _cm_bc = cute.make_tensor(
-                            _cmax.iterator,
-                            cute.make_layout(
-                                (((_v0e, _v1e, _v2e, _v3e), 1), _grpe, 1),
-                                stride=(((1, 0, _v0e, 0), 0), 0, 0),
-                            ),
+                    rM = cute.make_rmem_tensor_like(sM)
+                    rM.store(
+                        scores.reduce(
+                            cute.ReductionOp.MAX,
+                            init_val=-Float32.inf,
+                            reduction_profile=(None, 0),
                         )
-                        probs = exp2(scale_s_log2_e * scores - _cm_bc.load())
-                    else:
-                        # Reduce colmax in thread RF
-                        rM = cute.make_rmem_tensor_like(sM)
-                        rM.store(
-                            scores.reduce(
-                                cute.ReductionOp.MAX,
-                                init_val=-Float32.inf,
-                                reduction_profile=(None, 0),
-                            )
-                        )
+                    )
 
-                        # Reduce colmax in warp RF
-                        rM_lane = Float32(0)
-                        for n in cutlass.range_constexpr(blk_tile_n):
-                            rM[n] = warp_fmax(rM[n])  # warp reduction
-                            # Avoid dynamic register indexing (creates spills)
-                            if n == lane_idx:
-                                rM_lane = rM[n]
-                        rM_lane *= scale_s_log2_e  # apply scale
+                    # Reduce colmax in warp RF
+                    rM_lane = Float32(0)
+                    for n in cutlass.range_constexpr(blk_tile_n):
+                        rM[n] = warp_fmax(rM[n])  # warp reduction
+                        # Avoid dynamic register indexing (creates spills)
+                        if n == lane_idx:
+                            rM_lane = rM[n]
+                    rM_lane *= scale_s_log2_e  # apply scale
 
-                        # Reduce colmax in smem
-                        phase_mark(softmax_phase, 20 + s)
-                        if cutlass.const_expr(softmax_warpgroups > 1):
-                            sM_acquire_nbar.arrive_and_wait()
-                        phase_mark(softmax_phase, 30 + s)
-                        sM_consumer_nbar.arrive_and_wait()
-                        if lane_store_max:
-                            if cutlass.const_expr(
-                                use_qmul4_v_tmem and softmax_warpgroups == 1
-                            ):
-                                # TRT-style FP8-P rescale suppression.  Keep
-                                # the old normalization origin while the new
-                                # tile max is at most 8 log2 units higher.
-                                # exp2(delta) <= 256 remains below E4M3 max
-                                # 448, so numerator and denominator retain a
-                                # common scale without saturating P.
-                                if rM_lane - previous_max_lane > Float32(8):
-                                    smem_fmax(
-                                        sM.iterator + sM.layout(lane_idx),
-                                        rM_lane,
-                                    )
-                            else:
-                                # Alternating WGs cannot use a WG-local prior
-                                # maximum. Use ordinary atomic max until a
-                                # collective suppression protocol is available.
-                                smem_fmax(
-                                    sM.iterator + sM.layout(lane_idx), rM_lane
-                                )
-
-                        # Wait for colmax and load
-                        sM_producer_nbar.arrive_and_wait()
-                        colmax = sM.load()
+                    # Reduce colmax in smem
+                    phase_mark(softmax_phase, 20 + s)
+                    if cutlass.const_expr(softmax_warpgroups > 1):
+                        sM_acquire_nbar.arrive_and_wait()
+                    phase_mark(softmax_phase, 30 + s)
+                    sM_consumer_nbar.arrive_and_wait()
+                    if lane_store_max:
                         if cutlass.const_expr(
                             use_qmul4_v_tmem and softmax_warpgroups == 1
                         ):
-                            if lane_store_max:
-                                previous_max_lane = sM[lane_idx]
-                        if cutlass.const_expr(softmax_warpgroups > 1):
-                            sM_release_nbar.arrive()
+                            # TRT-style FP8-P rescale suppression.  Keep
+                            # the old normalization origin while the new
+                            # tile max is at most 8 log2 units higher.
+                            # exp2(delta) <= 256 remains below E4M3 max
+                            # 448, so numerator and denominator retain a
+                            # common scale without saturating P.
+                            if rM_lane - previous_max_lane > Float32(8):
+                                smem_fmax(
+                                    sM.iterator + sM.layout(lane_idx),
+                                    rM_lane,
+                                )
+                        else:
+                            # Alternating WGs cannot use a WG-local prior
+                            # maximum. Use ordinary atomic max until a
+                            # collective suppression protocol is available.
+                            smem_fmax(
+                                sM.iterator + sM.layout(lane_idx), rM_lane
+                            )
 
-                        # Handle if we never saw any in-bounds values
-                        if cutlass.const_expr(is_masked_loop and do_atomic_red):
-                            if check_safe_max:
-                                rM = cute.make_rmem_tensor_like(colmax)
-                                rM.store(colmax)
-                                for n in cutlass.range_constexpr(blk_tile_n):
-                                    if rM[n] == -Float32.inf:
-                                        rM[n] = Float32(0)
-                                colmax = rM.load()
+                    # Wait for colmax and load
+                    sM_producer_nbar.arrive_and_wait()
+                    colmax = sM.load()
+                    if cutlass.const_expr(
+                        use_qmul4_v_tmem and softmax_warpgroups == 1
+                    ):
+                        if lane_store_max:
+                            previous_max_lane = sM[lane_idx]
+                    if cutlass.const_expr(softmax_warpgroups > 1):
+                        sM_release_nbar.arrive()
 
-                        # Wait for empty P buffer
-                        # Here so we can interleave ex2 with convert ops
-                        p_handle = p_producer.acquire_and_advance(p_token)
-                        tSsP_s = tSsP[None, None, p_handle.index]
+                    # Handle if we never saw any in-bounds values
+                    if cutlass.const_expr(is_masked_loop and do_atomic_red):
+                        if check_safe_max:
+                            rM = cute.make_rmem_tensor_like(colmax)
+                            rM.store(colmax)
+                            for n in cutlass.range_constexpr(blk_tile_n):
+                                if rM[n] == -Float32.inf:
+                                    rM[n] = Float32(0)
+                            colmax = rM.load()
 
-                        # Compute online softmax
-                        probs = exp2(scale_s_log2_e * scores - colmax)
+                    # Wait for empty P buffer
+                    # Here so we can interleave ex2 with convert ops
+                    p_handle = p_producer.acquire_and_advance(p_token)
+                    tSsP_s = tSsP[None, None, p_handle.index]
+
+                    # Compute online softmax
+                    probs = exp2(scale_s_log2_e * scores - colmax)
 
                     # Store P to smem and notify BMM2
-                    if cutlass.const_expr(use_nvfp4_vp):
-                        
-                        
-                        
-                        
-                        
-                        
-                        _probs_r = cute.make_rmem_tensor(tSrS_s.shape, acc_dtype)
-                        _probs_r.store(probs)
-                        _do_pstore = cutlass.const_expr(self.perf_probe < 2)
-
-                        for _g in cutlass.range_constexpr(_grpe if _do_pstore else 0):
-                            for _v3 in cutlass.range_constexpr(_v3e):
-                                # 坑20:窄精度 rmem 向量须 ≥32bit → 每 (grp,v3) 8 值
-                                # 一次转换。v1 放 stride-1 内模 → 字节两 nibble 恰为
-                                # (tok, tok+8) 对(低 nibble=v1=0=物理偶槽)
-                                _pr = cute.make_rmem_tensor((2, _v0e, _v2e), acc_dtype)
-                                for _v2 in cutlass.range_constexpr(_v2e):
-                                    for _v0 in cutlass.range_constexpr(_v0e):
-                                        for _v1 in cutlass.range_constexpr(2):
-                                            _pr[_v1, _v0, _v2] = (
-                                                _probs_r[((_v0, _v1, _v2, _v3), 0), _g, 0]
-                                                * 5.818181818181818
-                                            )
-                                _pr4 = cute.make_rmem_tensor((2, _v0e, _v2e), vp_dtype)
-                                _pr4.store(_pr.load().to(vp_dtype))
-                                _pb = cute.recast_tensor(_pr4, cutlass.Int8)
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                
-                                _hps = max(mma_tile_k_vp // mma_tile_m, 1)
-                                _sk_of_v3 = _v3 // _hps
-                                _v3_in_stage = _v3 % _hps
-                                for _v2 in cutlass.range_constexpr(_v2e):
-                                    for _v0 in cutlass.range_constexpr(_v0e):
-                                        _f = (
-                                            (16 * _w + 8 * _g + _t1)
-                                            + _v3_in_stage * (mma_tile_m // 2)
-                                            + (_col_base + _v0 + 8 * _v2)
-                                            * (mma_tile_k_vp // 2)
-                                            + (_sk_of_v3 + tiles_sk * p_handle.index)
-                                            * (mma_tile_n * mma_tile_k_vp // 2)
-                                        )
-                                        if cutlass.const_expr(self.perf_probe == 0):
-                                            sP_flat[_f] = _pb[0, _v0, _v2]
-                    else:
-                        _p_quant = probs.to(mma_dtype).reshape(tSsP_s.shape)
-                        if cutlass.const_expr(
-                            use_qmul4_v_tmem
-                            and os.environ.get(
-                                "RESATTN_QMUL4_VALUE_DEBUG"
-                            )
-                            == "1"
+                    _p_quant = probs.to(mma_dtype).reshape(tSsP_s.shape)
+                    if cutlass.const_expr(
+                        use_qmul4_v_tmem
+                        and os.environ.get(
+                            "RESATTN_QMUL4_VALUE_DEBUG"
+                        )
+                        == "1"
+                    ):
+                        _p_debug = cute.make_rmem_tensor(
+                            tSsP_s.shape, mma_dtype
+                        )
+                        _p_debug.store(_p_quant)
+                        _p_debug_flat = cute.make_tensor(
+                            _p_debug.iterator,
+                            cute.make_layout(cute.size(tSsP_s.shape)),
+                        )
+                        _p_has_nan = cutlass.Boolean(False)
+                        for _pi in cutlass.range_constexpr(
+                            cute.size(tSsP_s.shape)
                         ):
-                            _p_debug = cute.make_rmem_tensor(
-                                tSsP_s.shape, mma_dtype
+                            _px = Float32(_p_debug_flat[_pi])
+                            _p_has_nan |= _px != _px
+                        if _p_has_nan:
+                            cute.printf(
+                                "P_NAN tid=%d stage=%d\n",
+                                warpgroup_tidx,
+                                p_handle.index,
                             )
-                            _p_debug.store(_p_quant)
-                            _p_debug_flat = cute.make_tensor(
-                                _p_debug.iterator,
-                                cute.make_layout(cute.size(tSsP_s.shape)),
-                            )
-                            _p_has_nan = cutlass.Boolean(False)
-                            for _pi in cutlass.range_constexpr(
-                                cute.size(tSsP_s.shape)
-                            ):
-                                _px = Float32(_p_debug_flat[_pi])
-                                _p_has_nan |= _px != _px
-                            if _p_has_nan:
-                                cute.printf(
-                                    "P_NAN tid=%d stage=%d\n",
-                                    warpgroup_tidx,
-                                    p_handle.index,
-                                )
-                            tSsP_s.store(_p_debug.load())
-                        else:
-                            tSsP_s.store(_p_quant)
+                        tSsP_s.store(_p_debug.load())
+                    else:
+                        tSsP_s.store(_p_quant)
                     cute.arch.fence_view_async_shared()
                     p_handle.commit()
                     phase_mark(softmax_phase, 40 + s)
 
                     # Accumulate per-thread colsum
                     tSrL = cute.make_rmem_tensor(tSrL_shape, acc_dtype)
-                    if cutlass.const_expr(use_nvfp4_vp):
-                        # v2:只归约 v3(SM tile,同旧代码的 sm-fold),保留 (v1,grp)
-                        # → St16x256b 每 warp 写满 32 DP;L 的 DP 语义 = partial 槽,
-                        # correction 归约全部 128 DP,不关心槽里是哪个 token
-                        for _g in cutlass.range_constexpr(_grpe):
-                            for _v2 in cutlass.range_constexpr(_v2e):
-                                for _v1 in cutlass.range_constexpr(_v1e):
-                                    for _v0 in cutlass.range_constexpr(_v0e):
-                                        _acc = Float32(0)
-                                        for _v3 in cutlass.range_constexpr(_v3e):
-                                            _acc = _acc + _probs_r[
-                                                ((_v0, _v1, _v2, _v3), 0), _g, 0
-                                            ]
-                                        tSrL[((_v0, _v1, _v2), 0), _g] = _acc
-                    else:
-                        colsum = probs[None, 0]
-                        for sm in cutlass.range_constexpr(1, tiles_sm, 1):
-                            colsum += probs[None, sm]
-                        tSrL.store(colsum.reshape(tSrL.shape))
+                    colsum = probs[None, 0]
+                    for sm in cutlass.range_constexpr(1, tiles_sm, 1):
+                        colsum += probs[None, sm]
+                    tSrL.store(colsum.reshape(tSrL.shape))
 
                     # Store per-thread colsum to tmem
                     if cutlass.const_expr(softmax_warpgroups == 1):
@@ -4256,10 +3270,9 @@ class GroupedQueryAttentionDecodePagedFp4:
                 cute.copy(tmem_store_atom_o, tOrO, tOtO[None, None, phase])
             cute.copy(tmem_store_atom_o, tOrO[None, 0], tOtL[None, 1])
             cute.arch.fence_view_async_tmem_store()
-            if cutlass.const_expr(use_qmul4_v_tmem):
-                phase_mark(2, 60)
-                o_init_nbar.arrive_and_wait()
-                phase_mark(2, 61)
+            phase_mark(2, 60)
+            o_init_nbar.arrive_and_wait()
+            phase_mark(2, 61)
 
             # Initialize consumer barriers
             sM_consumer_nbar.arrive()

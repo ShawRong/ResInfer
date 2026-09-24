@@ -640,3 +640,80 @@ void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
         stream, enable_pdl);
   });
 }
+
+// Attention consumes one independently padded SF atom per (batch, KV head).
+// Reuse the MExt pack16 math; only the grouped row/SF addressing differs.
+namespace {
+__global__ void quantize_mext_grouped_q_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    uint8_t* __restrict__ q_pack,
+    uint8_t* __restrict__ q_sf,
+    int logical_rows, int physical_rows, int head_dim) {
+  const int group = blockIdx.x;
+  const int scale_groups = head_dim / CVT_FP4_SF_VEC_SIZE;
+  const int base_rows = physical_rows / 2;
+  const int64_t input_base = int64_t(group) * logical_rows * head_dim;
+  const int64_t data_base = int64_t(group) * physical_rows * (head_dim / 2);
+  const int64_t scale_base = int64_t(group) * 128 * scale_groups;
+  for (int index = threadIdx.x; index < logical_rows * scale_groups;
+       index += blockDim.x) {
+    const int row = index / scale_groups;
+    const int column = index % scale_groups;
+    vllm::PackedVec<__nv_bfloat16> lo{}, hi{};
+    vllm::load_packed_vec16(
+        q + input_base + int64_t(row) * head_dim +
+            column * CVT_FP4_SF_VEC_SIZE,
+        lo, hi);
+    uint8_t* base_data = q_pack + data_base +
+                         int64_t(row) * (head_dim / 2) + column * 8;
+    uint8_t* residue_data = q_pack + data_base +
+                            int64_t(base_rows + row) * (head_dim / 2) +
+                            column * 8;
+    uint8_t* base_scale = q_sf + scale_base +
+        vllm::compute_tiled_sf_offset<uint8_t>(row, column, head_dim);
+    uint8_t* residue_scale = q_sf + scale_base +
+        vllm::compute_tiled_sf_offset<uint8_t>(base_rows + row, column,
+                                               head_dim);
+    const vllm::u32x2 packed =
+        vllm::cvt_warp_fp16_to_fp4_mext_r1_fast16<__nv_bfloat16, false>(
+            lo, hi, 1.0f, 1.0f, base_scale,
+            reinterpret_cast<uint32_t*>(residue_data), residue_scale);
+    *reinterpret_cast<uint2*>(base_data) = make_uint2(packed.lo, packed.hi);
+  }
+}
+}  // namespace
+
+void scaled_fp4_quant_mext_r1_grouped_q(torch::Tensor const& q,
+                                         torch::Tensor& q_pack,
+                                         torch::Tensor& q_sf) {
+  TORCH_CHECK(q.is_cuda() && q_pack.is_cuda() && q_sf.is_cuda() &&
+                  q.device() == q_pack.device() && q.device() == q_sf.device(),
+              "grouped Q tensors must share one CUDA device");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.is_contiguous() &&
+                  q.dim() == 4, "q must be contiguous BF16 [B, Hkv, G, D]");
+  TORCH_CHECK(q_pack.scalar_type() == torch::kUInt8 &&
+                  q_sf.scalar_type() == torch::kUInt8 &&
+                  q_pack.is_contiguous() && q_sf.is_contiguous(),
+              "grouped Q outputs must be contiguous uint8");
+  const int batch = q.size(0), heads = q.size(1);
+  const int rows = q.size(2), head_dim = q.size(3);
+  const int physical_rows = rows == 4 ? 8 : 16;
+  TORCH_CHECK(rows == 4 || rows == 6 || rows == 8,
+              "grouped residue Q supports GQA4/6/8");
+  TORCH_CHECK(head_dim == 128, "grouped residue Q requires head_dim=128");
+  TORCH_CHECK(q_pack.dim() == 4 && q_pack.size(0) == batch &&
+                  q_pack.size(1) == heads &&
+                  q_pack.size(2) == physical_rows &&
+                  q_pack.size(3) == head_dim / 2,
+              "q_pack shape must match the physical Q tile");
+  TORCH_CHECK(q_sf.numel() >= int64_t(batch) * heads * 128 *
+                                  (head_dim / CVT_FP4_SF_VEC_SIZE),
+              "grouped Q scale buffer is too small");
+  if (batch == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  quantize_mext_grouped_q_kernel<<<batch * heads, 128, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+      q_pack.data_ptr<uint8_t>(), q_sf.data_ptr<uint8_t>(),
+      rows, physical_rows, head_dim);
+}

@@ -42,8 +42,6 @@ extra_compile_args = {
 
 if os.getenv("NVFP4_ENABLE_LINEINFO", "0") == "1":
     extra_compile_args["nvcc"].append("-lineinfo")
-if os.getenv("NVFP4_ROWPAIR_SMOKE_ONLY", "0") == "1":
-    extra_compile_args["nvcc"].append("-DNVFP4_ROWPAIR_SMOKE_ONLY=1")
 
 
 # Enable NVFP4 for Blackwell (FP4 E2M1) architectures.
@@ -94,7 +92,6 @@ sources = [
     'nvfp4/cuda/nvfp4_quant_kernels.cu',
     'nvfp4/cuda/nvfp4_residue_pack8.cu',
     'nvfp4/cuda/nvfp4_residue_pack16.cu',
-    'resattn/cuda/nvfp4_quantize_q.cu',
     'mxfp4/cuda/mxfp4_residue_quant.cu',
 ]
 
@@ -135,7 +132,7 @@ setup(
     packages=(find_packages(include=['nvfp4', 'nvfp4.*']) + list(KERNEL_PACKAGES)),
     package_dir=KERNEL_PACKAGES,
     package_data={name: ['cuda/*.cu', 'cuda/*.cuh']
-                  for name in ['nvfp4', *KERNEL_PACKAGES]},
+                  for name in ['nvfp4', 'nvfp4.mxfp4']},
     include_package_data=False,
     ext_modules=ext_modules,
     cmdclass={'build_ext': cpp_extension.BuildExtension},

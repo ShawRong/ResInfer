@@ -1,10 +1,8 @@
 """C++ extension loader for the local NVFP4 kernels.
 
-The compiled extension backs the fold / quant / GEMM ops. It is NOT needed by
-``nvfp4.cute_attn`` (paged NVFP4 attention), which is pure CuTeDSL + torch, so
-importing this package must not hard-fail when the extension is absent: the
-module-level load is soft, and callers that actually need an op get a clear
-error from ``ensure_loaded()``.
+The compiled extension backs fold, quantization and GEMM ops, including the
+grouped residue-Q producer used by ResAttn. Import remains soft; the decode
+entry reports an actionable error when the required op is missing.
 """
 
 from __future__ import annotations
@@ -30,7 +28,7 @@ def _warn_if_stale(so_path: str) -> None:
         so_mtime = os.path.getmtime(so_path)
         newest, newest_f = 0.0, None
         native_dirs = ("bindings", "common/cuda", "common/fp4", "nvfp4/cuda",
-                       "mxfp4/cuda", "resattn/cuda")
+                       "mxfp4/cuda")
         for f in (p for directory in native_dirs
                   for p in (src / directory).rglob("*")):
             if f.suffix in (".cu", ".cuh", ".cpp", ".h") :
@@ -55,7 +53,7 @@ def _warn_if_stale(so_path: str) -> None:
 _MISSING_MSG = (
     "nvfp4 extension (nvfp4._C) not found or unloadable. Build it with "
     "`csrc/build.sh` if you need the fold / quant / GEMM ops. "
-    "nvfp4.cute_attn (paged NVFP4 attention) does not require it."
+    "ResAttn residue-Q decode requires this extension."
 )
 
 

@@ -108,8 +108,7 @@ def run(args: argparse.Namespace) -> dict:
     pool = NvFp4PagedKVPool(
         num_kv_heads=kv_heads, head_dim=dim, k_data=k_data, v_data=v_data,
         k_sf=k_sf, v_sf=v_sf,
-        v_staging=torch.empty(0, dtype=torch.bfloat16, device=device),
-        page_size=128, layout_profile="trtllm", k_global_scale=1.,
+        page_size=128, k_global_scale=1.,
         v_global_scale=1.)
     output_scale_inv = torch.ones(1, dtype=torch.float32, device=device)
     q_scale = torch.ones(1, dtype=torch.float32, device=device)
@@ -167,14 +166,14 @@ def run(args: argparse.Namespace) -> dict:
     def resattn() -> None:
         if nvfp4_output:
             host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
-                q, pool, v_data, v_sf, kv_indices, kv_indptr, seq_lens,
+                q, pool, v_data, v_sf, block_tables, seq_lens,
                 dim ** -.5, output_scale_inv, out=res_output[0],
                 output_block_scale=res_output[1], max_seq_len=args.seq,
                 k_sf_mode="linear", value_scale=1., reduction_workspace=work,
                 plan=plan, residue_fold=True)
         else:
             host.run_paged_fp4_decode_qmul4_tmem(
-                q, pool, v_data, v_sf, kv_indices, kv_indptr, seq_lens,
+                q, pool, v_data, v_sf, block_tables, seq_lens,
                 dim ** -.5, out=res_output, max_seq_len=args.seq,
                 k_sf_mode="linear", value_scale=1., reduction_workspace=work,
                 plan=plan, residue_fold=True, direct_output=True)

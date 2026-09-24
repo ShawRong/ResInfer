@@ -142,7 +142,7 @@ expected = [
     'scaled_fp4_quant_mext_r1',
     'scaled_fp4_quant',
     'mxfp4_residue_quant',
-    'nvfp4_quantize_q_residue',
+    'scaled_fp4_quant_mext_r1_grouped_q',
 ]
 missing = [op for op in expected if not hasattr(torch.ops.nvfp4, op)]
 if missing:

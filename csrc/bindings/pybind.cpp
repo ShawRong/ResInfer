@@ -30,19 +30,9 @@ void scaled_fp4_quant_mext_r1(torch::Tensor& output, torch::Tensor const& input,
                               int64_t layout_mode,
                               bool enable_pdl);
 
-void nvfp4_quantize_q(torch::Tensor const& q, torch::Tensor& q_pack,
-                      torch::Tensor& q_sf);
-void nvfp4_quantize_q_and_zero(torch::Tensor const& q,
-                               torch::Tensor& q_pack,
-                               torch::Tensor& q_sf,
-                               torch::Tensor& out);
-void nvfp4_quantize_q_residue(torch::Tensor const& q,
-                              torch::Tensor& q_pack,
-                              torch::Tensor& q_sf);
-void nvfp4_quantize_context_q(torch::Tensor const& q_source,
-                              torch::Tensor const& query_indptr,
-                              torch::Tensor& q_pack,
-                              torch::Tensor& q_sf);
+void scaled_fp4_quant_mext_r1_grouped_q(torch::Tensor const& q,
+                                         torch::Tensor& q_pack,
+                                         torch::Tensor& q_sf);
 
 void mxfp4_residue_quant(torch::Tensor x, torch::Tensor q, torch::Tensor sf,
                          c10::optional<torch::Tensor> masks, int64_t per8,
@@ -72,16 +62,8 @@ TORCH_LIBRARY(nvfp4, m) {
       "                         int elts_mode, int layout_mode, "
       "                         bool enable_pdl=True) -> ()");
   m.def(
-      "nvfp4_quantize_q(Tensor q, Tensor(a!) q_pack, Tensor(b!) q_sf) -> ()");
-  m.def(
-      "nvfp4_quantize_q_and_zero(Tensor q, Tensor(a!) q_pack, "
-      "Tensor(b!) q_sf, Tensor(c!) out) -> ()");
-  m.def(
-      "nvfp4_quantize_q_residue(Tensor q, Tensor(a!) q_pack, "
+      "scaled_fp4_quant_mext_r1_grouped_q(Tensor q, Tensor(a!) q_pack, "
       "Tensor(b!) q_sf) -> ()");
-  m.def(
-      "nvfp4_quantize_context_q(Tensor q_source, Tensor query_indptr, "
-      "Tensor(a!) q_pack, Tensor(b!) q_sf) -> ()");
   m.def(
       "mxfp4_residue_quant(Tensor x, Tensor(a!) q, Tensor(b!) sf, "
       "Tensor? masks, int per8, bool swizzle, "
@@ -91,10 +73,8 @@ TORCH_LIBRARY(nvfp4, m) {
 // Register CUDA implementation
 TORCH_LIBRARY_IMPL(nvfp4, CUDA, m) {
   m.impl("scaled_fp4_quant", &scaled_fp4_quant);
-  m.impl("nvfp4_quantize_q", &nvfp4_quantize_q);
-  m.impl("nvfp4_quantize_q_and_zero", &nvfp4_quantize_q_and_zero);
-  m.impl("nvfp4_quantize_q_residue", &nvfp4_quantize_q_residue);
-  m.impl("nvfp4_quantize_context_q", &nvfp4_quantize_context_q);
+  m.impl("scaled_fp4_quant_mext_r1_grouped_q",
+         &scaled_fp4_quant_mext_r1_grouped_q);
   m.impl("scaled_fp4_quant_pack8_r0125_no_swap",
          &scaled_fp4_quant_pack8_r0125_no_swap);
   m.impl("scaled_fp4_quant_pack8_r025_no_swap",
