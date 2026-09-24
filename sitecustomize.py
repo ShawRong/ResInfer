@@ -9,7 +9,7 @@ patch behavior is:
 - Applied in vLLM spawn worker processes (when PYTHONPATH includes repo root)
 
 Enable by setting:
-  RESIDUE_PATCH_VLLM=1
+  RESIDUE_NVFP4=1
 
 and (recommended) also setting:
   RESIDUE_VLLM_MODEL_DIR=/path/to/exported_model
@@ -21,8 +21,7 @@ import os
 
 
 def _maybe_patch_vllm() -> None:
-    enabled = os.environ.get("RESIDUE_PATCH_VLLM", "").strip().lower()
-    if enabled not in {"1", "true", "yes", "on"}:
+    if os.environ.get("RESIDUE_NVFP4") != "1":
         return
 
     # Pass model_dir if available; worker processes inherit this env var.
@@ -48,7 +47,7 @@ def _maybe_patch_vllm() -> None:
         # ignored by Python. SystemExit makes an explicit patch request fail
         # closed before the serving process can fall back to stock vLLM.
         raise SystemExit(
-            "RESIDUE_PATCH_VLLM=1 but the patch was not installed") from exc
+            "RESIDUE_NVFP4=1 but the patch was not installed") from exc
 
 
 _maybe_patch_vllm()

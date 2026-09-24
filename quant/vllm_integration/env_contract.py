@@ -14,14 +14,14 @@ _TRUTHY_LOOKING = {"true", "yes", "on", "y", "enable", "enabled"}
 
 # name -> (kind, allowed/None, one-line meaning)
 #   kind: "one"    parsed with == "1"; anything else means OFF
-#         "truthy" any non-empty value counts (plugin gate)
 #         "enum"   must be one of `allowed` (case-sensitive)
 #         "int"    must parse as int
 #         "path"   filesystem path
 #         "free"   uninterpreted string (csv lists, filenames)
 KNOWN: dict[str, tuple] = {
     # -- activation / core -------------------------------------------------
-    "RESIDUE_PATCH_VLLM": ("truthy", None, "plugin gate: install the patch"),
+    "RESIDUE_NVFP4": ("one", None, "install the NVFP4 LinearMethod patch"),
+    "RESIDUE_MXFP4": ("one", None, "register the ModelOpt MXFP4 adapter"),
     "RESIDUE_VLLM_MODEL_DIR": ("path", None,
                                "export dir; metadata source, REQUIRED for "
                                "residue exports"),

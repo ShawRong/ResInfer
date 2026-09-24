@@ -169,7 +169,7 @@ def provenance(gpu: int, neighbors: list) -> dict:
         md5 = h.hexdigest()
 
     import torch
-    tracked = ("RESIDUE_PATCH_VLLM", "RESIDUE_PATCH_MODE",
+    tracked = ("RESIDUE_NVFP4", "RESIDUE_PATCH_MODE",
                "RESIDUE_ENABLE_DECODE_MEXT", "RESIDUE_DECODE_MEXT_MAX_M",
                "RESIDUE_MEXT_PREFILL_PATH", "RESIDUE_SHARE_AUTOTUNE_CACHE",
                "RESIDUE_TENSOR_DUMP", "RESIDUE_ATTN",
@@ -535,7 +535,7 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
         [str(REPO), str(REPO / "csrc")]
         + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
     if quant == "residue_nvfp4":
-        env["RESIDUE_PATCH_VLLM"] = "1"
+        env["RESIDUE_NVFP4"] = "1"
         env["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
         env["RESIDUE_SHARE_AUTOTUNE_CACHE"] = "1"
         # RESIDUE_PATCH_MODE is left unset, and this changes NOTHING about
@@ -559,7 +559,7 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
         
         env["RESIDUE_VLLM_MODEL_DIR"] = model
     else:
-        for k in ("RESIDUE_PATCH_VLLM", "RESIDUE_PATCH_MODE",
+        for k in ("RESIDUE_NVFP4", "RESIDUE_PATCH_MODE",
                   "RESIDUE_ENABLE_DECODE_MEXT",
                   "RESIDUE_SHARE_AUTOTUNE_CACHE",
                   "RESIDUE_VLLM_MODEL_DIR"):

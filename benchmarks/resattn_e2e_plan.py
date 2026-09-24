@@ -62,8 +62,8 @@ def build_plan(model: str, config: dict, *, python: str, gpu: str,
         common_env.update(VLLM_HAS_FLASHINFER_CUBIN="1",
                           FLASHINFER_NO_DOWNLOAD="1",
                           FLASHINFER_CUBIN_DIR=offline_cubin_dir)
-    # Empty env values are not equivalent to absence: the linear plugin checks
-    # bool(env_value), so even RESIDUE_PATCH_VLLM='0' would enable that patch.
+    # Start both arms from a clean environment so inherited linear and
+    # attention settings cannot change this attention-only comparison.
     unset = sorted(k for k in os.environ if k.startswith(("RESIDUE_", "NVFP4_")))
     unset = sorted(set(unset + ["VLLM_PLUGINS", "VLLM_ATTENTION_BACKEND",
                                "VLLM_BATCH_INVARIANT"]))

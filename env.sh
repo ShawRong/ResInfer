@@ -19,7 +19,7 @@ ${LD_LIBRARY_PATH:-}"
 unset _VENV
 
 # Repo-local `sitecustomize.py` is used to auto-patch vLLM spawn workers when
-# `RESIDUE_PATCH_VLLM=1` is set. Ensure repo root is importable.
+# `RESIDUE_NVFP4=1` is set. Ensure repo root is importable.
 export PYTHONPATH="$PWD:${PYTHONPATH:-}"
 
 # Torch CUDA extensions are sensitive to conda build flags. If this shell was

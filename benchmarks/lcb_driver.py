@@ -395,7 +395,7 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path,
     env["VLLM_SCHED_MEFF_FLUSH_EVERY"] = str(a.meff_flush_every)
 
     if arm["kind"] == "residue":
-        env["RESIDUE_PATCH_VLLM"] = "1"
+        env["RESIDUE_NVFP4"] = "1"
         env["RESIDUE_VLLM_MODEL_DIR"] = arm["abs_path"]
         
         

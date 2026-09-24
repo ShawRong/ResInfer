@@ -239,7 +239,7 @@ def install_env(a):
     
     os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     if not a.plain:
-        os.environ["RESIDUE_PATCH_VLLM"] = "1"
+        os.environ["RESIDUE_NVFP4"] = "1"
         os.environ["RESIDUE_VLLM_MODEL_DIR"] = a.model
         
         
@@ -371,7 +371,7 @@ def install_env(a):
     # invisible after the fact -- the scores carry no trace of it.
     print("[kit] execution contract: " + " ".join(
         f"{k}={os.environ.get(k, '<unset>')}" for k in (
-            "VLLM_ENABLE_V1_MULTIPROCESSING", "RESIDUE_PATCH_VLLM",
+            "VLLM_ENABLE_V1_MULTIPROCESSING", "RESIDUE_NVFP4",
             "RESIDUE_ENABLE_DECODE_MEXT", "RESIDUE_PREFILL_RESIDUE_OFF",
             "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M",
             "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M",
@@ -640,7 +640,10 @@ def cmd_analyze(a) -> int:
         if rec is None:
             return None, "no provenance.json -- the cell cannot be determined"
         env = rec.get("env") or {}
-        if env.get("RESIDUE_PATCH_VLLM") != "1":
+        # Historical provenance uses the old gate name. Prefer the current
+        # name when present; this fallback only reads saved result records.
+        nvfp4 = env.get("RESIDUE_NVFP4", env.get("RESIDUE_PATCH_VLLM"))
+        if nvfp4 != "1":
             return "stock", "stock vLLM, residue patch never installed"
         if env.get("RESIDUE_PREFILL_RESIDUE_OFF") != "1":
             return "both", "residue active everywhere"

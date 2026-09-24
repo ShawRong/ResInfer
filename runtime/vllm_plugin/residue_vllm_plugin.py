@@ -1,38 +1,18 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""vLLM general-plugin shim that installs the Residue NVFP4 patch in EVERY
-vLLM process, including the V1 EngineCore worker subprocess.
+"""Initialize enabled ResInfer integrations through vLLM's general plugin hook.
 
-Why this exists
----------------
-vLLM V1 (>= the dev260 wheel we pin) runs EngineCore in a *spawned subprocess*
-by default (``VLLM_ENABLE_V1_MULTIPROCESSING=1``). That subprocess — not the
-main process — is what builds the model executor and loads weights
-(``vllm/v1/engine/core.py``: ``load_general_plugins()`` at ctor line 110, then
-``executor_class(vllm_config)`` at line 123). Patching ``ModelOptNvFp4Config``
-only in the main process therefore never reaches the worker, and weight loading
-falls back to stock ModelOpt → the qkv_proj shape assert.
+vLLM calls this entry point before model construction in its serving processes,
+including spawned workers. The worker must be able to import ``quant``.
 
-Older scripts (``vllm==0.15.0``) "worked" only because that version's offline
-``LLM()`` ran EngineCore in-process, so there was no subprocess to miss. It was
-never a real fix for worker propagation.
+Each gate is independent and enabled only by the literal string "1":
+    RESIDUE_NVFP4=1    install the NVFP4 LinearMethod patch
+    RESIDUE_MXFP4=1    register the ModelOpt MXFP4 LinearMethod adapter
+    RESIDUE_ATTN=1     register the ResAttn attention backend
 
-The canonical, version- and container-layout-independent mechanism is the
-``vllm.general_plugins`` entry-point group: vLLM loads it in *all* processes,
-before the model is built. That is strictly more robust than sitecustomize/.pth
-(which depend on the container's python site layout and did not run in Modal's
-spawned worker).
-
-Enable (opt-in, same env knobs the old scripts used):
-    RESIDUE_PATCH_VLLM=1          turn the plugin on
-    RESIDUE_PATCH_MODE=mext_r1    patch mode (patch.py reads this; default v2)
-    RESIDUE_VLLM_MODEL_DIR=...     model dir for residue metadata lookup
-
-``quant`` must be importable in the worker. Put the repo root on ``PYTHONPATH``
-(env is inherited by spawned subprocesses) so ``import quant`` works there.
-
-The function is idempotent — ``patch_vllm_modelopt`` guards re-entry, and vLLM
-may call plugins more than once per process.
+RESIDUE_PATCH_MODE selects the NVFP4 patch mode (default v2).
+RESIDUE_VLLM_MODEL_DIR supplies the checkpoint directory for residue metadata.
+Importing this module does not install integrations; vLLM calls ``apply()``.
 """
 from __future__ import annotations
 
@@ -41,16 +21,16 @@ import os
 
 def initialize() -> None:
     """Install enabled ResInfer integrations in the current vLLM process."""
-    patch_linear = bool(os.environ.get("RESIDUE_PATCH_VLLM"))
+    nvfp4 = os.environ.get("RESIDUE_NVFP4") == "1"
     resattn = os.environ.get("RESIDUE_ATTN") == "1"
     mxfp4 = os.environ.get("RESIDUE_MXFP4") == "1"
-    if not (patch_linear or resattn or mxfp4):
+    if not (nvfp4 or resattn or mxfp4):
         return
     pid = os.getpid()
     try:
         if mxfp4:
             from quant.vllm_integration import linear_method_mxfp4  # noqa: F401
-        if patch_linear:
+        if nvfp4:
             from quant.vllm_integration.patch import (is_patched,
                                                       patch_vllm_modelopt)
 
