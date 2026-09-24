@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# setup-export-venv.sh — Provision the FP4 export venv at env-export/.venv.
-#
-# Usage:
-#   source ./env.sh
-#   ./setup-export-venv.sh
-#
-# Most of the venv is built declaratively by `uv sync --project env-export`
-# from env-export/pyproject.toml — including nvidia-modelopt==0.45.0rc1 and
-# tensorrt-llm 1.1.0, which uses a [[tool.uv.dependency-metadata]] override to
-# strip its modelopt~=0.37 pin.
-#
-# This script then layers in nvfp4 (csrc), which needs install-time flags
-# uv cannot express in pyproject.toml:
-#   - --no-build-isolation (so the build sees torch)
-#   - non-editable (avoids sharing the built .so with the main .venv, which
-#     uses a different torch ABI)
-#   - quant/export-only by default (no local CUTLASS GEMM), because this venv
-#     is for ModelOpt calibration/export and TRT-LLM pins old FlashInfer headers.
-#
-# Idempotent: re-running upgrades/repairs the venv in place.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$REPO_ROOT/env-export"
+PROJECT_DIR="$REPO_ROOT/.dev/envs/export"
 VENV="$PROJECT_DIR/.venv"
 PY="$VENV/bin/python"
 
@@ -31,7 +31,7 @@ echo "[setup-export-venv] Project: $PROJECT_DIR"
 echo "[setup-export-venv] Target:  $VENV"
 
 # ── 1. Bulk install via uv sync (torch + modelopt + trtllm + HF stack) ──
-echo "[setup-export-venv] Step 1/2: uv sync --project env-export"
+echo "[setup-export-venv] Step 1/2: uv sync --project .dev/envs/export"
 uv sync --project "$PROJECT_DIR"
 
 # ── 2. nvfp4 local CUDA kernel (non-editable, isolated from main .venv) ──

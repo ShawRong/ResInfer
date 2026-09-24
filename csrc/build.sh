@@ -1,29 +1,29 @@
 #!/usr/bin/env bash
-# build.sh — Build nvfp4 _C.*.so against a target venv's torch.
-#
-# Direct setuptools build_ext --inplace; does NOT call uv (avoids implicit
-# `uv sync` that would re-evaluate the venv before we even start the build).
-# Idempotent: removes prior build artifacts then rebuilds the .so in place.
-#
-# Default target is the repository's main .venv when present, otherwise the
-# active virtualenv or python3. Override via env:
-#
-#   # build into env-export/.venv (different torch ABI)
-#   PY=$(realpath ../env-export/.venv/bin/python) ./build.sh
-#
-#   # multi-arch build (sm_100 + sm_120 + sm_90)
-#   NVFP4_TORCH_CUDA_ARCH_LIST="9.0;10.0;12.0" \
-#   NVFP4_CUDAARCHS="90-real;100-real;120-real" \
-#     ./build.sh
-#
-# Inputs (all optional):
-#   PY                          target venv python
-#   NVFP4_CUDA_HOME             CUDA toolkit root; otherwise infer from CUDA_HOME/nvcc
-#   NVFP4_TOOLCHAIN_PREFIX      conda/micromamba toolchain prefix
-#   NVFP4_CC                    C compiler; otherwise conda gcc or system gcc
-#   NVFP4_CXX                   C++ compiler; otherwise conda g++ or system g++
-#   NVFP4_TORCH_CUDA_ARCH_LIST  12.0
-#   NVFP4_CUDAARCHS             120-real
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 set -euo pipefail
 

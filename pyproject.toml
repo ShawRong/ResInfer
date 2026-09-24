@@ -1,13 +1,13 @@
-# To install:
-#   source ./env.sh
-#   uv sync                      # main runtime/eval venv (vLLM + lm-eval)
-#   ./setup-export-venv.sh       # standalone env-export/.venv for FP4 export
-#
-# Architecture: dual-venv setup
-#   - Main .venv: vLLM runtime/eval. It does not own ModelOpt
-#     calibration/export dependencies.
-#   - env-export/.venv: ModelOpt calibration/export env, versioned separately
-#     because TRT-LLM has its own torch ABI and ModelOpt dependency constraints.
+
+
+
+
+
+
+
+
+
+
 
 [build-system]
 requires = ["setuptools>=77", "wheel"]
@@ -32,8 +32,8 @@ dependencies = [
     "torchvision==0.26.0+cu130",
     "torchaudio==2.11.0",
 
-    # ── Runtime quantization support ─────────────────────────────────────
-    # Export/calibration ModelOpt is managed separately in env-export/.
+    
+    
     "torch-c-dlpack-ext>=0.1.5",
     "nvfp4",                              # local kernel wheel (csrc)
 

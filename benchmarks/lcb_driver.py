@@ -1,38 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""LCB / AIME driver -- the decode venues, on the shipped stack. SINGLE SERVER.
-
-One `vllm serve` process per arm, lighteval's litellm endpoint pointed at it.
-There is NO prefill/decode split, no NIXL, no proxy: the PD harness in the
-paper tree is a disaggregated-serving experiment and its topology is ruled
-out. This file quarries exactly three things from it -- the run-scoped
-lighteval cache_dir, replay detection from generation-throughput lines, and
-the runtime_env snapshot -- as code, not as architecture. The skeleton
-(server launch, lighteval config, teardown, M_eff probe) comes from the
-paper tree's single-server harness `run_lighteval_with_meff.py`.
-
-Four deliberate departures from the PD harness:
-
-  1. A cache REPLAY is a FAILURE, not a warning. Zero "Avg generation
-     throughput" lines in the server log means lighteval replayed an older
-     run's generations; the case exits non-zero with status "fail_replay".
-  2. The lighteval cache is RUN-SCOPED BY DEFAULT (per case, under --out).
-     --global-cache opts out, loudly.
-  3. VLLM_NVFP4_GEMM_BACKEND is never set -- forcing it distorts baselines
-     and vLLM>=0.26 ignores it anyway. Inherited values are dropped.
-  4. A residue arm is gated on the RESOLVED MODE in the server log before
-     the first prompt is sent. A residue export served without mext falls
-     back to the plain floor with serving looking completely normal -- the
-     most expensive silent failure this driver can have.
-
-Two venvs, never mixed: the server runs from the repo's main .venv; the
-scorer runs from envs/lighteval/.venv (their dependency pins conflict).
-
-    .venv/bin/python benchmarks/lcb_driver.py \
-        --manifest benchmarks/suites/lcb_4b.yaml \
-        --models-root <dir holding the exports> \
-        --out runs/lcb_4b_$(date +%Y%m%d_%H%M%S) --gpu 0
-"""
+'LCB / AIME driver -- the decode venues, on the shipped stack. SINGLE SERVER.'
 from __future__ import annotations
 
 import argparse
@@ -50,8 +18,8 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 VLLM_BIN = REPO / ".venv" / "bin" / "vllm"
 SERVING_PYTHON = REPO / ".venv" / "bin" / "python"
 # The isolated scorer env (a declarative uv sub-project, benchmarks/README.md).
-LIGHTEVAL_CLI = REPO / "envs" / "lighteval" / ".venv" / "bin" / "lighteval"
-LIGHTEVAL_PYTHON = REPO / "envs" / "lighteval" / ".venv" / "bin" / "python"
+LIGHTEVAL_CLI = REPO / ".dev" / "envs" / "lighteval" / ".venv" / "bin" / "lighteval"
+LIGHTEVAL_PYTHON = REPO / ".dev" / "envs" / "lighteval" / ".venv" / "bin" / "python"
 
 _PIDS: list[int] = []
 
@@ -647,7 +615,7 @@ def run_lighteval(arm: dict, man: dict, a, cfg_path: pathlib.Path,
     if not LIGHTEVAL_CLI.exists():
         raise SystemExit(
             f"lighteval CLI not found: {LIGHTEVAL_CLI} -- the scorer runs "
-            f"from the ISOLATED env. Bootstrap envs/lighteval/ (uv sync) "
+            f"from the ISOLATED env. Bootstrap .dev/envs/lighteval/ (uv sync) "
             f"before running this driver.")
     raw = case_out / "lighteval_raw"
     raw.mkdir(parents=True, exist_ok=True)
@@ -678,7 +646,7 @@ def run_lighteval(arm: dict, man: dict, a, cfg_path: pathlib.Path,
     if a.data_root:
         env["RESINFER_EVAL_DATA_ROOT"] = str(
             pathlib.Path(a.data_root).expanduser().resolve())
-    compat = REPO / "envs" / "lighteval" / "compat"
+    compat = REPO / ".dev" / "envs" / "lighteval" / "compat"
     env["PYTHONPATH"] = os.pathsep.join(
         [str(compat), str(REPO)]
         + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
@@ -709,7 +677,7 @@ def preflight_lighteval(env: dict, case_out: pathlib.Path) -> None:
     if not env.get("NLTK_DATA"):
         raise RuntimeError(
             "NLTK_DATA is required for offline lighteval; run "
-            "envs/lighteval/bootstrap_offline.py and pass --nltk-data")
+            ".dev/envs/lighteval/bootstrap_offline.py and pass --nltk-data")
     script = r'''import importlib.util, pathlib
 import nltk, xxhash
 spec = importlib.util.find_spec("lighteval")

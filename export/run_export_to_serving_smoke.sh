@@ -49,7 +49,7 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RUNTIME_PY="${RUNTIME_PY:-$REPO_ROOT/.venv/bin/python}"
-EXPORT_PY="${EXPORT_PY:-$REPO_ROOT/env-export/.venv/bin/python}"
+EXPORT_PY="${EXPORT_PY:-$REPO_ROOT/.dev/envs/export/.venv/bin/python}"
 MODEL_PATH="${RESINFER_SMOKE_MODEL_PATH:-Qwen/Qwen3-0.6B}"
 OUTPUT_DIR="${OUTPUT_DIR:-/tmp/resinfer_release_smoke_$(date +%Y%m%d_%H%M%S)}"
 HOST="${RESINFER_SMOKE_HOST:-127.0.0.1}"

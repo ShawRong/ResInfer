@@ -1446,7 +1446,7 @@ def _argv_external(name):
         raise NotImplementedError(
             f"venue '{name}' is not scored by this kit -- it needs lighteval, "
             f"which cannot co-install with vLLM and lives in "
-            f"envs/lighteval/. USE THE DRIVER THAT DOES:\n"
+            f".dev/envs/lighteval/. USE THE DRIVER THAT DOES:\n"
             f"    python -m benchmarks.lcb_driver --manifest <this manifest> "
             f"--models-root <dir> --arms <a,b> --out <dir>\n"
             f"It launches one server per arm through the production "
