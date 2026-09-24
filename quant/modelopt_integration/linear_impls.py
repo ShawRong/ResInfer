@@ -9,17 +9,33 @@ Architecture:
 - ResidueLinear/ResidueSwapLinear: legacy RealQuantLinear wrapper path
 - NVFP4Linear: Use RealQuantLinear + standard Nvfp4Linear (from ModelOpt)
 
-Note: old backend_infer/backend GEMM functions are archived; official eval uses vLLM.
-      RealQuantLinear is the actual module that uses these functions.
+Each wrapper delegates forward to the supplied RealQuantLinear. It does not
+install a GEMM backend. Existing registry keys and module paths are retained.
 """
 import os
-import torch
 import torch.nn as nn
 
 from quant.linear_registry import LinearRegistry
 
 # Import ModelOpt's RealQuantLinear (post-compress module)
 from modelopt.torch.quantization.nn.modules.quant_linear import RealQuantLinear
+
+
+def _wrap_compressed(cls, linear, *, compressed_hint=False):
+    """Share wrapping without changing class paths or the `linear.*` state keys."""
+    if not isinstance(linear, RealQuantLinear):
+        detail = " (compressed model)" if compressed_hint else ""
+        raise TypeError(
+            f"{cls.__name__} can only wrap RealQuantLinear{detail}, "
+            f"got {type(linear).__name__}"
+        )
+    instance = object.__new__(cls)
+    nn.Module.__init__(instance)
+    instance.in_features = linear.in_features
+    instance.out_features = linear.out_features
+    instance.has_bias = linear.bias is not None
+    instance.linear = linear
+    return instance
 
 
 @LinearRegistry.register("ResidueLinear")
@@ -55,26 +71,12 @@ class ResidueLinear(nn.Module):
         Returns:
             ResidueLinear instance wrapping RealQuantLinear
         """
-        # Ensure swap mode disabled
+        # Preserve the legacy construction-time environment scope.
         old_swap = os.environ.get("RESIDUE_SWAP")
         os.environ["RESIDUE_SWAP"] = "0"
 
         try:
-            # If already RealQuantLinear (from compress), wrap it
-            if isinstance(linear, RealQuantLinear):
-                instance = object.__new__(cls)
-                super(ResidueLinear, instance).__init__()
-                instance.in_features = linear.in_features
-                instance.out_features = linear.out_features
-                instance.has_bias = linear.bias is not None
-                instance.linear = linear
-                return instance
-
-            # Otherwise, unsupported (need compressed model)
-            raise TypeError(
-                f"ResidueLinear can only wrap RealQuantLinear (compressed model), "
-                f"got {type(linear).__name__}"
-            )
+            return _wrap_compressed(cls, linear, compressed_hint=True)
 
         finally:
             if old_swap is None:
@@ -91,7 +93,8 @@ class ResidueSwapLinear(nn.Module):
     """
     Residue quantization with swap mode.
 
-    Swap mode: Q(x_salient) → x_salient (FP16) for higher accuracy.
+    The wrapped RealQuantLinear owns forward behavior; the legacy class name
+    alone does not establish which residue mode it executes.
     """
 
     def __init__(self, in_features: int, out_features: int, bias: bool = True, **kwargs):
@@ -104,23 +107,12 @@ class ResidueSwapLinear(nn.Module):
     @classmethod
     def from_linear(cls, linear: nn.Module, r: float = 0.125, fmt: str = "nvfp4", **kwargs):
         """Create ResidueSwapLinear from RealQuantLinear."""
-        # Ensure swap mode enabled
+        # Preserve the legacy construction-time environment scope.
         old_swap = os.environ.get("RESIDUE_SWAP")
         os.environ["RESIDUE_SWAP"] = "1"
 
         try:
-            if isinstance(linear, RealQuantLinear):
-                instance = object.__new__(cls)
-                super(ResidueSwapLinear, instance).__init__()
-                instance.in_features = linear.in_features
-                instance.out_features = linear.out_features
-                instance.has_bias = linear.bias is not None
-                instance.linear = linear
-                return instance
-
-            raise TypeError(
-                f"ResidueSwapLinear can only wrap RealQuantLinear, got {type(linear).__name__}"
-            )
+            return _wrap_compressed(cls, linear)
 
         finally:
             if old_swap is None:
@@ -151,19 +143,9 @@ class NVFP4Linear(nn.Module):
     @classmethod
     def from_linear(cls, linear: nn.Module, fmt: str = "nvfp4", **kwargs):
         """Create NVFP4Linear from RealQuantLinear."""
-        if isinstance(linear, RealQuantLinear):
-            instance = object.__new__(cls)
-            super(NVFP4Linear, instance).__init__()
-            instance.in_features = linear.in_features
-            instance.out_features = linear.out_features
-            instance.has_bias = linear.bias is not None
-            instance.fmt = fmt
-            instance.linear = linear
-            return instance
-
-        raise TypeError(
-            f"NVFP4Linear can only wrap RealQuantLinear, got {type(linear).__name__}"
-        )
+        instance = _wrap_compressed(cls, linear)
+        instance.fmt = fmt
+        return instance
 
     def forward(self, x):
         return self.linear(x)
