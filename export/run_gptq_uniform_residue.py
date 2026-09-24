@@ -79,7 +79,7 @@ def seed_everything(seed: int) -> None:
 
 
 def load_stage_api():
-    from export.stage_adapters import (
+    from export.stages import (
         DumpCleanHFStage,
         ExportHFStage,
         InspectQuantExportStage,

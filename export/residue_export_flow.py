@@ -240,7 +240,7 @@ def main() -> int:
 
     import torch
 
-    from export.stage_adapters import (
+    from export.stages import (
         CheckQuantizerStateStage,
         DumpCleanHFStage,
         ExportHFStage,

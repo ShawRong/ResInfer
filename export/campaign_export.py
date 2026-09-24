@@ -308,17 +308,17 @@ def preflight(spec_name: str) -> int:
 
     print("=== stages ===")
     try:
-        from export.stage_adapters import (  # noqa: F401
+        from export.stages import (  # noqa: F401
             CheckQuantizerStateStage, ExportHFStage, InjectResidueMetadataStage,
             InspectQuantExportStage, LoadHFStage, ModelOptCalibrateStage,
             SnapshotQuantizerStateStage, StageContext,
         )
-        check("export.stage_adapters (8 stages)", True)
+        check("export.stages (8 stages)", True)
         check("InspectQuantExportStage._assert_extended_widths",
               hasattr(InspectQuantExportStage, "_assert_extended_widths"),
               "the widening gate -- without it a bad export dies at serving time")
     except Exception as exc:  # noqa: BLE001
-        check("export.stage_adapters", False, f"{type(exc).__name__}: {exc}")
+        check("export.stages", False, f"{type(exc).__name__}: {exc}")
 
     print("=== spec ===")
     arms = SPECS.get(spec_name)
@@ -401,7 +401,7 @@ def find_quantizer_state(artifact_root: Path) -> Path:
 
 # ── one arm ───────────────────────────────────────────────────────────────
 def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
-    from export.stage_adapters import (
+    from export.stages import (
         CheckQuantizerStateStage, ExportHFStage, InjectResidueMetadataStage,
         InspectQuantExportStage, LoadHFStage, ModelOptCalibrateStage,
         SnapshotQuantizerStateStage, StageContext,
@@ -545,7 +545,7 @@ def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
 
 # ── verification of a finished directory, no GPU ──────────────────────────
 def verify(out_root: Path) -> int:
-    from export.stage_adapters import InspectQuantExportStage, StageContext
+    from export.stages import InspectQuantExportStage, StageContext
 
     out_root = out_root.resolve()  # see cmd_run: relative paths get doubled
     arms = sorted(p for p in out_root.iterdir()
