@@ -75,6 +75,9 @@ KNOWN: dict[str, tuple] = {
                                  "SM100 MXFP4 group-32 Fold FlashInfer tactic "
                                  "tuner (experimental; default off pending "
                                  "GPU validation)"),
+    "RESIDUE_MXFP4_TP_EXPERIMENTAL": ("enum", {"0", "1"},
+                                     "enable experimental SM100 packed MXFP4 "
+                                     "tensor-parallel loading (default off)"),
     "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
                                    "kill the sm10x fold (mext_r1 layers then "
                                    "refuse to serve, by design)"),

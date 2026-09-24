@@ -2,6 +2,8 @@
 """Native ModelOpt MXFP4 loading and ResInfer Linear execution on SM100."""
 from __future__ import annotations
 
+import os
+
 import torch
 from torch.nn import Parameter
 
@@ -145,22 +147,59 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
         **extra_weight_attrs,
     ):
         from quant.kernel_metadata import padded_k, residue_spec
+        from .residue_tp import current_tp_rank, plan_from_partition
 
         n = sum(output_partition_sizes)
         k = input_size_per_partition
-        if input_size != k or output_size != n:
-            raise ValueError("MXFP4 linear currently supports unsharded/TP1 weights only")
         if params_dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("MXFP4 output dtype must be fp16 or bf16")
         if k <= 0 or k % 128 or n <= 0 or n % 32:
-            raise ValueError("MXFP4 linear requires positive K%128==0 and N%32==0")
-        self.spec = residue_spec(self.metadata, k, n)
+            raise ValueError("MXFP4 rank-local linear requires positive K%128==0 and N%32==0")
+        # Sidecar indices and extended dimensions describe the full checkpoint,
+        # while vLLM allocates parameters for this rank's partition.
+        self.spec = residue_spec(self.metadata, input_size, output_size)
         self.mode = self.spec["mode"]
         self.indices = tuple(self.spec.get("indices", ()))
-        kp = padded_k(k, len(self.indices))
-        if self.extended_dim is not None and self.extended_dim != kp:
+        checkpoint_k = padded_k(input_size, len(self.indices))
+        if self.extended_dim is not None and self.extended_dim != checkpoint_k:
             raise ValueError("metadata extended dimension does not match MXFP4 weights")
+        row_parallel = k != input_size
+        column_parallel = n != output_size
+        if (row_parallel or column_parallel) and os.environ.get(
+            "RESIDUE_MXFP4_TP_EXPERIMENTAL", "0"
+        ) != "1":
+            raise ValueError(
+                "MXFP4 TP loading is experimental; set "
+                "RESIDUE_MXFP4_TP_EXPERIMENTAL=1 to opt in"
+            )
+        if row_parallel and column_parallel:
+            raise ValueError("MXFP4 cannot shard both input and output axes in one linear")
+        if row_parallel and (k > input_size or input_size % k or output_size != n):
+            raise ValueError("MXFP4 row-parallel partition does not match global shape")
+        if column_parallel and (input_size != k or n > output_size):
+            raise ValueError("MXFP4 column-parallel partition does not match global shape")
+
+        shard_plan = None
+        if row_parallel and self.mode == "selective":
+            shard_plan = plan_from_partition(
+                extended_dim=input_size + len(self.indices),
+                input_size_per_partition=k,
+                input_size=input_size,
+                num_salient=len(self.indices),
+                tp_rank=current_tp_rank(),
+                scale_vec_size=32,
+                scale_swizzle_blocks=1,  # checkpoint scales are still linear
+                k_alignment=128,
+            )
+
+        # vLLM's row-parallel loader slices the parameter's physical width.
+        # For packed FP4 that width is K/2 bytes; for raw E8M0 scales it is
+        # K/32 blocks. K_local%128 keeps both slices on the GEMM scale grid.
+        # The output-parallel loaders slice rows, including fused QKV shards.
+        # Swizzle scales only after loading this rank's raw linear slice.
+        kp = padded_k(k, shard_plan.salient_shard if shard_plan else len(self.indices))
         loader = extra_weight_attrs.pop("weight_loader")
+        layer._mxfp4_shard_plan = shard_plan
         layer._mxfp4_loaded = {"weight": set(), "weight_scale": set()}
         layer._mxfp4_shards = len(output_partition_sizes)
 
@@ -168,6 +207,13 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             def load(param, tensor, *args, **kwargs):
                 if tensor.dtype != torch.uint8:
                     raise ValueError(f"packed MXFP4 {name} must be uint8")
+                if shard_plan is not None:
+                    from .residue_tp import interleave_extended_for_tp
+
+                    tensor = interleave_extended_for_tp(
+                        tensor, shard_plan,
+                        scale=2 if name == "weight" else 32,
+                    )
                 loader(param, tensor, *args, **kwargs)
                 shard = args[0] if args else kwargs.get("loaded_shard_id")
                 if isinstance(shard, (tuple, list)):
@@ -208,8 +254,15 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             indices = torch.empty(0, dtype=torch.int32, device=weight.device)
             masks = torch.empty(0, dtype=torch.uint8, device=weight.device)
             if self.mode == "selective":
+                selected = self.indices
+                plan = layer._mxfp4_shard_plan
+                if plan is not None:
+                    selected = plan.local_salient_indices(
+                        torch.tensor(self.indices, dtype=torch.int32,
+                                     device=weight.device)
+                    )
                 indices, masks = prepare_indices(
-                    self.indices,
+                    selected,
                     layer._mxfp4_input_size,
                     weight.device,
                 )
