@@ -252,29 +252,16 @@ def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
 # GEMM' -- deleted 2a3e507; sm120 is CuTeDSL too now.) It consumes the row_pair mext_r1
 # quant layout directly (no m_pad, no tile8) and, for pure mext_r1 layers,
 # reads the full contiguous packed weight (k_base == full K, no prefix slice).
-# Cached: capability probe runs once.
-_SM10X_FOLD_ARCH: str | None = None
-_SM10X_FOLD_PROBED = False
-
-
 def _sm10x_fold_arch() -> str | None:
-    """Return 'sm100'/'sm103' if this GPU should use the CuTeDSL fold, else
-    None (SM120 / other → legacy path). Probed once."""
-    global _SM10X_FOLD_ARCH, _SM10X_FOLD_PROBED
-    if _SM10X_FOLD_PROBED:
-        return _SM10X_FOLD_ARCH
-    _SM10X_FOLD_PROBED = True
+    """Return the SM10x kernel arch; a disabled Fold is an explicit opt-out."""
     if os.environ.get("RESIDUE_DISABLE_SM10X_FOLD", "0") == "1":
-        _SM10X_FOLD_ARCH = None
         return None
-    try:
-        major, minor = torch.cuda.get_device_capability()
-        from nvfp4.cute_fold.tactics import kernel_arch_for_capability
+    major, minor = torch.cuda.get_device_capability()
+    if major != 10:
+        return None
+    from nvfp4.cute_fold.tactics import kernel_arch_for_capability
 
-        _SM10X_FOLD_ARCH = kernel_arch_for_capability(int(major), int(minor))
-    except Exception:
-        _SM10X_FOLD_ARCH = None
-    return _SM10X_FOLD_ARCH
+    return kernel_arch_for_capability(int(major), int(minor))
 
 
 
@@ -283,29 +270,6 @@ def _sm10x_fold_arch() -> str | None:
 
 
 
-_SM120_FOLD_OK: bool | None = None
-
-
-def _sm120_fold_available() -> bool:
-    """True iff this GPU is GeForce Blackwell and the CuTeDSL fold imports.
-
-    This used to be `_sm120_fold_available()`, gated on
-    RESIDUE_SM120_CUTEDSL_FOLD. The flag existed to fall back to the C++ CUTLASS
-    fold; that kernel is gone, so there is nothing to fall back TO and a flag
-    that only turns the fold off would just break the layer. What remains is a
-    capability probe. Probed once; any failure -> legacy K-extension path.
-    """
-    global _SM120_FOLD_OK
-    if _SM120_FOLD_OK is not None:
-        return _SM120_FOLD_OK
-    try:
-        major, minor = torch.cuda.get_device_capability()
-        from nvfp4.cute_fold_sm120 import supports_capability
-
-        _SM120_FOLD_OK = bool(supports_capability(int(major), int(minor)))
-    except Exception:
-        _SM120_FOLD_OK = False
-    return _SM120_FOLD_OK
 
 
 # (n_w, k_base, k_ext_in_fp4_elements, is_mext_r1)
@@ -369,7 +333,7 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         except Exception as e:                            # noqa: BLE001
             print(f"[residue] sm10x fold-tuner precompile skipped: "
                   f"{type(e).__name__}: {str(e)[:70]}", flush=True)
-    if not _sm120_fold_available():
+    if torch.cuda.get_device_capability()[0] != 12:
         return
     try:
         from nvfp4.cute_fold_sm120 import warmup_fold_default
@@ -432,15 +396,12 @@ def warmup_sm120_cutedsl_fold(m_tokens, out_dtype=torch.bfloat16) -> int:
 
     Call at engine init, OUTSIDE cudagraph capture. Returns the number of
     (shape, m) pairs compiled; 0 when the path is off or nothing registered.
-    Best-effort: a compile failure must not take the engine down, since the
-    layer can still fall back to the legacy path.
+    Warmup is best-effort; a required kernel failure surfaces when used.
     """
     # Say WHY nothing happened. A silent `return 0` here is how a broken
     # warmup hides: the engine still starts, the fold still works, and the only
     # symptom is cudagraph capture quietly taking 97s instead of 5s.
-    if not _sm120_fold_available():
-        print("[residue] sm120 fold warmup: CuTeDSL path disabled, nothing to "
-              "pre-compile", flush=True)
+    if torch.cuda.get_device_capability()[0] != 12:
         return 0
     if not _SM120_FOLD_SHAPES:
         print("[residue] sm120 fold warmup: NO shapes registered -- kernels "
@@ -631,9 +592,11 @@ def _nvfp4_linear_impl(
     
     
     
-    
-    fold_max_m = fold_max_m_for(_sm10x_fold_arch())
-    mext_fold_max_m = mext_fold_max_m_for(_sm10x_fold_arch())
+    sm10x_arch = _sm10x_fold_arch()
+    fold_arch = sm10x_arch or (
+        "sm120" if torch.cuda.get_device_capability()[0] == 12 else None)
+    fold_max_m = fold_max_m_for(sm10x_arch)
+    mext_fold_max_m = mext_fold_max_m_for(sm10x_arch)
     
     
     
@@ -655,7 +618,7 @@ def _nvfp4_linear_impl(
     
     
     _prefill_off = prefill_residue_disabled(original_m, fold_max_m)
-    use_fold = (not _prefill_off) and fold_eligible and (
+    use_fold = (not _prefill_off) and fold_eligible and fold_arch is not None and (
         is_mext_r1 or _FORCE_FOLD or original_m <= fold_max_m)
 
     if use_fold:
@@ -669,7 +632,7 @@ def _nvfp4_linear_impl(
                 if ready:
                     return _run_kloop(args, ready[0])
             return _run_ratio1_prefill_two_gemm(*args, output_dtype)
-        if _sm10x_fold_arch() is not None:
+        if sm10x_arch is not None:
             from ..flashinfer_integration.sm10x_fold_tuner import _run_fallback
             return _run_fallback(args, output_dtype)[:original_m]
         from ..flashinfer_integration.sm120_fold_tuner import run_fold_table
@@ -708,7 +671,7 @@ def _nvfp4_linear_impl(
             "mext_r1 layer reached the non-fold path (fold_eligible="
             f"{bool(fold_eligible)}, M={int(x.shape[0])}). The residue cannot "
             "be applied without the fold kernel and there is no K-extended "
-            "weight to fall back to. Check the fold arch probe / "
+            "weight to fall back to. Check the GPU architecture and "
             "RESIDUE_DISABLE_SM10X_FOLD rather than letting this serve plain "
             "NVFP4."
         )
@@ -797,12 +760,14 @@ def nvfp4_linear(
         return x.new_empty((0, weight.shape[0]))
     from ..flashinfer_integration.nvfp4_linear_tuner import tuned_nvfp4_linear
 
-    arch = _sm10x_fold_arch() or "sm120"
+    sm10x_arch = _sm10x_fold_arch()
+    arch = sm10x_arch or (
+        "sm120" if torch.cuda.get_device_capability()[0] == 12 else None)
     policy = (
         int(k_base), int(num_salient), int(weights_padding_cols),
         int(output_size), bool(fold_eligible), bool(use_swap), bool(is_mext_r1),
-        arch, fold_max_m_for(_sm10x_fold_arch()),
-        mext_fold_max_m_for(_sm10x_fold_arch()), bool(_FORCE_FOLD),
+        arch, fold_max_m_for(sm10x_arch),
+        mext_fold_max_m_for(sm10x_arch), bool(_FORCE_FOLD),
         bool(_PREFILL_RESIDUE_OFF),
         int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
         int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,

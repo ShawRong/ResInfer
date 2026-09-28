@@ -32,7 +32,8 @@ def _route(m, policy):
      arch, fold_max, mext_max, force_fold, _enabled, _min, _max,
      _prefill, _sm10_tuner, _sm120_tuner) = policy[:17]
     off = _residue_off(int(m), policy)
-    fold = not off and eligible and (is_mext or force_fold or m <= fold_max)
+    fold = not off and eligible and arch is not None and (
+        is_mext or force_fold or m <= fold_max)
     if fold:
         if is_mext and m > mext_max:
             return "ratio1_prefill"
