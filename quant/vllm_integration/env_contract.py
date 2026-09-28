@@ -92,6 +92,12 @@ KNOWN: dict[str, tuple] = {
                                      "share the FlashInfer autotune cache "
                                      "across models"),
     # -- attention (experimental) -------------------------------------------
+    "RESIDUE_ATTN_TUNER": (
+        "enum", {"0", "1"},
+        "opt in to FlashInfer split/reduction selection; default 0 pending "
+        "the tuner GPU gate. Requires valid decode warmup inputs before "
+        "graph capture; uncached configurations retain the default policy",
+    ),
     "RESIDUE_ATTN": (
         "one", None,
         "register phase-separated ResAttn: pure decode uses ResAttn; "

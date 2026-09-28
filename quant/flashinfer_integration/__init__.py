@@ -8,6 +8,7 @@ Imports stay lazy so importing this package does not load GPU dependencies.
 from importlib import import_module
 
 _ENTRIES = {
+    "tuned_resattn_decode": "resattn_tuner",
     "tuned_linear": "linear_tuner",
     "tuned_nvfp4_linear": "nvfp4_linear_tuner",
     "tuned_mxfp4_fold": "mxfp4_fold_tuner",
