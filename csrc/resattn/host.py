@@ -708,25 +708,12 @@ def run_paged_fp4_decode_qmul4_tmem(
         raise NotImplementedError(f"direct BF16 output: unsupported {reduction=}")
     if k_sf_mode not in ("atom", "linear"):
         raise ValueError(f"unsupported K-scale mode: {k_sf_mode}")
-    single_softmax_wg = _use_single_softmax_scheduler(
-        g_pad, reduction, "qmul4_tmem", splits
-    )
-    f = _compiled(
-        H * g_pad,
-        H,
-        D,
-        1,
-        reduction,
-        "qmul4_tmem",
-        k_sf_mode,
-        single_softmax_wg=single_softmax_wg,
-        partial_o_dtype=_reduction_workspace_partial_o_dtype(
-            reduction_workspace
-        ),
-        smem_correction_broadcast=single_softmax_wg,
-        residue_fold=residue_fold,
-        output_num_qo_heads=HQ if direct_output else None,
-    )
+    f = compile_decode_variant(decode_compile_spec(
+        HQ, H, D, (splits, reduction),
+        output_nvfp4=False, residue_fold=residue_fold,
+        k_sf_mode=k_sf_mode, direct_output=direct_output,
+        partial_o_dtype=_reduction_workspace_partial_o_dtype(reduction_workspace),
+    ))
     if residue_fold:
         fused = _quantize_q_residue_cuda(q_eff, H)
         if fused is None:
@@ -807,6 +794,32 @@ def run_paged_fp4_decode_qmul4_tmem(
     return out
 
 
+def decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan, *,
+                        output_nvfp4=False, residue_fold=False,
+                        k_sf_mode="linear", direct_output=None,
+                        partial_o_dtype=None):
+    """The single compilation contract for launches and all warmup callers.
+
+    Batch, sequence length and split count are runtime arguments. Only the
+    reducer and the scheduler selected from the split count specialize code.
+    """
+    if direct_output is None:
+        direct_output = residue_fold
+    splits, reduction = plan
+    tile = (_residue_padded_group_size(num_qo_heads, num_kv_heads) if residue_fold
+            else _padded_group_size(num_qo_heads, num_kv_heads))
+    ssw = _use_single_softmax_scheduler(tile, reduction, "qmul4_tmem", splits)
+    return dict(
+        args=(num_kv_heads * tile, num_kv_heads, head_dim, 1, reduction,
+              "qmul4_tmem", k_sf_mode, output_nvfp4,
+              num_qo_heads if output_nvfp4 or direct_output else None),
+        kwargs=dict(single_softmax_wg=ssw, smem_correction_broadcast=ssw,
+                    residue_fold=residue_fold,
+                    partial_o_dtype=partial_o_dtype or (
+                        "bf16" if reduction == "gmem_fused" else "fp32")),
+    )
+
+
 def plan_decode_compile_variants(
     num_qo_heads: int,
     num_kv_heads: int,
@@ -848,11 +861,6 @@ def plan_decode_compile_variants(
             "decode QK residue warmup requires logical GQA ratio in "
             f"{RESIDUE_GQA_GROUPS}"
         )
-    g_pad = (
-        _residue_padded_group_size(num_qo_heads, num_kv_heads)
-        if residue_fold
-        else _padded_group_size(num_qo_heads, num_kv_heads)
-    )
     seqs = sorted(
         {min(s, max_model_len)
          for s in (256, 4096, QMUL4_KERNEL_REDUCTION_MIN_SEQ, 65536)}
@@ -867,17 +875,12 @@ def plan_decode_compile_variants(
             splits, reduction = plan_qmul4_decode(
                 batch, num_kv_heads, seq, device
             )
-            ssw = _use_single_softmax_scheduler(
-                g_pad, reduction, "qmul4_tmem", splits
+            spec = decode_compile_spec(
+                num_qo_heads, num_kv_heads, head_dim, (splits, reduction),
+                output_nvfp4=False, residue_fold=residue_fold,
             )
-            args = (num_kv_heads * g_pad, num_kv_heads, head_dim, 1,
-                    reduction, "qmul4_tmem", "linear")
-            kwargs = dict(
-                single_softmax_wg=ssw,
-                partial_o_dtype=_reduction_workspace_partial_o_dtype(None),
-                smem_correction_broadcast=ssw,
-                residue_fold=residue_fold,
-            )
+            args, kwargs = spec["args"], spec["kwargs"]
+            ssw = kwargs["single_softmax_wg"]
             key = args + tuple(sorted(kwargs.items()))
             if key in seen:
                 continue
@@ -910,11 +913,6 @@ def plan_decode_nvfp4_compile_variants(
             "decode QK residue warmup requires logical GQA ratio in "
             f"{RESIDUE_GQA_GROUPS}"
         )
-    g_pad = (
-        _residue_padded_group_size(num_qo_heads, num_kv_heads)
-        if residue_fold
-        else _padded_group_size(num_qo_heads, num_kv_heads)
-    )
     seqs = sorted(
         {
             min(s, max_model_len)
@@ -939,28 +937,12 @@ def plan_decode_nvfp4_compile_variants(
             )
             if reduction not in ("none", "kernel", "gmem_fused"):
                 continue
-            ssw = _use_single_softmax_scheduler(
-                g_pad, reduction, "qmul4_tmem", splits
+            spec = decode_compile_spec(
+                num_qo_heads, num_kv_heads, head_dim, (splits, reduction),
+                output_nvfp4=True, residue_fold=residue_fold,
             )
-            args = (
-                num_kv_heads * g_pad,
-                num_kv_heads,
-                head_dim,
-                1,
-                reduction,
-                "qmul4_tmem",
-                "linear",
-                True,
-                num_qo_heads,
-            )
-            kwargs = dict(
-                single_softmax_wg=ssw,
-                partial_o_dtype=(
-                    "bf16" if reduction == "gmem_fused" else "fp32"
-                ),
-                smem_correction_broadcast=ssw,
-                residue_fold=residue_fold,
-            )
+            args, kwargs = spec["args"], spec["kwargs"]
+            ssw = kwargs["single_softmax_wg"]
             key = args + tuple(sorted(kwargs.items()))
             if key in seen:
                 continue
@@ -978,9 +960,9 @@ def plan_decode_nvfp4_compile_variants(
     return plans
 
 
-def compile_decode_variant(plan: dict) -> None:
+def compile_decode_variant(plan: dict):
     """Compile one plan from `plan_decode_compile_variants` (cached)."""
-    _compiled(*plan["args"], **plan["kwargs"])
+    return _compiled(*plan["args"], **plan["kwargs"])
 
 
 def run_paged_fp4_decode_qmul4_tmem_nvfp4(
@@ -1120,26 +1102,12 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
                 splits, B, H * g_pad, D, q.device
             )
 
-    single_softmax_wg = _use_single_softmax_scheduler(
-        g_pad, reduction, "qmul4_tmem", splits
-    )
-    f = _compiled(
-        H * g_pad,
-        H,
-        D,
-        1,
-        reduction,
-        "qmul4_tmem",
-        k_sf_mode,
-        True,
-        HQ,
-        single_softmax_wg=single_softmax_wg,
-        partial_o_dtype=_reduction_workspace_partial_o_dtype(
-            reduction_workspace
-        ),
-        smem_correction_broadcast=single_softmax_wg,
-        residue_fold=residue_fold,
-    )
+    f = compile_decode_variant(decode_compile_spec(
+        HQ, H, D, (splits, reduction),
+        output_nvfp4=True, residue_fold=residue_fold,
+        k_sf_mode=k_sf_mode, direct_output=True,
+        partial_o_dtype=_reduction_workspace_partial_o_dtype(reduction_workspace),
+    ))
     if residue_fold:
         q_eff = q
     elif g_pad != g:

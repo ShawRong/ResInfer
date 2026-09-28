@@ -62,16 +62,8 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     slice_nvfp4_output,
 )
 
-# mext_r1 quant layout selector. The C op defines:
-#   0 = concat
-#   1 = row_pair
-#   2 = tile8  ← required by the clean-vec-store fold GEMM
+# Row-pair layout used by the two-GEMM prefill fallback.
 _LAYOUT_ROW_PAIR = 1
-_LAYOUT_TILE8 = 2
-
-# Pad input rows to a multiple of 8 so the tile8 fold kernel sees a clean
-# 2x-doubled M dimension. The original M is preserved via output slicing.
-_M_PAD_MULTIPLE = 8
 
 # ── how a layer represents its residue ─────────────────────────────────────
 # Derived, never passed: the op already receives `num_salient` and
@@ -263,7 +255,6 @@ def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
 # Cached: capability probe runs once.
 _SM10X_FOLD_ARCH: str | None = None
 _SM10X_FOLD_PROBED = False
-_SM10X_FOLD_FIRED = [False]  # one-time "fold kernel actually ran" log guard
 
 
 def _sm10x_fold_arch() -> str | None:
@@ -360,26 +351,21 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
     # registration and the whitelist is complete for the whole model.
     if key[3] and _sm10x_fold_arch() is not None and _mext_prefill_two_gemm():
         try:
-            from ..flashinfer_integration.mext_prefill_tuner import (_PRECOMPILED,
-                                             precompile_kloop_sm100)
+            from ..flashinfer_integration.mext_prefill_tuner import precompile_kloop_sm100
 
-            if not any(k0 == "sm100" for k0, *_ in _PRECOMPILED):
-                n = precompile_kloop_sm100()
-                if n:
-                    print(f"[residue] sm100 kloop pre-compiled x {n} "
-                          f"(tile, cluster) configs", flush=True)
+            precompile_kloop_sm100()
         except Exception as e:                            # noqa: BLE001
             print(f"[residue] sm100 kloop precompile skipped: "
                   f"{type(e).__name__}: {str(e)[:70]}", flush=True)
-        # Phase-3 fold tuner (dark by default): warm the row_pair candidate
+        # Warm the enabled Fold candidates
         # set so a persisted cache entry finds its kernel on a later boot.
         # Symbolic shapes -- one warm covers every layer, so first
         # registration triggers it, same as the kloop above.
         try:
-            from ..flashinfer_integration.sm10x_fold_tuner import precompile_row_pair, tuner_enabled
+            from ..flashinfer_integration.sm10x_fold_tuner import precompile_sm10x_families, tuner_enabled
 
             if tuner_enabled():
-                precompile_row_pair()
+                precompile_sm10x_families()
         except Exception as e:                            # noqa: BLE001
             print(f"[residue] sm10x fold-tuner precompile skipped: "
                   f"{type(e).__name__}: {str(e)[:70]}", flush=True)
@@ -583,158 +569,7 @@ def _run_mext_r1_two_gemm(
     return y[0::2] + y[1::2]
 
 
-def _mext_prefill_fallback(inputs):
-    """vLLM's backend for the framework-independent prefill adapter."""
-    x, weight, scale_inv, weight_sf, alpha = inputs
-    return _run_mext_r1_two_gemm(x, weight, scale_inv, weight_sf, alpha, x.dtype)
-
-
-def _run_mext_fold_gemm_sm10x(
-    x_fp4_rowpair: torch.Tensor,
-    weight: torch.Tensor,
-    x_sf: torch.Tensor,
-    weight_scale_base: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    family: tuple[str, str] | None = None,
-) -> torch.Tensor:
-    """CuTeDSL sm100/sm103 fold GEMM for a pure mext_r1 layer.
-
-    `family` declares which layout the activation is in -- None means the
-    row_pair default. It cannot be inferred from the tensor (both layouts are
-    [2M, K/2]), so a tile8 caller must say so.
-
-    x_fp4_rowpair: [2M, K/2] uint8 (scaled_fp4_quant_mext_r1 row_pair output).
-    weight:        [N, K/2] uint8 packed FP4 (full contiguous, k_base == K).
-    x_sf:          raw swizzled 128x4 FP8 scale from the mext_r1 quant.
-    weight_scale_base: swizzled base-K weight scale (== weight_scale for mext_r1).
-    Returns [M, N] in output_dtype.
-    """
-    from nvfp4.fold import run_fold
-
-    if not _SM10X_FOLD_FIRED[0]:
-        _SM10X_FOLD_FIRED[0] = True
-        print(
-            f"[residue] SM10x MExt fold kernel FIRED: act={tuple(x_fp4_rowpair.shape)} "
-            f"weight={tuple(weight.shape)} arch={_sm10x_fold_arch()}",
-            flush=True,
-        )
-
-    major, minor = torch.cuda.get_device_capability()
-    return run_fold(
-        int(major),
-        int(minor),
-        weight,
-        x_fp4_rowpair,
-        weight_scale_base,
-        x_sf.view(torch.float8_e4m3fn),
-        alpha,
-        output_dtype,
-        family=family,
-    )
-
-
-def _tune_mext_families_sm10x(
-    x: torch.Tensor,
-    input_global_scale_inv: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale_base: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-) -> torch.Tensor:
-    """Warmup-only: measure N-ext vs A4 for this layer's shape and m-bucket.
-
-    Cross-family selection cannot live inside run_fold, because by then the
-    activation has already been quantised into ONE layout and the families do
-    not accept the same one. Here both are producible from the same `x`, so
-    this is where the comparison belongs.
-
-    Returns the winner's output so the warmup forward still produces a real
-    result. Never call inside a cudagraph capture -- it measures (sync + JIT).
-
-    A6 IS a candidate (it arrives via candidate_families()): since
-    pi_via_layout the kernel carries the pi permutation in its own TMA/SF
-    layouts, so A6 takes the same unpermuted weight as every other family --
-    no load-time transform, nothing breaks N-ext on the same layer. Gated
-    bitwise on B200 (gate_a6_pi_via_layout_sm100.py, 3/3 tiles incl. 2SM).
-    """
-    from nvfp4.cute_fold import tactics as T
-    from nvfp4.fold import candidate_families
-
-    x_rp, sf_rp = nvfp4.scaled_fp4_quant_mext_r1(
-        x, input_global_scale_inv, layout_mode=_LAYOUT_ROW_PAIR,
-    )
-    x_t8, sf_t8 = nvfp4.scaled_fp4_quant_mext_r1(
-        x, input_global_scale_inv, layout_mode=_LAYOUT_TILE8,
-        m_pad_multiple=_M_PAD_MULTIPLE,
-    )
-    raw = {"row_pair": (x_rp, sf_rp), "tile8": (x_t8, sf_t8)}
-    # The tuner calls the kernel directly, so it needs the fp8 SF view that
-    # _run_mext_fold_gemm_sm10x would otherwise apply for us.
-    acts = {k: (a, sf.view(torch.float8_e4m3fn)) for k, (a, sf) in raw.items()}
-
-    major, minor = torch.cuda.get_device_capability()
-    arch = T.kernel_arch_for_capability(int(major), int(minor))
-    family, _tactic = T.tune_families(
-        acts, weight, weight_scale_base, alpha, output_dtype,
-        kernel_arch=arch, families=candidate_families(),
-    )
-
-    act_fp4, act_sf = raw[T.FAMILY_ACT_LAYOUT[family]]
-    return _run_mext_fold_gemm_sm10x(
-        act_fp4, weight, act_sf, weight_scale_base, alpha, output_dtype,
-        family=family,
-    )
-
-
-
-
-
-
-
-
-
-_SM120_DSL_ENABLED: bool | None = None
-_SM120_DSL_FIRED = [False]
-
-
-def _run_mext_fold_gemm_sm120_cutedsl(
-    x: torch.Tensor,
-    input_global_scale_inv: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale_base: torch.Tensor,
-    alpha: torch.Tensor,
-    output_dtype: torch.dtype,
-    original_m: int,
-    output_n: int,
-    k_base: int,
-) -> torch.Tensor:
-    'SM120 CuTeDSL fold, tile picked by the FlashInfer tuner.'
-    from ..flashinfer_integration.sm120_fold_tuner import tuned_sm120_fold
-
-    if not _SM120_DSL_FIRED[0]:
-        _SM120_DSL_FIRED[0] = True
-        print(
-            f"[residue] SM120 CuTeDSL MExt fold FIRED: "
-            f"weight={tuple(weight.shape)} m={original_m}",
-            flush=True,
-        )
-    return tuned_sm120_fold(
-        x,
-        weight,
-        input_global_scale_inv,
-        weight_scale_base,
-        alpha,
-        output_dtype,
-    )
-
-
-@torch.library.custom_op(
-    "residue::nvfp4_linear",
-    mutates_args=(),
-    device_types="cuda",
-)
-def nvfp4_linear(
+def _nvfp4_linear_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     input_global_scale_inv: torch.Tensor,
@@ -750,7 +585,7 @@ def nvfp4_linear(
     use_swap: bool,
     is_mext_r1: bool,
 ) -> torch.Tensor:
-    """Single opaque op covering both residue NVFP4 paths.
+    """Static NVFP4 fallback shared by tuning and serving.
 
     Dispatch rule (computed inside the opaque body, so each cudagraph capture
     sees the real M of its capture size):
@@ -839,143 +674,21 @@ def nvfp4_linear(
         is_mext_r1 or _FORCE_FOLD or original_m <= fold_max_m)
 
     if use_fold:
-        
-        
-        
-        
-        if (is_mext_r1 and original_m > mext_fold_max_m
-                and _mext_prefill_two_gemm()):
-            _w_view = _base_k_weight_view(weight, k_base)
-            if _MEXT_PREFILL_PATH in ("auto", "k_loop"):
-                # FlashInfer-tuned two_gemm-vs-k_loop selection, per (shape,
-                # m-bucket). runners[0]=two_gemm is FlashInfer's designated
-                # fallback on any cache miss, and KloopRunner only reports
-                # precompiled tiles outside the tuning window -- so this
-                # branch can never JIT while serving. Any tuner-layer error
-                # degrades to plain two_gemm rather than breaking the op.
-                try:
-                    from ..flashinfer_integration.mext_prefill_tuner import tuned_mext_prefill
-
-                    return tuned_mext_prefill(
-                        x, _w_view, input_global_scale_inv,
-                        weight_scale_base, alpha, output_dtype,
-                        force_kloop=(_MEXT_PREFILL_PATH == "k_loop"),
-                        fallback_forward=_mext_prefill_fallback,
-                        fallback_key="vllm_cutlass_scaled_fp4_mm_v1",
-                    )
-                except Exception:                         # noqa: BLE001
-                    pass
-            return _run_mext_r1_two_gemm(
-                x, _w_view, input_global_scale_inv,
-                weight_scale_base, alpha, output_dtype,
-            )
-
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
-        
+        args = [x, _base_k_weight_view(weight, k_base),
+                input_global_scale_inv, weight_scale_base, alpha]
+        if is_mext_r1 and original_m > mext_fold_max_m and _mext_prefill_two_gemm():
+            if _MEXT_PREFILL_PATH == "k_loop":
+                from ..flashinfer_integration.mext_prefill_tuner import (
+                    _kloop_valid_tactics, _run_kloop)
+                ready = _kloop_valid_tactics(args, False)
+                if ready:
+                    return _run_kloop(args, ready[0])
+            return _run_mext_r1_two_gemm(*args, output_dtype)
         if _sm10x_fold_arch() is not None:
-            
-            
-            
-            
-            
-            from nvfp4.fold import (
-                ENABLE_MEXT_FAMILY,
-                is_tuning_mode,
-                select_fold_plan,
-            )
-
-            major, minor = torch.cuda.get_device_capability()
-
-            from ..flashinfer_integration.sm10x_fold_tuner import tuned_sm10x_fold, tuner_enabled
-
-            if tuner_enabled():
-                # The candidate index includes producer layout and Fold
-                # family.  RESIDUE_FOLD_MEXT=1 admits A4/A6 to the same
-                # FlashInfer election as row-pair; cache miss still serves
-                # the safe static row-pair fallback.
-                out = tuned_sm10x_fold(
-                    x,
-                    _base_k_weight_view(weight, k_base),
-                    input_global_scale_inv,
-                    weight_scale_base,
-                    alpha,
-                    output_dtype,
-                )
-                return out[:original_m]
-
-            if ENABLE_MEXT_FAMILY and is_tuning_mode():
-                # Warmup window: this is the ONLY place both layouts of the
-                # same activation exist, so cross-family measurement has to
-                # happen here rather than inside run_fold.
-                return _tune_mext_families_sm10x(
-                    x,
-                    input_global_scale_inv,
-                    weight,
-                    weight_scale_base,
-                    alpha,
-                    output_dtype,
-                )[:original_m]
-
-            # family AND layout together: "tile8" is shared by A4 and A6, so
-            # deriving one from the other would dispatch A6 as A4.
-            family, layout = select_fold_plan(
-                int(major), int(minor), int(output_n),
-                int(weight.shape[1]) * 2, int(original_m))
-
-            if layout == "tile8":
-                # tile8 pads M to a multiple of 8 inside the quant op (same
-                # contract the deleted SM120 C++ fold used); out[:original_m] trims.
-                x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
-                    x,
-                    input_global_scale_inv,
-                    layout_mode=_LAYOUT_TILE8,
-                    m_pad_multiple=_M_PAD_MULTIPLE,
-                )
-            else:
-                x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
-                    x,
-                    input_global_scale_inv,
-                    layout_mode=_LAYOUT_ROW_PAIR,
-                )
-            out = _run_mext_fold_gemm_sm10x(
-                x_fp4,
-                _base_k_weight_view(weight, k_base),
-                x_sf,
-                weight_scale_base,
-                alpha,
-                output_dtype,
-                family=family,
-            )
-            return out[:original_m]
-
-        
-        
-        
-        
-        
-        
-        
-        
-        return _run_mext_fold_gemm_sm120_cutedsl(
-            x,
-            input_global_scale_inv,
-            _base_k_weight_view(weight, k_base),
-            weight_scale_base,
-            alpha,
-            output_dtype,
-            int(original_m),
-            int(output_n),
-            int(k_base),
-        )
+            from ..flashinfer_integration.sm10x_fold_tuner import _run_fallback
+            return _run_fallback(args, output_dtype)[:original_m]
+        from ..flashinfer_integration.sm120_fold_tuner import run_fold_table
+        return run_fold_table(args, output_dtype)[:original_m]
 
     # ── no residue at all: stock vLLM NVFP4 ────────────────────────────────
     # Reached when a layer that carries no residue entered the op anyway and
@@ -1073,6 +786,49 @@ def nvfp4_linear(
         output_dtype,
     )
     return slice_nvfp4_output(out, int(output_size))
+
+
+@torch.library.custom_op(
+    "residue::nvfp4_linear", mutates_args=(), device_types="cuda",
+)
+def nvfp4_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    input_global_scale_inv: torch.Tensor,
+    weight_scale: torch.Tensor,
+    weight_scale_base: torch.Tensor,
+    channel_mask: torch.Tensor,
+    alpha: torch.Tensor,
+    k_base: int,
+    num_salient: int,
+    weights_padding_cols: int,
+    output_size: int,
+    fold_eligible: bool,
+    use_swap: bool,
+    is_mext_r1: bool,
+) -> torch.Tensor:
+    """Dispatch all NVFP4 Linear sizes through one FlashInfer operation."""
+    if x.shape[0] == 0:
+        return x.new_empty((0, weight.shape[0]))
+    from ..flashinfer_integration.nvfp4_linear_tuner import tuned_nvfp4_linear
+
+    arch = _sm10x_fold_arch() or "sm120"
+    policy = (
+        int(k_base), int(num_salient), int(weights_padding_cols),
+        int(output_size), bool(fold_eligible), bool(use_swap), bool(is_mext_r1),
+        arch, fold_max_m_for(_sm10x_fold_arch()),
+        mext_fold_max_m_for(_sm10x_fold_arch()), bool(_FORCE_FOLD),
+        bool(_PREFILL_RESIDUE_OFF),
+        int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
+        int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,
+        _MEXT_PREFILL_PATH,
+        os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1",
+        os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1") == "1",
+    )
+    return tuned_nvfp4_linear(
+        [x, weight, input_global_scale_inv, weight_scale,
+         weight_scale_base, channel_mask, alpha], policy,
+    )
 
 
 @nvfp4_linear.register_fake

@@ -339,11 +339,9 @@ def fi_tactic_resolved(before: set | None) -> list | None:
         out = []
         for k in set(cache) - before:
             v = cache[k]
-            out.append({"op": k[0] if isinstance(k, tuple) and k else None,
-                        "runner": k[1] if isinstance(k, tuple) and len(k) > 1
-                        else None,
-                        "runner_id": v[0] if len(v) > 0 else None,
-                        "tactic": v[1] if len(v) > 1 else None})
+            out.append({"op": k.custom_op,
+                        "runner": k.runner_class_name,
+                        "tactic": v[0]})
         return sorted(out, key=lambda d: (str(d["op"]), str(d["tactic"])))
     except Exception:                                       # noqa: BLE001
         return None

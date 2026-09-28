@@ -1,35 +1,20 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""FlashInfer AutoTuner selection for the full MXFP4 quantize + Fold path.
-
-The NVFP4 tactic table is only a source of candidate tile descriptions.  An
-MXFP4 candidate must pass a shape-specific output check *before* it is offered
-to FlashInfer's profiler.  A cache hit without that check serves the safe
-row-pair fallback instead of launching an unverified tactic.
-"""
+'FlashInfer selection for MXFP4 quantize + Fold.'
 
 from __future__ import annotations
 
 import hashlib
 import os
-
 import torch
 
-from .fi_tuner_base import make_runner_pair, make_tuning_config, tuned_call
+from .linear_tuner import LinearSpec, tuned_linear
 
-_OP = "residue_mxfp4_fold_sm100_group32_v1"
-_VERSION = 1
+_VERSION = 3
 _FAMILIES = (("row_pair", "std"), ("tile8", "std"), ("tile8", "pi"))
-_FALLBACK = (("row_pair", "std"), "tma", (128, 128), (1, 1), None)
+_DEFAULT = (("row_pair", "std"), "tma", (128, 128), (1, 1), None)
 
 _CANDIDATES: list[tuple] | None = None
-_TUNING_CONFIGS: dict[int, object] = {}
-_RUNNERS: dict[tuple, list] = {}
-_PREFLIGHT: dict[tuple, tuple[int, ...]] = {}
-_STRICT_PREFLIGHT: set[tuple] = set()
-_EXECUTED: set[tuple[tuple, int]] = set()
-_ANNOUNCED = [False]
-_DEGRADED = [False]
 _LAST_SOURCE: list[str | None] = [None]
 _LAST_TILE: list[tuple | None] = [None]
 
@@ -44,25 +29,15 @@ def _candidates() -> list[tuple]:
             (family, *_norm_tactic(raw))
             for family in _FAMILIES
             for raw in FAMILY_TACTICS[family]
+            # M1_ALL_TACTICS.md: invalid launches and A4 wrong output.
+            if not (family[0] == "row_pair" and raw[1] in ((128, 24), (256, 256)))
+            if not (family == ("tile8", "std") and raw[1] == (128, 32))
         ]
     return _CANDIDATES
 
 
 def candidates_hash() -> str:
-    return hashlib.sha256(repr((_VERSION, _candidates())).encode()).hexdigest()[:16]
-
-
-def _map_to_tuning_buckets(m: int) -> int:
-    # One exact-M profile per shape: a precheck at M=1 must not green-light a
-    # synthetic M=2/4/... profile generated in the same choose_one call.
-    return int(m)
-
-
-def _tuning_config(m: int):
-    m = int(m)
-    if m not in _TUNING_CONFIGS:
-        _TUNING_CONFIGS[m] = make_tuning_config((m,), _map_to_tuning_buckets)
-    return _TUNING_CONFIGS[m]
+    return hashlib.sha256(repr((_VERSION, _candidates(), _DEFAULT)).encode()).hexdigest()[:16]
 
 
 def tuner_enabled() -> bool:
@@ -71,32 +46,6 @@ def tuner_enabled() -> bool:
     if value not in ("0", "1"):
         raise ValueError("RESIDUE_MXFP4_FOLD_TUNER must be 0 or 1")
     return value == "1"
-
-
-def is_tuning_mode() -> bool:
-    try:
-        from flashinfer.autotuner import AutoTuner
-    except ImportError:
-        return False
-    return bool(AutoTuner.get().is_tuning_mode)
-
-
-def _geometry(inputs, pdl_mode: str, out_dtype) -> tuple:
-    x, weight, weight_sf = inputs
-    return (
-        "mxfp4", "ceil", 32, _VERSION, candidates_hash(), pdl_mode,
-        int(x.shape[0]), int(x.shape[1]), int(weight.shape[0]),
-        tuple(x.stride()), tuple(weight.stride()), tuple(weight_sf.stride()),
-        int(weight_sf.numel()), str(x.dtype), str(weight.dtype),
-        str(weight_sf.dtype), str(out_dtype), str(x.device),
-    )
-
-
-def preflighted(inputs, *, pdl_mode="early", out_dtype=torch.bfloat16,
-                strict_reference=False) -> bool:
-    """Whether this process validated candidates for this exact shape/config."""
-    key = _geometry(inputs, pdl_mode, out_dtype)
-    return key in (_STRICT_PREFLIGHT if strict_reference else _PREFLIGHT)
 
 
 def _static_legal(candidate: tuple, m: int) -> bool:
@@ -120,8 +69,7 @@ def _pad_multiple(candidate: tuple) -> int | None:
 
 
 def _run_tactic(inputs, candidate: tuple, pdl_mode: str, out_dtype):
-    from nvfp4.cute_fold.host import mext_fold_gemm_sm103
-    from nvfp4.mxfp4 import quantize_mext
+    from nvfp4.mxfp4 import fold_gemm, quantize_mext
 
     x, weight, weight_sf = inputs
     family, mode, tile, cluster, ab = candidate
@@ -130,125 +78,45 @@ def _run_tactic(inputs, candidate: tuple, pdl_mode: str, out_dtype):
         x, recipe="ceil", mext_layout=family[0], m_pad_multiple=pad,
         pdl_mode=pdl_mode)
     _LAST_TILE[0] = candidate
-    out = mext_fold_gemm_sm103(
-        weight, packed, weight_sf, scales, None,
+    out = fold_gemm(
+        packed, weight, scales, weight_sf,
         out_dtype=out_dtype, mma_tiler_mn=tile,
-        cluster_shape_mn=cluster, store_mode=mode, kernel_arch="sm100",
-        ab_stage_override=ab, pi_via_layout=family == ("tile8", "pi"),
-        fp4_format="mxfp4")
+        cluster_shape_mn=cluster, store_mode=mode,
+        ab_stage_override=ab, pi_via_layout=family == ("tile8", "pi"))
     return out[: x.shape[0]]
 
 
 def _fallback(inputs, pdl_mode: str, out_dtype):
-    return _run_tactic(inputs, _FALLBACK, pdl_mode, out_dtype)
+    return _run_tactic(inputs, _DEFAULT, pdl_mode, out_dtype)
 
 
-def _check_output(actual, reference) -> float:
-    if tuple(actual.shape) != tuple(reference.shape):
-        raise ValueError(f"output shape {tuple(actual.shape)} != {tuple(reference.shape)}")
-    if not bool(torch.isfinite(actual).all()):
-        raise ValueError("non-finite output")
-    denom = float(reference.float().abs().max()) + 1e-9
-    relmax = float((actual.float() - reference.float()).abs().max()) / denom
-    if relmax > 0.25:
-        raise ValueError(f"BF16 relative max {relmax:.5f} > 0.25")
-    return relmax
+def _valid(inputs, policy, tuning):
+    out_dtype, _pdl_mode, _hash = policy
+    from nvfp4.cute_fold.host import _compile_fold_gemm, STORE_MODE_TO_MODE
+
+    return [i for i, (family, mode, tile, cluster, ab) in enumerate(_candidates())
+            if _static_legal(_candidates()[i], int(inputs[0].shape[0]))
+            and (tuning or _compile_fold_gemm(
+                tile, cluster, out_dtype, mode=STORE_MODE_TO_MODE[mode],
+                kernel_arch="sm100", ab_stage_override=ab,
+                pi_via_layout=family == ("tile8", "pi"), fp4_format="mxfp4",
+                compile_if_missing=False) is not None)]
 
 
-def _check_against_fixed(actual, reference) -> None:
-    # Reference is the same MXFP4 quantizer + fixed Fold implementation, not
-    # an unquantized BF16 matmul. Require pointwise agreement, including tails.
-    torch.testing.assert_close(actual, reference, rtol=0.03, atol=0.125)
+def _run(inputs, policy, index):
+    out_dtype, pdl_mode, _hash = policy
+    return _run_tactic(inputs, _candidates()[index], pdl_mode, out_dtype)
 
 
-def preflight_tactics(inputs, reference, *, pdl_mode="early",
-                      out_dtype=torch.bfloat16,
-                      strict_reference=False) -> dict:
-    """Verify every listed tactic for this exact logical shape before tuning.
-
-    Only input reads and fresh output allocations occur; the caller's x,
-    weight, scale and reference tensors are never changed.  Rechecking after
-    a cache hit is intentional: the process may have a new compiled binary.
-    """
-    if pdl_mode not in ("off", "tail", "early"):
-        raise ValueError(f"invalid MXFP4 PDL mode {pdl_mode!r}")
-    if len(inputs) != 3:
-        raise ValueError("expected (raw activation, packed weight, flat scales)")
-    inputs = tuple(inputs)
-    key = _geometry(inputs, pdl_mode, out_dtype)
-    _PREFLIGHT.pop(key, None)
-    _STRICT_PREFLIGHT.discard(key)
-    m = int(inputs[0].shape[0])
-    valid: list[int] = []
-    failed: dict[int, str] = {}
-    max_relative: dict[int, float] = {}
-    # A broken fallback would poison both cache misses and the tuning result.
-    try:
-        fallback_output = _fallback(inputs, pdl_mode, out_dtype)
-        torch.cuda.synchronize(inputs[0].device)
-        fallback_relative = _check_output(fallback_output, reference)
-        if strict_reference:
-            _check_against_fixed(fallback_output, reference)
-    except Exception as exc:
-        raise RuntimeError(f"MXFP4 row-pair fallback failed preflight: {exc}") from exc
-    for index, candidate in enumerate(_candidates()):
-        if not _static_legal(candidate, m):
-            failed[index] = "static legality filter"
-            continue
-        try:
-            actual = _run_tactic(inputs, candidate, pdl_mode, out_dtype)
-            torch.cuda.synchronize(inputs[0].device)
-            max_relative[index] = _check_output(actual, reference)
-            if strict_reference:
-                _check_against_fixed(actual, reference)
-        except Exception as exc:  # CUDA launch and correctness failures are candidates, not winners.
-            # A sticky asynchronous failure cannot be safely ignored.
-            try:
-                torch.cuda.synchronize(inputs[0].device)
-            except Exception:
-                raise
-            failed[index] = f"{type(exc).__name__}: {str(exc)[:160]}"
-            continue
-        valid.append(index)
-        _EXECUTED.add((key, index))
-    # Publish the set atomically, after every candidate has been checked.
-    _PREFLIGHT[key] = tuple(valid)
-    if strict_reference:
-        _STRICT_PREFLIGHT.add(key)
-    return {"op": _OP, "candidate_hash": candidates_hash(),
-            "logical_m": m, "candidate_count": len(_candidates()),
-            "valid_indices": valid, "failed": failed,
-            "relative_max": max_relative, "fallback_relative_max": fallback_relative,
-            "fallback": _FALLBACK, "strict_reference": strict_reference}
+def _default(inputs, policy):
+    out_dtype, pdl_mode, _hash = policy
+    return _fallback(inputs, pdl_mode, out_dtype)
 
 
-def _make_runners(pdl_mode: str, out_dtype):
-    def fallback(inputs):
-        return _fallback(inputs, pdl_mode, out_dtype)
-
-    def valid(inputs, tuning):
-        key = _geometry(inputs, pdl_mode, out_dtype)
-        checked = _PREFLIGHT.get(key, ())
-        return list(checked) if tuning else [
-            i for i in checked if (key, i) in _EXECUTED]
-
-    def run(inputs, index):
-        candidate = _candidates()[index]
-        output = _run_tactic(inputs, candidate, pdl_mode, out_dtype)
-        _EXECUTED.add((_geometry(inputs, pdl_mode, out_dtype), index))
-        return output
-
-    def extras(inputs):
-        return _geometry(inputs, pdl_mode, out_dtype)
-
-    return make_runner_pair(
-        _OP, fallback_forward=fallback,
-        fallback_extras=("mxfp4", 32, "row_pair", _VERSION, pdl_mode,
-                         str(out_dtype)),
-        valid_tactics=valid, run_tactic=run, candidate_extras=extras,
-        degraded_flag=_DEGRADED,
-        on_degrade=lambda: _set_source("fallback"),
-    )
+def _route(m, policy):
+    # The legality of direct stores and padded quantization changes at exact
+    # logical M, so a graph-capture size must never borrow another M's winner.
+    return int(m)
 
 
 def _set_source(source: str):
@@ -263,36 +131,17 @@ def last_tactic_tile() -> tuple | None:
     return _LAST_TILE[0]
 
 
-def record_static_fallback() -> None:
-    """Record the existing fixed Fold path when normal serving skips tuning."""
-    _LAST_SOURCE[0] = "offline_table"
-    _LAST_TILE[0] = _FALLBACK
-
-
-def _announce(runner, tactic, runners):
-    if runner is runners[1] and tactic >= 0:
-        return f"tactic source: autotuned {_candidates()[tactic]}"
-    return "tactic source: row-pair fallback"
-
-
 def tuned_mxfp4_fold(x, packed_w, flat_ws, *, pdl_mode="early",
-                     out_dtype=torch.bfloat16):
-    """Tune and run MXFP4 producer+Fold using FlashInfer's cache/scaffold."""
+                     out_dtype=torch.bfloat16, tune=True,
+                     tuning_buckets=None):
+    """Tune full MXFP4 quantize + Fold over exact logical token counts."""
     if pdl_mode not in ("off", "tail", "early"):
         raise ValueError(f"invalid MXFP4 PDL mode {pdl_mode!r}")
-    inputs = [x, packed_w, flat_ws]
-    runner_key = (pdl_mode, out_dtype)
-
-    def runners():
-        if runner_key not in _RUNNERS:
-            _RUNNERS[runner_key] = _make_runners(pdl_mode, out_dtype)
-        return _RUNNERS[runner_key]
-
-    return tuned_call(
-        _OP, runners_getter=runners,
-        config_getter=lambda: _tuning_config(int(x.shape[0])),
-        inputs=inputs,
-        fallback_forward=lambda args: _fallback(args, pdl_mode, out_dtype),
-        kill_env_value=None, announce_flag=_ANNOUNCED,
-        announce=_announce, record=_set_source,
+    m = int(x.shape[0])
+    buckets = tuple(sorted({*(int(b) for b in (tuning_buckets or ())), m}))
+    spec = LinearSpec(
+        "mxfp4", (out_dtype, pdl_mode, candidates_hash()), buckets,
+        bool(tune), _default, _valid, _run, _route,
+        "mxfp4_row_pair_v3", _set_source,
     )
+    return tuned_linear([x, packed_w, flat_ws], spec)

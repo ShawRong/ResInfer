@@ -51,7 +51,7 @@ def gemm(a, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
 
 def fold_gemm(a_rowpair, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
               mma_tiler_mn=(128, 128), cluster_shape_mn=(1, 1),
-              store_mode="tma", pi_via_layout=False):
+              store_mode="tma", pi_via_layout=False, ab_stage_override=None):
     """Fused FP32 pair sum; one physical weight and compact [M,N] output."""
     m2, _, _, arch = _validate(a_rowpair, b, a_scale, b_scale, out_dtype)
     if m2 % 2:
@@ -65,4 +65,5 @@ def fold_gemm(a_rowpair, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
             out_dtype=out_dtype, mma_tiler_mn=tuple(mma_tiler_mn),
             cluster_shape_mn=tuple(cluster_shape_mn), kernel_arch=arch,
             store_mode=store_mode, pi_via_layout=pi_via_layout,
+            ab_stage_override=ab_stage_override,
             fp4_format="mxfp4")

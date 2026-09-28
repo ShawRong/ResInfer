@@ -70,7 +70,7 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_SM10X_FOLD_TUNER": ("enum", {"0", "1"},
                                  "sm10x decode-fold FlashInfer tactic tuner "
                                  "(default ON since task-014 passed on B200; "
-                                 "0 = the legacy in-process tuner path)"),
+                                 "0 = the existing static row-pair policy)"),
     "RESIDUE_MXFP4_FOLD_TUNER": ("enum", {"0", "1"},
                                  "SM100 MXFP4 group-32 Fold FlashInfer tactic "
                                  "tuner (experimental; default off pending "
@@ -91,8 +91,6 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_SHARE_AUTOTUNE_CACHE": ("one", None,
                                      "share the FlashInfer autotune cache "
                                      "across models"),
-    "RESIDUE_FOLD_TUNE_DUMP": ("free", None,
-                               "write the fold tuner's decisions to this path"),
     # -- attention (experimental) -------------------------------------------
     "RESIDUE_ATTN": (
         "one", None,

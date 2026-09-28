@@ -24,14 +24,6 @@ _DEFAULT_PATH_WARNED = False
 
 
 
-
-
-
-
-
-
-
-
 _SM10X_HOST = "nvfp4.cute_fold.host"
 _SM120_HOST = "nvfp4.cute_fold_sm120.host"
 
@@ -45,18 +37,11 @@ def compile_stats() -> dict[str, dict | None]:
     """
     out: dict[str, dict | None] = {"sm10x": None, "sm120": None}
 
-    mod = sys.modules.get(_SM10X_HOST)
-    if mod is not None:
+    for arch, module_name in (("sm10x", _SM10X_HOST), ("sm120", _SM120_HOST)):
+        mod = sys.modules.get(module_name)
         cache = getattr(mod, "_KERNEL_CACHE", None)
         if cache is not None:
-            out["sm10x"] = {"compiled": len(cache), "keys": list(cache)}
-
-    mod = sys.modules.get(_SM120_HOST)
-    if mod is not None:
-        fn = getattr(mod, "compile_fold_gemm_sm120", None)
-        info = getattr(fn, "cache_info", None)
-        if info is not None:
-            out["sm120"] = {"compiled": info().misses, "keys": None}
+            out[arch] = {"compiled": len(cache), "keys": list(cache)}
 
     return out
 

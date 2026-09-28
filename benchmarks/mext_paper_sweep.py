@@ -377,11 +377,6 @@ def _worker(args: argparse.Namespace) -> int:
                     x_scale_trt = (x.float().abs().max() / 448.0).reshape(1).float()
                     alpha_trt = (x_scale_trt / wgs_trt).reshape(1).float()
                 reference = x @ weight.T
-                mxfp4_preflight = None
-                if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
-                    mxfp4_preflight = mxfp4_fold_tuner.preflight_tactics(
-                        (x, w_mx, ws_mx_flat), reference,
-                        pdl_mode="early", out_dtype=torch.bfloat16)
                 outputs = {arm: torch.empty(m, n, device=device, dtype=torch.bfloat16)
                            for arm in resolved["arms"] if arm != "mext_r1"}
                 padded_m = max(4, m)
@@ -497,7 +492,6 @@ def _worker(args: argparse.Namespace) -> int:
                         if arm == "resinfer_mxfp4_mext_r1_tuned":
                             row["tactic_source"] = mxfp4_fold_tuner.last_tactic_source()
                             row["tactic"] = mxfp4_fold_tuner.last_tactic_tile()
-                            row["preflight"] = mxfp4_preflight
                             if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
                                 or row["tactic"] is None):
                                 raise RuntimeError("MXFP4 Fold did not serve a profiled tactic")

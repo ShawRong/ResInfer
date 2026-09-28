@@ -52,12 +52,9 @@ dependencies = [
 
     # ── Eval stack (vllm + lm-eval) ──────────────────────────────────────
     "vllm==0.26.0",
-    "flashinfer-python==0.6.14",
-    # flashinfer-cubin is deliberately NOT pinned: flashinfer enforces an
-    # EXACT cubin/python version match and the cubin package lags (latest
-    # 0.6.13 vs flashinfer-python 0.6.14), so installing it makes
-    # `import flashinfer` raise. Without it flashinfer fetches/JITs cubins
-    # on demand, which is verified working (nvfp4_quantize smoke).
+    "flashinfer-python==0.7.0",
+    # Fetch/JIT cubins on demand. An optional flashinfer-cubin installation
+    # must match flashinfer-python exactly.
     "xgrammar>=0.2.1,<1.0.0",             # vllm structured-output backend
     "mistral-common[image]>=1.11.3",      # vllm tokenizer / multimodal dep
     "ray>=2.53.0",
@@ -166,6 +163,11 @@ environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # rejects the metadata conflict. We override cupti-python's claim so the
 # resolver accepts the working combination.
 override-dependencies = [
+    # vLLM 0.26 pins 0.6.14. This candidate uses the 0.7.0 AutoTuner's
+    # per-sample L2 eviction; validate the full runtime tuple before release.
+    "flashinfer-python==0.7.0",
+    # FlashInfer 0.7 requires >=0.1.11; vLLM 0.26 pins 0.1.10.
+    "apache-tvm-ffi==0.1.11",
     "nvidia-cuda-cupti==13.0.85",
     # vLLM 0.26 pins 4.6.0; ResAttn native QMUL4 needs the 4.8.0 compiler.
     "nvidia-cutlass-dsl[cu13]==4.8.0",

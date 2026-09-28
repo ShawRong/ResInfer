@@ -8,10 +8,9 @@ Imports stay lazy so importing this package does not load GPU dependencies.
 from importlib import import_module
 
 _ENTRIES = {
-    "tuned_sm10x_fold": "sm10x_fold_tuner",
-    "tuned_sm120_fold": "sm120_fold_tuner",
+    "tuned_linear": "linear_tuner",
+    "tuned_nvfp4_linear": "nvfp4_linear_tuner",
     "tuned_mxfp4_fold": "mxfp4_fold_tuner",
-    "tuned_mext_prefill": "mext_prefill_tuner",
 }
 __all__ = list(_ENTRIES)
 

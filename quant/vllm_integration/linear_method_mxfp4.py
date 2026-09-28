@@ -129,10 +129,18 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
         if runtime_mode == "mext_r1":
             from ..flashinfer_integration import mxfp4_fold_tuner
             if mxfp4_fold_tuner.tuner_enabled():
-                from .autotune_warmup import request_mxfp4_warmup
-                from .patch import _install_fold_decode_autotune_warmup
-                request_mxfp4_warmup()
-                _install_fold_decode_autotune_warmup()
+                from vllm.config import get_current_vllm_config
+
+                config = get_current_vllm_config()
+                limit = int(config.scheduler_config.max_num_batched_tokens)
+                sizes = {1, limit, 2, 4, 8, 16, 32, 64, 128, 192, 256,
+                         384, 512}
+                sizes.update(config.compilation_config.cudagraph_capture_sizes or [])
+                self.tuning_buckets = sorted(m for m in sizes if 0 < m <= limit)
+            else:
+                self.tuning_buckets = None
+        else:
+            self.tuning_buckets = None
 
     def create_weights(
         self,
@@ -295,4 +303,5 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             layer._mxfp4_output_dtype,
             bias,
             self.activation_recipe,
+            self.tuning_buckets,
         )

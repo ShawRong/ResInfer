@@ -10,8 +10,6 @@ FlashInfer CuTeDSL GEMM uses.
 
 from __future__ import annotations
 
-import functools
-
 import torch
 
 import cuda.bindings.driver as cuda
@@ -22,6 +20,9 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import make_ptr
 
 SF_VEC_SIZE = 16
+
+# Keep warmed kernels resident for graph capture; queries use the same keys.
+_KERNEL_CACHE: dict = {}
 
 
 def _hw_max_active_clusters() -> int:
@@ -91,7 +92,6 @@ def _fold_launch(
     gemm(mA, mB, mSFA, mSFB, mD, mAlpha, max_active_clusters, stream)
 
 
-@functools.lru_cache(maxsize=256)
 def compile_fold_gemm_sm120(
     m: int,
     k: int,
@@ -99,8 +99,15 @@ def compile_fold_gemm_sm120(
     out_dtype: torch.dtype,
     a_ld: int | None = None,
     k_loop: bool = False,
+    compile_if_missing: bool = True,
 ):
     'Compile (and cache) ONE fold kernel per (n_w, k, tile) -- the token'
+    a_ld = None if a_ld == k else a_ld
+    key = (torch.cuda.current_device(), m, k, tile_shape_mnk, out_dtype, a_ld, k_loop)
+    if key in _KERNEL_CACHE:
+        return _KERNEL_CACHE[key]
+    if not compile_if_missing:
+        return None
     import os as _os
     if _os.environ.get("NVFP4_FOLD_COMPILE_LOG", "0") == "1":
         print(f"[fold-compile] n_w={m} k={k} (dynamic m) "
@@ -123,7 +130,7 @@ def compile_fold_gemm_sm120(
     sfb_ptr = make_ptr(cutlass.Float8E4M3FN, 0, cute.AddressSpace.gmem, assumed_align=16)
     d_ptr = make_ptr(c_dtype, 0, cute.AddressSpace.gmem, assumed_align=16)
     alpha_ptr = make_ptr(cutlass.Float32, 0, cute.AddressSpace.gmem, assumed_align=4)
-    return cute.compile(
+    compiled = cute.compile(
         _fold_launch, gemm, a_ptr, b_ptr, sfa_ptr, sfb_ptr, d_ptr, alpha_ptr,
         m, cutlass.Int32(256), k, cutlass.Int32(256),
         _hw_max_active_clusters(),
@@ -131,6 +138,8 @@ def compile_fold_gemm_sm120(
         a_ld,
         (2 * k if k_loop else None),
     )
+    _KERNEL_CACHE[key] = compiled
+    return compiled
 
 
 def kext_kloop_gemm_sm120(

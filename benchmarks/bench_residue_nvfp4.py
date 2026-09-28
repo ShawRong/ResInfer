@@ -470,24 +470,6 @@ def run(args) -> None:
 
     fold_seen = [False]      # sticky; see the fold_fired check below
 
-    def cold_tune() -> dict:
-        """What the TUNING windows achieved -- a different quantity from
-        `cold_l2_effective`, which is about the MEASUREMENT.
-
-        Both must be in the row. `cold_l2_cache=True` was a no-op in this
-        project for a year precisely because nothing recorded what a window
-        achieved as opposed to what it requested, and the two halves fail
-        independently: a run can measure cold against a tactic that was
-        selected hot, which is exactly what every row before 98500d3 did.
-        """
-        try:
-            from quant.flashinfer_integration.fi_tuner_base import cold_tuning_state
-
-            st = cold_tuning_state()
-        except Exception:                              # noqa: BLE001
-            return {}
-        return {"cold_tuning": st} if st else {}
-
     def ops_of(fn, fn_args) -> dict:
         'Device-op census for one arm, split into kernels and everything else.'
         d = device_ops(fn, fn_args)
@@ -639,7 +621,6 @@ def run(args) -> None:
                       
                       "weight_mb": n * k / 2 / 1e6,
                       **stock_ops,
-                      **cold_tune(),
                       **l2,
                       **stock})
 
@@ -726,7 +707,6 @@ def run(args) -> None:
                           "fold_fired_in_run": fold_seen[0],
                           "weight_mb": n * k / 2 / 1e6,
                           **mext_ops,
-                          **cold_tune(),
                           # fold_tactic_source is hardcoded per-arch on sm12x
                           # and cannot report this; see the priming comment.
                           "fold_tuner_primed": bool(args.autotune),
@@ -798,7 +778,6 @@ def run(args) -> None:
                               "vs_ideal": t["us"] / ((1.0 + r) * stock["us"]),
                               "weight_mb": n * e["k_ext"] / 2 / 1e6,
                               **kext_ops,
-                              **cold_tune(),
                               "fold_tuner_primed": bool(args.autotune),
                               
                               

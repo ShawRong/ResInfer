@@ -71,6 +71,7 @@ def _compile_fold_gemm(
     dsmem_split: bool = False,
     strided_weight: bool = False,
     fp4_format: str = "nvfp4",
+    compile_if_missing: bool = True,
 ):
     """Compile a fold-GEMM kernel variant:
 
@@ -79,6 +80,9 @@ def _compile_fold_gemm(
     - "fold_mext_direct": M-ext fold (A6), pi alias + 128-bit direct stores
     - "plain_tma":        stock kernel/epilogue baseline (no fold)
     - "plain_mn":         SM100 plain GEMM, activation on M, row-major output
+
+    compile_if_missing=False queries residency without compiling; returns None
+    on a miss. The current device is part of the cache identity.
 
     (The former "fold_direct" tiny-m mode was removed: dominated at every
     m_tok after the transposed-staging fold_tma optimization -- see
@@ -117,11 +121,13 @@ def _compile_fold_gemm(
     if mode == "plain_mn" and kernel_arch != "sm100":
         raise ValueError("plain_mn is currently SM100-only")
     sf_vec_size = 32 if fp4_format == "mxfp4" else SF_VEC_SIZE
-    key = (fp4_format, mma_tiler_mn, cluster_shape_mn, out_dtype, mode, kernel_arch,
-           ab_stage_override, dual_alpha, pi_via_layout, split_k,
+    key = (torch.cuda.current_device(), fp4_format, mma_tiler_mn, cluster_shape_mn,
+           out_dtype, mode, kernel_arch, ab_stage_override, dual_alpha, pi_via_layout, split_k,
            splitk_ablate, dsmem_split, strided_weight)
     if key in _KERNEL_CACHE:
         return _KERNEL_CACHE[key]
+    if not compile_if_missing:
+        return None
 
     cutlass, cute, make_ptr, get_max_active_clusters, kernel_classes = (
         _cutlass_modules()
