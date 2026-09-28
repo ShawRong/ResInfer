@@ -71,18 +71,7 @@ class ResidueLinear(nn.Module):
         Returns:
             ResidueLinear instance wrapping RealQuantLinear
         """
-        # Preserve the legacy construction-time environment scope.
-        old_swap = os.environ.get("RESIDUE_SWAP")
-        os.environ["RESIDUE_SWAP"] = "0"
-
-        try:
-            return _wrap_compressed(cls, linear, compressed_hint=True)
-
-        finally:
-            if old_swap is None:
-                os.environ.pop("RESIDUE_SWAP", None)
-            else:
-                os.environ["RESIDUE_SWAP"] = old_swap
+        return _wrap_compressed(cls, linear, compressed_hint=True)
 
     def forward(self, x):
         return self.linear(x)
@@ -107,18 +96,7 @@ class ResidueSwapLinear(nn.Module):
     @classmethod
     def from_linear(cls, linear: nn.Module, r: float = 0.125, fmt: str = "nvfp4", **kwargs):
         """Create ResidueSwapLinear from RealQuantLinear."""
-        # Preserve the legacy construction-time environment scope.
-        old_swap = os.environ.get("RESIDUE_SWAP")
-        os.environ["RESIDUE_SWAP"] = "1"
-
-        try:
-            return _wrap_compressed(cls, linear)
-
-        finally:
-            if old_swap is None:
-                os.environ.pop("RESIDUE_SWAP", None)
-            else:
-                os.environ["RESIDUE_SWAP"] = old_swap
+        return _wrap_compressed(cls, linear)
 
     def forward(self, x):
         return self.linear(x)

@@ -20,7 +20,7 @@ from modelopt.torch.quantization.nn.modules.quant_linear import QuantLinearConvB
 from modelopt.torch.quantization.nn.modules.quant_module import QuantModuleRegistry
 from .tensor_quantizer import ResidueTensorQuantizer
 from modelopt.torch.quantization.qtensor import NVFP4QTensor, MXFP4QTensor
-from .util import append_quant_residual_channels, swap_extension
+from .util import append_quant_residual_channels
 
 
 class ResidueQuantLinear(QuantLinearConvBase):
@@ -206,42 +206,23 @@ class ResidueQuantLinear(QuantLinearConvBase):
             raise RuntimeError("Salient indices not loaded. Call load_salient_indices() before input_extension().")
 
         if self.input_quantizer.block_sizes.get("scale_bits") == (8, 0):
-            if os.getenv("RESIDUE_SWAP", "0") == "1":
-                raise ValueError("MXFP4 runtime supports activation residue, not RESIDUE_SWAP")
             return self.input_quantizer.residue_extension(input, salient_indices)
 
         # Dynamic quantizer - compute amax from input
         amax = input.abs().max()
         weight_scaling_factor_2 = amax.float() / (448.0 * 6.0)
 
-        # Choose extension method based on RESIDUE_SWAP environment variable.
-        # The normal runtime path is fixed to activation-residue extension.
-        use_swap = os.getenv("RESIDUE_SWAP", "0") == "1"
-
         if os.getenv("RESIDUE_DEBUG", "0") == "1":
-            print(f"[{layer_name}] Using {'swap_extension' if use_swap else 'append_quant_residual_channels'} for input extension")
+            print(f"[{layer_name}] Using append_quant_residual_channels for input extension")
 
-        if use_swap:
-            extended_input = swap_extension(
-                input,
-                16,
-                weight_scaling_factor=None,
-                weight_scaling_factor_2=weight_scaling_factor_2,
-                salient_indices=salient_indices,
-                mode="residue",
-                quantizer=NVFP4QTensor, #TODO fixed to be nvfp4 qtensor for now
-            )
-        else:
-            extended_input = append_quant_residual_channels(
-                input,
-                16,
-                weight_scaling_factor=None,
-                weight_scaling_factor_2=weight_scaling_factor_2,
-                salient_indices=salient_indices,
-                quantizer=NVFP4QTensor, #TODO fixed to be nvfp4 qtensor for now
-            )
-
-        return extended_input
+        return append_quant_residual_channels(
+            input,
+            16,
+            weight_scaling_factor=None,
+            weight_scaling_factor_2=weight_scaling_factor_2,
+            salient_indices=salient_indices,
+            quantizer=NVFP4QTensor, #TODO fixed to be nvfp4 qtensor for now
+        )
 
 
 # Alias to mimic ModelOpt naming

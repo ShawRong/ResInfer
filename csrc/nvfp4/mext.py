@@ -62,10 +62,7 @@ def _resolve_mext_r1_elts_mode(elts_mode=None) -> int:
 
 def _resolve_mext_r1_layout_mode(layout_mode=None) -> int:
     if layout_mode is None:
-        layout_mode = os.getenv(
-            "RESIDUE_MEXT_R1_LAYOUT",
-            os.getenv("NVFP4_MEXT_R1_LAYOUT", "concat"),
-        )
+        layout_mode = os.getenv("RESIDUE_MEXT_R1_LAYOUT", "concat")
 
     if isinstance(layout_mode, str):
         normalized = layout_mode.strip().lower().replace("-", "_")
