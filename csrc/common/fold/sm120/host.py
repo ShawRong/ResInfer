@@ -108,6 +108,8 @@ def compile_fold_gemm_sm120(
         return _KERNEL_CACHE[key]
     if not compile_if_missing:
         return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Fold kernel is not prepared; run this shape eagerly before CUDA graph capture")
     import os as _os
     if _os.environ.get("NVFP4_FOLD_COMPILE_LOG", "0") == "1":
         print(f"[fold-compile] n_w={m} k={k} (dynamic m) "

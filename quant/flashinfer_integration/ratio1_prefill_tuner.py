@@ -60,16 +60,6 @@ def _run_kloop(inputs, tactic_idx):
                                     tile_shape_mnk=KLOOP_TILES[tactic_idx], m_tok_real=m)
 
 
-def precompile_kloop_sm100(out_dtype=torch.bfloat16):
-    return precompile(_CUSTOM_OP, _kernel,
-                      [((True, i, out_dtype), {}) for i in range(len(KLOOP_SM100_CFGS))])
-
-
-def precompile_kloop_sm120(n_w, k, out_dtype=torch.bfloat16):
-    return precompile(_CUSTOM_OP, _kernel,
-                      [((False, i, out_dtype, n_w, k), {}) for i in range(len(KLOOP_TILES))])
-
-
 def _kloop_valid_tactics(inputs, tuning):
     x, weight = inputs[:2]
     with torch.cuda.device(x.device):
@@ -85,3 +75,13 @@ def _kloop_valid_tactics(inputs, tuning):
                                                  compile_if_missing=False) is not None]
         except ImportError:
             return []
+
+
+def prepare_kloop(inputs):
+    """Prepare explicit k_loop mode on eager first use; failures retain two-GEMM."""
+    x, weight = inputs[:2]
+    n, k, a_ld = weight_geometry(weight)
+    sm10x = _is_sm10x()
+    return precompile(_CUSTOM_OP, _kernel, [
+        ((sm10x, i, x.dtype, n, k, a_ld), {})
+        for i in _kloop_valid_tactics(inputs, True)])

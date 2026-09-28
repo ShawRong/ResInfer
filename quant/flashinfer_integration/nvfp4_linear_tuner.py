@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import NamedTuple
 
+import torch
+
 from .linear_tuner import LinearSpec, tuned_linear
 
 _BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512,
@@ -57,21 +59,24 @@ def _fold_inputs(inputs, policy):
 
 
 def _valid(inputs, policy, tuning):
-    # Loading prepares candidates; a failed optional compile stays excluded.
+    # FlashInfer profiles candidates after eager warmup calls. vLLM also runs
+    # each graph size eagerly before capture, including when the FI cache hits.
+    # Let those calls load the chosen kernel; capture only uses resident ones.
+    allow_uncompiled = not torch.cuda.is_current_stream_capturing()
     route = _route(int(inputs[0].shape[0]), policy)
     if route == "sm10x_fold":
         if not policy.sm10x_tuner:
             return []
         from .sm10x_fold_tuner import valid_tactics
-        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, False)
+        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, allow_uncompiled)
     if route == "sm120_fold":
         if not policy.sm120_tuner:
             return []
         from .sm120_fold_tuner import valid_tactics
-        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, False)
+        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, allow_uncompiled)
     if route == "ratio1_prefill" and policy.prefill == "auto":
         from .ratio1_prefill_tuner import _kloop_valid_tactics
-        return _kloop_valid_tactics(_fold_inputs(inputs, policy), False)
+        return _kloop_valid_tactics(_fold_inputs(inputs, policy), allow_uncompiled)
     return []
 
 

@@ -7,15 +7,13 @@ from __future__ import annotations
 
 import torch
 
-from .fi_tuner_base import precompile, weight_geometry
+from .fi_tuner_base import weight_geometry
 
 
 FOLD_TILES = (
     (64, 64, 128), (64, 64, 256), (64, 128, 128),
     (128, 64, 128), (128, 64, 256), (128, 128, 128), (128, 128, 256),
 )
-
-_CUSTOM_OP = "residue_fold_tile_sm120"
 
 _LAST_SOURCE: list = [None]
 _LAST_TILE: list = [None]
@@ -72,16 +70,6 @@ def _table_tile(inputs) -> tuple[int, int, int]:
 def run_fold_table(inputs, out_dtype) -> torch.Tensor:
     """The untuned path: the offline-swept static table picks the tile."""
     return _run_fold_tile(inputs, _table_tile(inputs), out_dtype)
-
-
-def precompile_fold_tiles(n_w: int, k_logical: int, a_ld: int | None = None,
-                          out_dtype=torch.bfloat16) -> int:
-    """Prepare all legal candidate tiles for one weight geometry."""
-    from nvfp4.cute_fold_sm120.host import compile_fold_gemm_sm120
-
-    specs = [((n_w, k_logical, tile, out_dtype), {"a_ld": a_ld})
-             for tile in FOLD_TILES if k_logical % tile[2] == 0]
-    return precompile(_CUSTOM_OP, compile_fold_gemm_sm120, specs)
 
 
 def valid_tactics(inputs, out_dtype, tuning):

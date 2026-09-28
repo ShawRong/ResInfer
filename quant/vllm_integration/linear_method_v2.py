@@ -46,7 +46,6 @@ from .layout_utils import (
     prepare_decode_mext_weight_layout_from_raw_scale,
 )
 from .env_contract import settings
-from .linear_warmup import precompile_linear
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
 from .residue_tp import (
     SF_VEC_SIZE as SF_VEC_SIZE_FOR_TP,
@@ -193,7 +192,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         contract. AWQ pre_quant_scale must be folded during export and is not
         registered or applied at runtime.
         """
-        layer._residue_output_dtype = params_dtype
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
         _log_selected_kernel_once(self)
         extended_dim = self._get_extended_dim(layer_name)
@@ -437,7 +435,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 layer._decode_mext_layout_enabled = True
                 layer.weight_scale_base = layer.weight_scale
                 layer._mext_decode_k_base = int(layer.original_in_features)
-            precompile_linear(layer, ratio1=False)
         if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
             print(
                 "[residue:post_process_weights] "
@@ -516,7 +513,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # Full scale doubles as "base scale" for the op dispatcher — fold reads
         # the entire weight, so no separate prefix scale is needed.
         layer.weight_scale_base = layer.weight_scale
-        precompile_linear(layer, ratio1=True)
 
     def apply(
         self,

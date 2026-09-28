@@ -111,9 +111,12 @@ def _nvfp4_linear_impl(inputs, policy):
         if route == "ratio1_prefill":
             if policy.prefill == "k_loop":
                 from ..flashinfer_integration.ratio1_prefill_tuner import (
-                    _kloop_valid_tactics, _run_kloop,
+                    _kloop_valid_tactics, _run_kloop, prepare_kloop,
                 )
                 ready = _kloop_valid_tactics(args, False)
+                if not ready and not torch.cuda.is_current_stream_capturing():
+                    prepare_kloop(args)
+                    ready = _kloop_valid_tactics(args, False)
                 if ready:
                     return _run_kloop(args, ready[0])
             return _run_ratio1_prefill_two_gemm(*args, x.dtype)

@@ -128,6 +128,8 @@ def _compile_fold_gemm(
         return _KERNEL_CACHE[key]
     if not compile_if_missing:
         return None
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("Fold kernel is not prepared; run this shape eagerly before CUDA graph capture")
 
     cutlass, cute, make_ptr, get_max_active_clusters, kernel_classes = (
         _cutlass_modules()

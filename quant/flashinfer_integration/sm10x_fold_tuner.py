@@ -131,24 +131,6 @@ def _run_fallback(inputs, out_dtype) -> torch.Tensor:
         int(major), int(minor), weight, x_fp4, wsb, x_sf, alpha, out_dtype)
 
 
-def precompile_sm10x_families(out_dtype=torch.bfloat16) -> bool:
-    """Prepare the existing family and fallback kernels on the current device."""
-    from nvfp4.cute_fold.tactics import warmup_fold_default, warmup_specs
-
-    major, minor = torch.cuda.get_device_capability()
-    torch.zeros(1, device="cuda")
-    try:
-        families = _families()
-        expected = len(warmup_specs(_arch(), families=families))
-        compiled = warmup_fold_default(
-            int(major), int(minor), families=families, out_dtype=out_dtype)
-        return compiled == expected
-    except Exception as e:                                # noqa: BLE001
-        print(f"[residue] sm10x fold tuner precompile failed: "
-              f"{type(e).__name__}: {str(e)[:70]}", flush=True)
-    return False
-
-
 def valid_tactics(inputs, out_dtype, tuning):
     legal = _legal_indices(int(inputs[0].shape[0]))
     if tuning:
