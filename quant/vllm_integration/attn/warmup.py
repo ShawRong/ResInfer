@@ -50,7 +50,12 @@ class _DecodeWarmupProvider:
         if host is None or not torch.cuda.is_available():
             return []
         device = torch.device("cuda", torch.cuda.current_device())
+        from quant.flashinfer_integration.resattn_tuner import (
+            precompile_resattn_variant, tuner_enabled,
+        )
+        tune = tuner_enabled()
         units = []
+        seen = set()
         for (hq, hkv, d), (
             mml,
             mns,
@@ -76,14 +81,32 @@ class _DecodeWarmupProvider:
                     device,
                     residue_fold=qk_residue,
                 )
+            if tune:
+                from nvfp4.cute_attn.plan import decode_plan_candidates
+
+                tile = (host._residue_padded_group_size(hq, hkv) if qk_residue
+                        else host._padded_group_size(hq, hkv))
+                for packed in ((False, True) if fuse_attn_quant else (False,)):
+                    for candidate in decode_plan_candidates(
+                        mml, output_nvfp4=packed, grouped_head_tile=tile,
+                        residue_fold=qk_residue,
+                    ):
+                        spec = host.decode_compile_spec(
+                            hq, hkv, d, candidate, output_nvfp4=packed,
+                            residue_fold=qk_residue,
+                        )
+                        plans.append(dict(spec, label=f"tuner {candidate} nvfp4={packed}"))
             for plan in plans:
+                key = ("resattn_decode", plan["args"],
+                       tuple(sorted(plan["kwargs"].items())))
+                if key in seen:
+                    continue
+                seen.add(key)
                 units.append(CuTeDSLCompileUnit(
                     name=f"resattn_decode[{plan['label']}]",
-                    key=("resattn_decode", plan["args"],
-                         tuple(sorted(plan["kwargs"].items()))),
-                    compile=functools.partial(
-                        host.compile_decode_variant, plan
-                    ),
+                    key=key,
+                    compile=(functools.partial(precompile_resattn_variant, plan, device)
+                             if tune else functools.partial(host.compile_decode_variant, plan)),
                 ))
         return units
 
@@ -126,3 +149,15 @@ def _register_decode_warmup(num_qo_heads: int, num_kv_heads: int,
         fuse_attn_quant,
     )
     register_cutedsl_warmup_provider(_DECODE_WARMUP_PROVIDER)
+    from quant.flashinfer_integration.resattn_tuner import tuner_enabled
+
+    if tuner_enabled():
+        if cfg is not None and cfg.use_v2_model_runner:
+            raise NotImplementedError(
+                "ResAttn startup tuning currently requires VLLM_USE_V2_MODEL_RUNNER=0"
+            )
+        if cfg is not None and cfg.kernel_config.enable_flashinfer_autotune is False:
+            raise ValueError("RESIDUE_ATTN_TUNER=1 requires FlashInfer autotune at startup")
+        from .tuning import install_resattn_autotune_warmup
+
+        install_resattn_autotune_warmup()
