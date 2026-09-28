@@ -33,18 +33,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
 )
 from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
 
-try:
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        swizzle_blockscale,
-    )
-except ImportError:
-    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-        swizzle_blockscale,
-    )
-
-from .layout_utils import (
-    prepare_decode_mext_weight_layout_from_raw_scale,
-)
+from .util import prepare_decode_mext_scale, swizzle_blockscale
 from .env_contract import settings
 from .metadata import get_extended_dim, get_layer_metadata
 from .residue_tp import (
@@ -344,7 +333,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                         residue metadata setup. For cutlass + decode_mext_enabled
                         residue layers, snapshot the raw FP8 weight scale BEFORE
                         super-swizzle, then build the base-K prefix layout via
-                        `prepare_decode_mext_weight_layout_from_raw_scale`.
+                        `prepare_decode_mext_scale`.
         """
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
         runtime_mode = self._get_runtime_mode(layer_name)
@@ -430,7 +419,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             ):
                 # Residue layer: K-ext weight; weight_scale_base = first k_base
                 # groups of the extended scale (swizzled by prep helper).
-                prepare_decode_mext_weight_layout_from_raw_scale(
+                prepare_decode_mext_scale(
                     layer,
                     raw_weight_scale_ext,
                 )
