@@ -7,6 +7,7 @@ own warmup and must prepare the fallback before CUDA graph capture.
 from __future__ import annotations
 
 from typing import Callable, Sequence
+import warnings
 
 import torch
 
@@ -51,8 +52,9 @@ def precompile(op_name, compiler, specs):
             compiler(*args, **kwargs)
             done += 1
         except Exception as exc:
-            print(f"[residue] {op_name} precompile failed {args} {kwargs}: "
-                  f"{type(exc).__name__}: {str(exc)[:160]}", flush=True)
+            warnings.warn(
+                f"[residue] {op_name} precompile failed {args} {kwargs}: "
+                f"{type(exc).__name__}: {str(exc)[:160]}", RuntimeWarning)
     return done
 
 

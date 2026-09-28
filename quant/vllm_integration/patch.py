@@ -142,78 +142,6 @@ def _install_shared_autotune_cache() -> None:
           "documents concurrent writes as best-effort.", flush=True)
 
 
-def _install_sm120_cutedsl_fold_warmup() -> None:
-    'Pre-compile the SM120 CuTeDSL fold BEFORE cudagraph capture.'
-    try:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-    except Exception as e:                                # noqa: BLE001
-        print(f"[residue] sm120 fold warmup hook unavailable: {e}", flush=True)
-        return
-    if getattr(GPUModelRunner, "_residue_sm120_warmup_installed", False):
-        return
-    _orig_capture = GPUModelRunner.capture_model
-
-    def _capture_with_warmup(self, *args, **kwargs):
-        # Belt and braces only: the real pre-compile happens in
-        # register_sm120_fold_shape at PWAL, because this hook is NOT reliably
-        # reached (vLLM also captures from profile_cudagraph_memory). Anything
-        # PWAL already compiled is an lru_cache hit here, so this costs nothing
-        # when it does run and covers a shape PWAL somehow missed when it does.
-        try:
-            from .residue_linear_op import (_FOLD_MAX_M,
-                                            warmup_sm120_cutedsl_fold)
-
-            sizes = getattr(self.vllm_config.compilation_config,
-                            "cudagraph_capture_sizes", None) or []
-            fold_sizes = sorted({int(m) for m in sizes if int(m) <= _FOLD_MAX_M})
-            # Capture sizes are the graph shapes; the fold also runs eagerly at
-            # other M below the threshold, so cover the powers of two too.
-            fold_sizes = sorted(set(fold_sizes) | {
-                m for m in (1, 2, 4, 8, 16, 32, 64, 128) if m <= _FOLD_MAX_M})
-            if fold_sizes:
-                warmup_sm120_cutedsl_fold(fold_sizes)
-        except Exception as e:                            # noqa: BLE001
-            print(f"[residue] sm120 fold warmup skipped: "
-                  f"{type(e).__name__}: {str(e)[:90]}", flush=True)
-
-        # sm10x: shape-independent, so it needs no registration -- one call
-        # covers the whole space. Nothing did this before, which is why
-        # B200/B300 compiled the fold on first use. Cheap (a handful of
-        # kernels at ~1.3 s) and it removes the entire cold-start category.
-        try:
-            import torch
-
-            major, minor = torch.cuda.get_device_capability()
-            if major != 12:
-                from nvfp4.fold import warmup as _fold_warmup
-
-                n = _fold_warmup(int(major), int(minor))
-                if n:
-                    print(f"[residue] sm10x fold pre-compiled: {n} kernels",
-                          flush=True)
-        except Exception as e:                            # noqa: BLE001
-            print(f"[residue] sm10x fold warmup skipped: "
-                  f"{type(e).__name__}: {str(e)[:90]}", flush=True)
-
-        # OBSERVATION covers both arches. A clean capture prints nothing; if
-        # either warmup above under-covered, this names the keys it missed.
-        # Guard ONLY the import. Putting _orig_capture inside the try would
-        # re-run capture if vLLM itself raised ImportError somewhere in it.
-        try:
-            from nvfp4.fold import observe_compiles
-
-            ctx = observe_compiles("cudagraph capture")
-        except Exception:                                 # noqa: BLE001
-            import contextlib
-
-            ctx = contextlib.nullcontext()
-        with ctx:
-            return _orig_capture(self, *args, **kwargs)
-
-    GPUModelRunner.capture_model = _capture_with_warmup
-    GPUModelRunner._residue_sm120_warmup_installed = True
-
-
 def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> bool:
     """Replace ModelOptNvFp4Config.LinearMethodCls with a residue method.
 
@@ -326,10 +254,6 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
                 print(f"[residue] Added {target_cls.__name__} to WEIGHT_LOADER_V2_SUPPORTED")
         except (ImportError, AttributeError) as e:
             print(f"[residue] Warning: Could not patch WEIGHT_LOADER_V2_SUPPORTED: {e}")
-
-        # Same reasoning, already applied here: extended_k checkpoints take the
-        # fold too (via --enable_decode_mext) and need the same pre-compile.
-        _install_sm120_cutedsl_fold_warmup()
 
         # Must run BEFORE kernel_warmup resolves the cache path. Self-gated on
         # RESIDUE_SHARE_AUTOTUNE_CACHE=1 and a no-op otherwise.

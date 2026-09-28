@@ -44,8 +44,8 @@ except ImportError:
 
 from .layout_utils import (
     prepare_decode_mext_weight_layout_from_raw_scale,
-    register_fold_shape_for,
 )
+from .linear_warmup import precompile_linear
 from .linear_debug import maybe_tap_tensor
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
 from .residue_tp import (
@@ -246,6 +246,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         contract. AWQ pre_quant_scale must be folded during export and is not
         registered or applied at runtime.
         """
+        layer._residue_output_dtype = params_dtype
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
         _log_selected_kernel_once(self)
         extended_dim = self._get_extended_dim(layer_name)
@@ -489,7 +490,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 layer._decode_mext_layout_enabled = True
                 layer.weight_scale_base = layer.weight_scale
                 layer._mext_decode_k_base = int(layer.original_in_features)
-                register_fold_shape_for(layer, is_mext_r1=False, context="plain_nvfp4")
+            precompile_linear(layer, ratio1=False)
         if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
             print(
                 "[residue:post_process_weights] "
@@ -540,13 +541,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         layer.original_in_features = original_in
         # Full K is the only K — fold reads the entire weight, no prefix slice.
         layer._mext_decode_k_base = int(original_in)
-        # Register AFTER _mext_decode_k_base is set: the registrar reads it and
-        # silently returns on 0. Registering ten lines earlier meant NO mext_r1
-        # layer was ever recorded, which starved both the sm120 pre-compile and
-        # the sm10x tuning-bucket ladder -- found live by the sm100 e2e warmup
-        # audit (registry empty, tune_sizes=[128], prefill on the static table).
-        register_fold_shape_for(layer, is_mext_r1=True, context="mext_r1")
-
         input_global_scale = layer.input_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(input_global_scale, requires_grad=False)
         del layer.input_scale
@@ -575,7 +569,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # Full scale doubles as "base scale" for the op dispatcher — fold reads
         # the entire weight, so no separate prefix scale is needed.
         layer.weight_scale_base = layer.weight_scale
-
+        precompile_linear(layer, ratio1=True)
 
     def apply(
         self,

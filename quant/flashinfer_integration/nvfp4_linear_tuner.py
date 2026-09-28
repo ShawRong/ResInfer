@@ -71,20 +71,21 @@ def _fold_inputs(inputs, policy):
 
 
 def _valid(inputs, policy, tuning):
+    # Loading prepares candidates; a failed optional compile stays excluded.
     route = _route(int(inputs[0].shape[0]), policy)
     if route == "sm10x_fold":
         if not policy.sm10x_tuner:
             return []
         from .sm10x_fold_tuner import valid_tactics
-        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, tuning)
+        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, False)
     if route == "sm120_fold":
         if not policy.sm120_tuner:
             return []
         from .sm120_fold_tuner import valid_tactics
-        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, tuning)
+        return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, False)
     if route == "ratio1_prefill" and policy.prefill == "auto":
         from .ratio1_prefill_tuner import _kloop_valid_tactics
-        return _kloop_valid_tactics(_fold_inputs(inputs, policy), tuning)
+        return _kloop_valid_tactics(_fold_inputs(inputs, policy), False)
     return []
 
 
