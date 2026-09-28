@@ -201,7 +201,7 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
 
                     tensor = interleave_extended_for_tp(
                         tensor, shard_plan,
-                        scale=2 if name == "weight" else 32,
+                        channels_per_element=2 if name == "weight" else 32,
                     )
                 loader(param, tensor, *args, **kwargs)
                 shard = args[0] if args else kwargs.get("loaded_shard_id")

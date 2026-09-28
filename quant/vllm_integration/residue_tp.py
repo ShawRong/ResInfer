@@ -1,6 +1,17 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-'Tensor-parallel sharding for packed FP4 residue K-extensions.'
+"""Load-time TP sharding of NVFP4 extended-K and MXFP4 selective weights.
+
+A row-parallel rank needs both its base columns and matching residue columns.
+For TP2, reorder the checkpoint before vLLM's ordinary contiguous slicing:
+
+    [base_0 | base_1 | salient_0 | salient_1]
+    [base_0 | salient_0 | base_1 | salient_1]
+
+Weights and scales follow the same ordering. Each MXFP4 rank gets its own
+trailing padding. Column-parallel layers keep all input columns; ratio-1
+weights have no K extension and use vLLM's normal sharding.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -30,8 +41,14 @@ class ResidueTPError(ValueError):
 class ResidueShardPlan:
     """How to cut one extended tensor for one rank.
 
-    Attributes are in *logical channels*; helpers convert to packed-FP4 and
-    scale-factor coordinates.
+    Widths are logical channels; range helpers convert to storage elements.
+
+    Format      scale_vec_size  scale_swizzle_blocks  k_alignment
+    NVFP4       16              4                     1 (no extra padding)
+    MXFP4       32              1 (raw scales)        128
+
+    Packed weights store two channels per byte in either format. Both use
+    the existing 128-channel residue scale boundary check.
     """
 
     k_base: int
@@ -120,34 +137,38 @@ class ResidueShardPlan:
 
     # -- range helpers ----------------------------------------------------
 
-    def ranges(self, scale: int = 1) -> tuple[tuple[int, int], tuple[int, int]]:
-        """(base, salient) ranges as (offset, length), divided by `scale`.
+    def ranges(
+        self, channels_per_element: int = 1,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Return base and salient (offset, length) in storage elements.
 
-        `scale` = 1 for logical channels, 2 for packed FP4 (two nibbles per
-        byte), or `scale_vec_size` for block scales.
+        Use one channel per element for logical indices, two for packed FP4,
+        or `scale_vec_size` for block scales.
         """
-        if scale <= 0:
-            raise ResidueTPError("scale must be positive")
+        if channels_per_element <= 0:
+            raise ResidueTPError("channels_per_element must be positive")
         for name, v in (("k_base", self.k_base),
                         ("base_shard", self.base_shard),
                         ("salient_shard", self.salient_shard)):
-            if v % scale:
+            if v % channels_per_element:
                 raise ResidueTPError(
-                    f"{name}={v} not divisible by scale={scale}"
+                    f"{name}={v} not divisible by channels_per_element={channels_per_element}"
                 )
-        base = (self.tp_rank * self.base_shard // scale, self.base_shard // scale)
-        sal = ((self.k_base + self.tp_rank * self.salient_shard) // scale,
-               self.salient_shard // scale)
+        base = (self.tp_rank * self.base_shard // channels_per_element,
+                self.base_shard // channels_per_element)
+        sal = ((self.k_base + self.tp_rank * self.salient_shard) // channels_per_element,
+               self.salient_shard // channels_per_element)
         return base, sal
 
-    def gather(self, full: torch.Tensor, scale: int = 1,
+    def gather(self, full: torch.Tensor, channels_per_element: int = 1,
                dim: int = -1) -> torch.Tensor:
-        """Assemble this rank's shard from the two ranges."""
-        (b_off, b_len), (s_off, s_len) = self.ranges(scale)
+        """Slice and concatenate locally; this is not a distributed collective."""
+        (b_off, b_len), (s_off, s_len) = self.ranges(channels_per_element)
         want = full.shape[dim]
-        if self.k_padded % scale or self.k_shard_padded % scale:
-            raise ResidueTPError("padded K is not divisible by scale")
-        need = self.k_padded // scale
+        if (self.k_padded % channels_per_element
+                or self.k_shard_padded % channels_per_element):
+            raise ResidueTPError("padded K is not divisible by channels_per_element")
+        need = self.k_padded // channels_per_element
         if want != need:
             raise ResidueTPError(
                 f"expected extended dim {need} along dim {dim}, got {want}"
@@ -156,7 +177,7 @@ class ResidueShardPlan:
             [full.narrow(dim, b_off, b_len), full.narrow(dim, s_off, s_len)],
             dim=dim,
         )
-        pad = (self.k_shard_padded - self.k_ext_shard) // scale
+        pad = (self.k_shard_padded - self.k_ext_shard) // channels_per_element
         if pad:
             # FP4 zero has packed code 0; E8M0 code 0 is the producer's
             # zero-block scale. Input checkpoint padding is discarded.
@@ -166,16 +187,6 @@ class ResidueShardPlan:
         return result
 
     # -- runtime state ----------------------------------------------------
-
-    def local_channel_mask(self, full_mask: torch.Tensor) -> torch.Tensor:
-        """This rank's slice of the per-8-channel salient bitmask."""
-        if full_mask.numel() != self.k_base // SALIENT_BLOCK:
-            raise ResidueTPError(
-                f"channel_mask has {full_mask.numel()} bytes, expected "
-                f"{self.k_base // SALIENT_BLOCK} for K_base={self.k_base}"
-            )
-        per = self.base_shard // SALIENT_BLOCK
-        return full_mask.narrow(0, self.tp_rank * per, per).contiguous()
 
     def local_salient_indices(self, full_indices: torch.Tensor) -> torch.Tensor:
         """This rank's salient indices, rebased to rank-local channels.
@@ -202,8 +213,10 @@ class ResidueShardPlan:
         return mine - lo
 
 
-def interleave_extended_for_tp(full: torch.Tensor, plan: ResidueShardPlan,
-                               scale: int = 1, dim: int = -1) -> torch.Tensor:
+def interleave_extended_for_tp(
+    full: torch.Tensor, plan: ResidueShardPlan,
+    channels_per_element: int = 1, dim: int = -1,
+) -> torch.Tensor:
     """Reorder ``[base | salient]`` into ``[base_0 | sal_0 | base_1 | ...]``.
 
     This avoids replacing vLLM's weight loader. After the permutation, rank
@@ -222,7 +235,8 @@ def interleave_extended_for_tp(full: torch.Tensor, plan: ResidueShardPlan,
     pieces = []
     for r in range(tp):
         r_plan = replace(plan, tp_rank=r)
-        pieces.append(r_plan.gather(full, scale=scale, dim=dim))
+        pieces.append(r_plan.gather(
+            full, channels_per_element=channels_per_element, dim=dim))
     return torch.cat(pieces, dim=dim).contiguous()
 
 
@@ -276,10 +290,7 @@ def plan_from_partition(
 
 
 def current_tp_rank() -> int:
-    """vLLM's TP rank, or 0 outside a distributed run."""
-    try:
-        from vllm.distributed import get_tensor_model_parallel_rank
+    """Query vLLM only when input sharding requires an initialized TP group."""
+    from vllm.distributed import get_tensor_model_parallel_rank
 
-        return get_tensor_model_parallel_rank()
-    except Exception:
-        return 0
+    return get_tensor_model_parallel_rank()

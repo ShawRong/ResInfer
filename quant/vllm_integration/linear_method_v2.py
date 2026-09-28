@@ -185,7 +185,8 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 input_size_per_partition=input_size_per_partition,
                 input_size=input_size,
                 num_salient=num_salient_meta,
-                tp_rank=current_tp_rank(),
+                tp_rank=(current_tp_rank()
+                         if input_size_per_partition < input_size else 0),
             )
 
         if extended_dim is not None:
@@ -234,13 +235,13 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
 
         `weight` is packed FP4 (two nibbles per byte, so K_ext/2 columns) and
         `weight_scale` holds one scale per 16 channels -- hence the differing
-        `scale` factors. Anything whose last dim is not an extended width is
+        channels-per-element counts. Anything whose last dim is not an extended width is
         left alone: it is not a K-extended tensor.
         """
         from .residue_tp import interleave_extended_for_tp
 
         targets = (("weight", 2), ("weight_scale", SF_VEC_SIZE_FOR_TP))
-        for name, scale in targets:
+        for name, channels_per_element in targets:
             param = getattr(layer, name, None)
             if param is None:
                 continue
@@ -248,20 +249,21 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             if orig is None:
                 continue
 
-            def make(orig_loader, col_scale):
+            def make(orig_loader, channels_per_element):
                 def loader(param_, loaded_weight, *args, **kwargs):
-                    expected = shard_plan.k_ext // col_scale
+                    expected = shard_plan.k_ext // channels_per_element
                     fired = loaded_weight.shape[-1] == expected
                     if fired:
                         loaded_weight = interleave_extended_for_tp(
-                            loaded_weight, shard_plan, scale=col_scale
+                            loaded_weight, shard_plan,
+                            channels_per_element=channels_per_element
                         )
                     diagnostics.log_tp_load(layer, loaded_weight, param_, expected, fired)
                     return orig_loader(param_, loaded_weight, *args, **kwargs)
 
                 return loader
 
-            param.weight_loader = make(orig, scale)
+            param.weight_loader = make(orig, channels_per_element)
 
     def _get_extended_dim(self, layer_name: str) -> int | None:
         """Look up the extended K for a residue layer.
