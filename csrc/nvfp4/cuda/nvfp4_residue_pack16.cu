@@ -18,10 +18,11 @@
  * to the pack8 family -- only the thread mapping changes. Kept in a separate
  * file mirroring nvfp4_residue_pack8.cu so the two families stay comparable.
  *
- * Assumes: exactly RESIDUE_PER_8_ELTS mask bits per channel byte, full warps
- * (launcher rounds block size to 32), and numTotalCols % 16 == 0 so the
+ * Assumes: exactly RESIDUE_PER_8_ELTS mask bits per channel byte and
+ * numTotalCols % 16 == 0 so the
  * 64-bit main-data stores stay aligned (the dispatcher falls back to pack8
- * otherwise).
+ * otherwise). Tail lanes stay active with zero inputs for warp collectives,
+ * but only valid columns and residue chunks may write output.
  */
 
 #include <torch/all.h>
@@ -52,7 +53,7 @@ __device__ __forceinline__ float pick_residue_value(
 // element-ordered consecutive uint32s the pack8 helpers emit; an elt16 warp
 // spans two pack8 warp sections, i.e. CHUNKS_PER_WARP = 32 * R2 / 8 chunks
 // starting at warpId * CHUNKS_PER_WARP. R2 = residues per thread.
-template <int R2>
+template <int R2, bool HAS_TAIL>
 __device__ __forceinline__ uint32_t* residue_data_offset(
     int rowIdx, int colIdx, int numMainCols, int numTotalCols,
     uint32_t* out) {
@@ -67,7 +68,13 @@ __device__ __forceinline__ uint32_t* residue_data_offset(
     int warpId = colIdx / 32;
     int laneId = colIdx % 32;
     if (laneId >= CHUNKS_PER_WARP) return nullptr;
-    return out + rowBase + warpId * CHUNKS_PER_WARP + laneId;
+    int chunkIdx = warpId * CHUNKS_PER_WARP + laneId;
+    if constexpr (HAS_TAIL) {
+      if (chunkIdx >= (numTotalCols - numMainCols) / CVT_FP4_ELTS_PER_UINT32) {
+        return nullptr;
+      }
+    }
+    return out + rowBase + chunkIdx;
   }
 }
 
@@ -143,7 +150,7 @@ __device__ __forceinline__ u32x2 main_quant16(
 }  // namespace pack16
 
 // ── r0125: 2 residues/thread, 8-thread SF groups, 4 source lanes/chunk ──────
-template <class Type, bool UE8M0_SF = false>
+template <class Type, bool UE8M0_SF, bool HAS_TAIL>
 __global__ void __launch_bounds__(512, 2)
     cvt_fp16_to_fp4_residue_pack16_r0125_no_swap(
         int32_t numRows, int32_t numTotalCols, int32_t numMainCols,
@@ -154,27 +161,30 @@ __global__ void __launch_bounds__(512, 2)
   int32_t effectiveRows = computeEffectiveRows(numRows);
 
   int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
-  if (colIdx >= numMainCols / 16) {
-    return;
+  // Complete-warp widths keep the original fast path. For tail widths,
+  // every lane must stay active for SF reductions and residue gathers.
+  if constexpr (!HAS_TAIL) {
+    if (colIdx >= numMainCols / 16) return;
   }
-  uint8_t mask0 = channelIndices[colIdx * 2];
-  uint8_t mask1 = channelIndices[colIdx * 2 + 1];
+  bool validCol = !HAS_TAIL || colIdx < numMainCols / 16;
+  uint8_t mask0 = validCol ? channelIndices[colIdx * 2] : 0x01;
+  uint8_t mask1 = validCol ? channelIndices[colIdx * 2 + 1] : 0x01;
   int laneId = threadIdx.x % 32;
 
   for (int rowIdx = blockIdx.x; rowIdx < effectiveRows; rowIdx += gridDim.x) {
     bool validRow = rowIdx < numRows;
     PackedVec<Type> loVec{};
     PackedVec<Type> hiVec{};
-    if (validRow) {
+    if (validRow && validCol) {
       load_packed_vec16(
           in + static_cast<int64_t>(rowIdx) * numMainCols + colIdx * 16,
           loVec, hiVec);
     }
 
-    auto sfOut = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
-        rowIdx, colIdx, numTotalCols, SFout);
-    auto residueSFOut = pack16::residue_sf_offset<uint8_t, 2>(
-        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart);
+    auto sfOut = validCol ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
+        rowIdx, colIdx, numTotalCols, SFout) : nullptr;
+    auto residueSFOut = validCol ? pack16::residue_sf_offset<uint8_t, 2>(
+        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart) : nullptr;
 
     float2 loResidue[4];
     float2 hiResidue[4];
@@ -206,13 +216,13 @@ __global__ void __launch_bounds__(512, 2)
                       __shfl_sync(uint32_t(-1), rv1, sourceThread));
     }
 
-    if (validRow) {
+    if (validRow && validCol) {
       int64_t outOffset = static_cast<int64_t>(rowIdx) *
                               (numTotalCols / CVT_FP4_ELTS_PER_UINT32) +
                           colIdx * 2;
       *reinterpret_cast<uint2*>(out + outOffset) =
           make_uint2(packed.lo, packed.hi);
-      uint32_t* residueDataOut = pack16::residue_data_offset<2>(
+      uint32_t* residueDataOut = pack16::residue_data_offset<2, HAS_TAIL>(
           rowIdx, colIdx, numMainCols, numTotalCols, out);
       if (residueDataOut) {
         *residueDataOut = fp32_vec_to_e2m1(residueChunk);
@@ -222,7 +232,7 @@ __global__ void __launch_bounds__(512, 2)
 }
 
 // ── r025: 4 residues/thread, 4-thread SF groups, 2 source lanes/chunk ───────
-template <class Type, bool UE8M0_SF = false>
+template <class Type, bool UE8M0_SF, bool HAS_TAIL>
 __global__ void __launch_bounds__(512, 2)
     cvt_fp16_to_fp4_residue_pack16_r025_no_swap(
         int32_t numRows, int32_t numTotalCols, int32_t numMainCols,
@@ -233,27 +243,30 @@ __global__ void __launch_bounds__(512, 2)
   int32_t effectiveRows = computeEffectiveRows(numRows);
 
   int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
-  if (colIdx >= numMainCols / 16) {
-    return;
+  // Complete-warp widths keep the original fast path. For tail widths,
+  // every lane must stay active for SF reductions and residue gathers.
+  if constexpr (!HAS_TAIL) {
+    if (colIdx >= numMainCols / 16) return;
   }
-  uint8_t mask0 = channelIndices[colIdx * 2];
-  uint8_t mask1 = channelIndices[colIdx * 2 + 1];
+  bool validCol = !HAS_TAIL || colIdx < numMainCols / 16;
+  uint8_t mask0 = validCol ? channelIndices[colIdx * 2] : 0x03;
+  uint8_t mask1 = validCol ? channelIndices[colIdx * 2 + 1] : 0x03;
   int laneId = threadIdx.x % 32;
 
   for (int rowIdx = blockIdx.x; rowIdx < effectiveRows; rowIdx += gridDim.x) {
     bool validRow = rowIdx < numRows;
     PackedVec<Type> loVec{};
     PackedVec<Type> hiVec{};
-    if (validRow) {
+    if (validRow && validCol) {
       load_packed_vec16(
           in + static_cast<int64_t>(rowIdx) * numMainCols + colIdx * 16,
           loVec, hiVec);
     }
 
-    auto sfOut = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
-        rowIdx, colIdx, numTotalCols, SFout);
-    auto residueSFOut = pack16::residue_sf_offset<uint8_t, 4>(
-        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart);
+    auto sfOut = validCol ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
+        rowIdx, colIdx, numTotalCols, SFout) : nullptr;
+    auto residueSFOut = validCol ? pack16::residue_sf_offset<uint8_t, 4>(
+        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart) : nullptr;
 
     float2 loResidue[4];
     float2 hiResidue[4];
@@ -298,13 +311,13 @@ __global__ void __launch_bounds__(512, 2)
         make_float2(__shfl_sync(uint32_t(-1), rv2, writerGroup * 2 + 1),
                     __shfl_sync(uint32_t(-1), rv3, writerGroup * 2 + 1));
 
-    if (validRow) {
+    if (validRow && validCol) {
       int64_t outOffset = static_cast<int64_t>(rowIdx) *
                               (numTotalCols / CVT_FP4_ELTS_PER_UINT32) +
                           colIdx * 2;
       *reinterpret_cast<uint2*>(out + outOffset) =
           make_uint2(packed.lo, packed.hi);
-      uint32_t* residueDataOut = pack16::residue_data_offset<4>(
+      uint32_t* residueDataOut = pack16::residue_data_offset<4, HAS_TAIL>(
           rowIdx, colIdx, numMainCols, numTotalCols, out);
       if (residueDataOut) {
         *residueDataOut = fp32_vec_to_e2m1(residueChunk);
@@ -315,7 +328,7 @@ __global__ void __launch_bounds__(512, 2)
 
 // ── r050: 8 residues/thread = exactly one chunk, 2-thread SF groups, no
 // data gather at all ────────────────────────────────────────────────────────
-template <class Type, bool UE8M0_SF = false>
+template <class Type, bool UE8M0_SF, bool HAS_TAIL>
 __global__ void __launch_bounds__(512, 2)
     cvt_fp16_to_fp4_residue_pack16_r050_no_swap(
         int32_t numRows, int32_t numTotalCols, int32_t numMainCols,
@@ -326,27 +339,30 @@ __global__ void __launch_bounds__(512, 2)
   int32_t effectiveRows = computeEffectiveRows(numRows);
 
   int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
-  if (colIdx >= numMainCols / 16) {
-    return;
+  // Complete-warp widths keep the original fast path. For tail widths,
+  // every lane must stay active for SF reductions and residue gathers.
+  if constexpr (!HAS_TAIL) {
+    if (colIdx >= numMainCols / 16) return;
   }
-  uint8_t mask0 = channelIndices[colIdx * 2];
-  uint8_t mask1 = channelIndices[colIdx * 2 + 1];
+  bool validCol = !HAS_TAIL || colIdx < numMainCols / 16;
+  uint8_t mask0 = validCol ? channelIndices[colIdx * 2] : 0x0f;
+  uint8_t mask1 = validCol ? channelIndices[colIdx * 2 + 1] : 0x0f;
   int laneId = threadIdx.x % 32;
 
   for (int rowIdx = blockIdx.x; rowIdx < effectiveRows; rowIdx += gridDim.x) {
     bool validRow = rowIdx < numRows;
     PackedVec<Type> loVec{};
     PackedVec<Type> hiVec{};
-    if (validRow) {
+    if (validRow && validCol) {
       load_packed_vec16(
           in + static_cast<int64_t>(rowIdx) * numMainCols + colIdx * 16,
           loVec, hiVec);
     }
 
-    auto sfOut = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
-        rowIdx, colIdx, numTotalCols, SFout);
-    auto residueSFOut = pack16::residue_sf_offset<uint8_t, 8>(
-        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart);
+    auto sfOut = validCol ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 1>(
+        rowIdx, colIdx, numTotalCols, SFout) : nullptr;
+    auto residueSFOut = validCol ? pack16::residue_sf_offset<uint8_t, 8>(
+        rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart) : nullptr;
 
     float2 loResidue[4];
     float2 hiResidue[4];
@@ -397,13 +413,13 @@ __global__ void __launch_bounds__(512, 2)
     residueChunk[3] =
         make_float2(rv6 * residueOutputScale, rv7 * residueOutputScale);
 
-    if (validRow) {
+    if (validRow && validCol) {
       int64_t outOffset = static_cast<int64_t>(rowIdx) *
                               (numTotalCols / CVT_FP4_ELTS_PER_UINT32) +
                           colIdx * 2;
       *reinterpret_cast<uint2*>(out + outOffset) =
           make_uint2(packed.lo, packed.hi);
-      uint32_t* residueDataOut = pack16::residue_data_offset<8>(
+      uint32_t* residueDataOut = pack16::residue_data_offset<8, HAS_TAIL>(
           rowIdx, colIdx, numMainCols, numTotalCols, out);
       *residueDataOut = fp32_vec_to_e2m1(residueChunk);
     }
@@ -431,15 +447,23 @@ static void pack16_launch_config(int m, int n, int multiProcessorCount,
             cudaStream_t stream) {                                            \
     dim3 grid, block;                                                         \
     pack16_launch_config(m, n, multiProcessorCount, grid, block);             \
-    if (useUE8M0) {                                                           \
-      KERNEL<T, true><<<grid, block, 0, stream>>>(                            \
-          m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output),   \
-          reinterpret_cast<uint32_t*>(SFOuput), channelIndices);              \
-    } else {                                                                  \
-      KERNEL<T, false><<<grid, block, 0, stream>>>(                           \
-          m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output),   \
-          reinterpret_cast<uint32_t*>(SFOuput), channelIndices);              \
-    }                                                                         \
+    auto launch = [&](auto tail) {                                           \
+      constexpr bool HAS_TAIL = decltype(tail)::value;                         \
+      if (useUE8M0) {                                                         \
+        KERNEL<T, true, HAS_TAIL><<<grid, block, 0, stream>>>(                  \
+            m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output), \
+            reinterpret_cast<uint32_t*>(SFOuput), channelIndices);            \
+      } else {                                                               \
+        KERNEL<T, false, HAS_TAIL><<<grid, block, 0, stream>>>(                 \
+            m, n_ext, n, input, SFScale, reinterpret_cast<uint32_t*>(output), \
+            reinterpret_cast<uint32_t*>(SFOuput), channelIndices);            \
+      }                                                                      \
+    };                                                                       \
+    if (n % (32 * 16) == 0) {                                                 \
+      launch(std::false_type{});                                             \
+    } else {                                                                 \
+      launch(std::true_type{});                                              \
+    }                                                                        \
   }
 
 PACK16_LAUNCHER(invokeFP4QuantizationPack16R0125NoSwap,
@@ -460,6 +484,8 @@ void pack16_entry_common_checks(torch::Tensor const& input, int64_t n_ext,
                                 int64_t expected_residue_per_8) {
   int32_t n = input.size(1);
   TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
+  TORCH_CHECK(n_ext == static_cast<int64_t>(n) + n / 8 * expected_residue_per_8,
+              "pack16 extended K must match the input K and residue ratio.");
   TORCH_CHECK(n_ext % 16 == 0,
               "pack16 residue path requires the extended K to be a multiple "
               "of 16 (64-bit store alignment); use the pack8 path otherwise.");

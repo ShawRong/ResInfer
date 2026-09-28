@@ -95,16 +95,19 @@ int resolve_residue_elts_mode() {
   return mode;
 }
 
-bool device_is_cc10() {
-  static const bool is10 = [] {
+int device_compute_capability() {
+  static const int capability = [] {
     int device = 0;
     cudaGetDevice(&device);
     int cc_major = 0;
+    int cc_minor = 0;
     cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor,
                            device);
-    return cc_major == 10;
+    cudaDeviceGetAttribute(&cc_minor, cudaDevAttrComputeCapabilityMinor,
+                           device);
+    return cc_major * 10 + cc_minor;
   }();
-  return is10;
+  return capability;
 }
 
 bool use_residue_pack16(torch::Tensor const& input, int64_t n_ext,
@@ -115,7 +118,24 @@ bool use_residue_pack16(torch::Tensor const& input, int64_t n_ext,
   // uint32 row stride; fall back to pack8 for exotic widths.
   if (input.size(1) % 16 != 0 || n_ext % 16 != 0) return false;
   if (mode == 16) return true;
-  if (!device_is_cc10()) return false;
+  int cc = device_compute_capability();
+  if (cc / 10 != 10) return false;
+  
+  
+  
+  
+  int64_t m = input.size(0);
+  int64_t k = input.size(1);
+  if (cc == 100 && m >= 1 && m <= 128) {
+    if (residue_per_8 == 1 &&
+        (k == 256 || k == 768 || (m >= 4 && (k == 512 || k == 1024)))) {
+      return false;
+    }
+    if (residue_per_8 == 2 && (k == 8192 || k == 12288 || k == 16384)) {
+      return true;
+    }
+    if (residue_per_8 == 4 && k == 16384) return true;
+  }
   
   
   
