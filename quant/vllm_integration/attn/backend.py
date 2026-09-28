@@ -9,7 +9,6 @@ stock would convert decode Q to FP8 and bypass ResAttn's BF16-Q residue path.
 Continuous batching is supported only while each step remains phase-separated;
 this backend does not change the scheduler or prevent it from proposing a mix.
 """
-from dataclasses import dataclass, fields
 import os
 
 import torch
@@ -22,9 +21,11 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Dyna
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.flashinfer import (
     FlashInferBackend,
+    FlashInferDecodeKernel,
     FlashInferImpl,
     FlashInferMetadata,
     FlashInferMetadataBuilder,
+    FlashInferTrtllmAPIDecode,
     TRTLLMPrefill,
 )
 
@@ -50,21 +51,15 @@ def _require_separate_phases(metadata):
         )
 
 
-@dataclass
-class ResidueDecodeMetadata:
-    num_decodes: int
-    num_decode_tokens: int
-    max_seq_len: int
-    seq_lens: torch.Tensor
-    block_tables: torch.Tensor
-
-
-@dataclass
-class ResAttnFlashInferMetadata(FlashInferMetadata):
-    residue_decode: ResidueDecodeMetadata | None = None
-    # Required for pure prefill only; mixed steps are unsupported.
-    # It is the object produced by stock's builder, not a reconstructed view.
-    stock: FlashInferMetadata | None = None
+def _require_trtllm_decode(metadata):
+    decode = metadata.decode
+    if (not isinstance(decode, FlashInferTrtllmAPIDecode)
+            or decode.kernel is not FlashInferDecodeKernel.TRTLLM_GEN):
+        raise NotImplementedError(
+            "ResAttn requires stock FlashInfer TRTLLM_GEN decode metadata "
+            "for NVFP4 KV and page128"
+        )
+    return decode
 
 
 class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
@@ -83,43 +78,34 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
             os.environ.get("RESIDUE_ATTN_CG_CAPTURE_LEN", "0")
         ) or vllm_config.model_config.max_model_len
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(self, common_prefix_len, common_attn_metadata,
+              fast_build=False) -> FlashInferMetadata:
         stock = super().build(common_prefix_len, common_attn_metadata, fast_build)
         _require_separate_phases(stock)
         if stock.use_cascade or not stock.causal:
             raise NotImplementedError("ResAttn requires causal, non-cascade attention")
         if stock.num_prefill_tokens and not isinstance(stock.prefill, TRTLLMPrefill):
             raise NotImplementedError("This adapter requires stock TRTLLM prefill")
-        decode = None
         n = stock.num_decodes
-        # Only pure decode reaches this descriptor construction.
         if n and not stock.num_prefill_tokens:
             if n != stock.num_decode_tokens:
                 raise NotImplementedError("ResAttn requires one token per decode")
-            cam = common_attn_metadata
-            table = cam.block_table_tensor[:n]
+            decode = _require_trtllm_decode(stock)
+            table = decode.block_tables
             if (
                 table.dtype != torch.int32 or table.ndim != 2
                 or table.shape[0] != n or table.shape[1] < 1
                 or table.stride(1) != 1 or table.stride(0) < table.shape[1]
             ):
                 raise ValueError("Expected int32 block table with unit column stride")
-            decode = ResidueDecodeMetadata(
-                num_decodes=n, num_decode_tokens=n,
-                max_seq_len=cam.max_seq_len, seq_lens=cam.seq_lens[:n],
-                block_tables=table,
-            )
-        return ResAttnFlashInferMetadata(
-            **{f.name: getattr(stock, f.name) for f in fields(FlashInferMetadata)},
-            residue_decode=decode,
-            stock=stock if stock.num_prefill_tokens else None,
-        )
+        return stock
 
     def build_for_cudagraph_capture(self, common_attn_metadata):
         md = self.build(0, common_attn_metadata)
-        if md.residue_decode is not None:
-            md.residue_decode.max_seq_len = max(
-                md.residue_decode.max_seq_len, self._cg_capture_seq_len
+        if md.num_decodes:
+            decode = _require_trtllm_decode(md)
+            decode.max_seq_len = max(
+                decode.max_seq_len, self._cg_capture_seq_len
             )
         return md
 
@@ -156,7 +142,8 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         self._decode_reduction_workspaces = {}
         self._residue_pool_key = None
         self._residue_pool = None
-        _register_decode_warmup(self.num_heads, self.num_kv_heads, self.head_size)
+        _register_decode_warmup(
+            self.num_heads, self.num_kv_heads, self.head_size)
 
     def fused_output_quant_supported(self, quant_key):
         return bool(self.is_kvcache_nvfp4 and quant_key == kNvfp4Dynamic)
@@ -196,16 +183,14 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             raise ValueError("ResAttn output dtype does not match fusion mode")
         md = attn_metadata
         if md.num_prefill_tokens:
-            if md.stock is None:
-                raise RuntimeError("ResAttn prefill fallback requires stock metadata")
             # vLLM already invoked the inherited stock cache writer exactly
             # once. Only pure prefill can reach the stock execution path.
             if not fused_nvfp4:
                 return super().forward(layer, query, key, value, kv_cache,
-                                       md.stock, output)
+                                       md, output)
             stock_output = torch.empty_like(query, dtype=torch.bfloat16)
             super().forward(layer, query, key, value, kv_cache,
-                            md.stock, stock_output)
+                            md, stock_output)
             n = md.num_actual_tokens
             torch.ops._C.scaled_fp4_quant.out(
                 input=stock_output[:n].reshape(n, self.num_heads * self.head_size),
@@ -215,29 +200,29 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
                 output_scale=output_block_scale.view(torch.int32),
             )
             return output
-        if md.residue_decode is not None:
+        if md.num_decodes:
+            decode = _require_trtllm_decode(md)
             pool = self._pool_for(kv_cache, layer)
             if fused_nvfp4:
                 host = _load_decode_kernel()
                 if host is None:
                     raise RuntimeError("ResAttn NVFP4 decode kernel unavailable")
                 plan = host.plan_qmul4_decode_nvfp4(
-                    md.residue_decode.num_decode_tokens,
+                    md.num_decode_tokens,
                     self.num_heads,
                     self.num_kv_heads,
-                    md.residue_decode.max_seq_len,
+                    decode.max_seq_len,
                     query.device,
                     residue_fold=_qk_residue_for_geometry(
                         self.num_heads, self.num_kv_heads
                     ),
                 )
                 self._decode_forward_nvfp4(
-                    query, pool, md.residue_decode, output,
+                    query, pool, md, output,
                     output_scale, output_block_scale, host, plan,
                 )
             else:
-                self._decode_forward(query, pool,
-                                     md.residue_decode, output)
+                self._decode_forward(query, pool, md, output)
         return output
 
 

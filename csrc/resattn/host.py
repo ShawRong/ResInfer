@@ -23,7 +23,7 @@ from .kv_layout import (
 
 from ..scale_layout import swizzle_scales
 
-from .plan import QMUL4_KERNEL_REDUCTION_MIN_SEQ, select_decode_plan
+from .plan import select_decode_plan, static_compile_plans
 
 E2M1_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 N_PAD = 128  # Q-SF 缓冲的 N 垫高(UTCCP 按 N=128 粒度)
@@ -121,10 +121,12 @@ def _sm_count(device_str: str) -> int:
     return torch.cuda.get_device_properties(device_str).multi_processor_count
 
 
-def plan_qmul4_decode(batch, num_kv_heads, max_kv_len, device):
+def plan_qmul4_decode(batch, num_kv_heads, max_kv_len, device, *,
+                       grouped_head_tile=16, residue_fold=False):
     """BF16 output wrapper over the shared split/reduction policy."""
     return select_decode_plan(
-        batch, num_kv_heads, max_kv_len, _sm_count(str(device))
+        batch, num_kv_heads, max_kv_len, _sm_count(str(device)),
+        grouped_head_tile=grouped_head_tile, residue_fold=residue_fold,
     )
 
 
@@ -699,7 +701,10 @@ def run_paged_fp4_decode_qmul4_tmem(
     # reduction workspace. Standalone calls retain the original selector.
     if plan is None:
         max_len = max_seq_len or int(seq_lens.max().item())
-        splits, reduction = plan_qmul4_decode(B, H, max_len, q.device)
+        splits, reduction = plan_qmul4_decode(
+            B, H, max_len, q.device, grouped_head_tile=g_pad,
+            residue_fold=residue_fold,
+        )
     else:
         splits, reduction = plan
     if direct_output and reduction not in ("none", "atomic", "kernel"):
@@ -820,148 +825,26 @@ def decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan, *,
     )
 
 
-def plan_decode_compile_variants(
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    max_model_len: int,
-    max_num_seqs: int,
-    device,
-    residue_fold: bool = False,
-) -> list[dict]:
-    """Every distinct `_compiled` key `run_paged_fp4_decode_qmul4_tmem` can
-    reach for this geometry, for warmup.
-
-    Built with the SAME helpers the production entry uses -- `_padded_group_
-    size`, `plan_qmul4_decode`, `_use_single_softmax_scheduler` -- so warmup
-    compiles exactly what live requests will hit. A hand-assembled key that
-    drifts anywhere compiles a variant nothing uses, and that failure is
-    silent: warmup "succeeds" and the first request still pays the JIT.
-
-    Candidate (batch, seq) points are derived from the ENGINE's limits, not
-    hardcoded: `max_model_len` bounds the sequence axis (a 4K-context model
-    must not probe 65536 and then print a failure banner every boot), and the
-    kernel-reduction variant needs `batch * num_kv_heads == 1`
-    (`plan_qmul4_decode`), so batch=1 is always probed. Points that select
-    the same key deduplicate; a geometry where a variant is unreachable (e.g.
-    "kernel" with num_kv_heads > 1) simply never yields it -- which is
-    correct, because serving cannot reach it either.
-
-    `partial_o_dtype` is resolved through `_reduction_workspace_partial_o_
-    dtype`: `None` and the fp32 workspace the backend allocates for the
-    "kernel" reduction both map to "fp32", so the key matches production for
-    every surviving reduction.
-    """
+def decode_compile_variants(num_qo_heads, num_kv_heads, head_dim, *,
+                             residue_fold, output_nvfp4):
     check_shape_supported(num_qo_heads, num_kv_heads, head_dim)
-    if (
-        residue_fold
-        and num_qo_heads // num_kv_heads not in RESIDUE_GQA_GROUPS
-    ):
-        raise NotImplementedError(
-            "decode QK residue warmup requires logical GQA ratio in "
-            f"{RESIDUE_GQA_GROUPS}"
-        )
-    seqs = sorted(
-        {min(s, max_model_len)
-         for s in (256, 4096, QMUL4_KERNEL_REDUCTION_MIN_SEQ, 65536)}
-        | {max_model_len}
-    )
-    batches = sorted({1, max(1, min(8, max_num_seqs)),
-                      max(1, min(64, max_num_seqs))})
-    plans: list[dict] = []
-    seen: set[tuple] = set()
-    for batch in batches:
-        for seq in seqs:
-            splits, reduction = plan_qmul4_decode(
-                batch, num_kv_heads, seq, device
-            )
-            spec = decode_compile_spec(
-                num_qo_heads, num_kv_heads, head_dim, (splits, reduction),
-                output_nvfp4=False, residue_fold=residue_fold,
-            )
-            args, kwargs = spec["args"], spec["kwargs"]
-            ssw = kwargs["single_softmax_wg"]
-            key = args + tuple(sorted(kwargs.items()))
-            if key in seen:
-                continue
+    tile = (_residue_padded_group_size(num_qo_heads, num_kv_heads) if residue_fold
+            else _padded_group_size(num_qo_heads, num_kv_heads))
+    specs, seen = [], set()
+    for plan in static_compile_plans(output_nvfp4=output_nvfp4,
+                                     grouped_head_tile=tile, residue_fold=residue_fold):
+        spec = decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan,
+                                    output_nvfp4=output_nvfp4, residue_fold=residue_fold)
+        key = (spec["args"], tuple(sorted(spec["kwargs"].items())))
+        if key not in seen:
             seen.add(key)
-            plans.append({
-                "label": f"reduction={reduction} ssw={ssw} "
-                         f"(batch={batch}, seq={seq})",
-                "args": args,
-                "kwargs": kwargs,
-            })
-    return plans
-
-
-def plan_decode_nvfp4_compile_variants(
-    num_qo_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    max_model_len: int,
-    max_num_seqs: int,
-    device,
-    residue_fold: bool = False,
-) -> list[dict]:
-    """Direct-NVFP4 ``_compiled`` keys reachable by the decode planner."""
-    check_shape_supported(num_qo_heads, num_kv_heads, head_dim)
-    if (
-        residue_fold
-        and num_qo_heads // num_kv_heads not in RESIDUE_GQA_GROUPS
-    ):
-        raise NotImplementedError(
-            "decode QK residue warmup requires logical GQA ratio in "
-            f"{RESIDUE_GQA_GROUPS}"
-        )
-    seqs = sorted(
-        {
-            min(s, max_model_len)
-            for s in (256, 1024, 2048, 4096, 8192, 65536)
-        }
-        | {max_model_len}
-    )
-    batches = sorted(
-        {1, max(1, min(8, max_num_seqs)), max(1, min(64, max_num_seqs))}
-    )
-    plans: list[dict] = []
-    seen: set[tuple] = set()
-    for batch in batches:
-        for seq in seqs:
-            splits, reduction = plan_qmul4_decode_nvfp4(
-                batch,
-                num_qo_heads,
-                num_kv_heads,
-                seq,
-                device,
-                residue_fold=residue_fold,
-            )
-            if reduction not in ("none", "kernel", "gmem_fused"):
-                continue
-            spec = decode_compile_spec(
-                num_qo_heads, num_kv_heads, head_dim, (splits, reduction),
-                output_nvfp4=True, residue_fold=residue_fold,
-            )
-            args, kwargs = spec["args"], spec["kwargs"]
-            ssw = kwargs["single_softmax_wg"]
-            key = args + tuple(sorted(kwargs.items()))
-            if key in seen:
-                continue
-            seen.add(key)
-            plans.append(
-                {
-                    "label": (
-                        f"nvfp4 reduction={reduction} ssw={ssw} "
-                        f"(batch={batch}, seq={seq})"
-                    ),
-                    "args": args,
-                    "kwargs": kwargs,
-                }
-            )
-    return plans
+            specs.append(dict(spec, label=f"{plan[1]} ssw={spec['kwargs']['single_softmax_wg']} "
+                                         f"nvfp4={output_nvfp4}"))
+    return specs
 
 
 def compile_decode_variant(plan: dict):
-    """Compile one plan from `plan_decode_compile_variants` (cached)."""
+    """Compile one specialization from `decode_compile_variants` (cached)."""
     return _compiled(*plan["args"], **plan["kwargs"])
 
 

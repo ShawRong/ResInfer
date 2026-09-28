@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import logging
 import os
-import warnings
 
 
 def _logger():
@@ -93,19 +92,3 @@ def log_decode_import_failure(exc):
     _logger().error("ResAttn decode kernel nvfp4.cute_attn.host failed to import "
                     "(%s: %s); backend will refuse the first decode forward",
                     type(exc).__name__, exc)
-
-
-def log_tuning_report(phase, records):
-    logger = _logger()
-    logger.info("ResAttn %s: %d startup samples", phase, len(records))
-    logger.debug("ResAttn %s selections: %s", phase, records)
-
-
-def warn_static_decode_plan():
-    warnings.warn(
-        "ResAttn startup tuning skipped: the vLLM V2 runner or disabled "
-        "FlashInfer autotune cannot run its legacy decode samples; using "
-        "the static decode plan. Set RESIDUE_ATTN_TUNER=1 to require tuning.",
-        RuntimeWarning,
-        stacklevel=3,
-    )
