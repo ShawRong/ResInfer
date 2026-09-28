@@ -103,8 +103,7 @@ def run_fold_default(
 
 
 def warmup_fold_default(major: int, minor: int, shapes) -> None:
-    """Pre-compile the kernels a server will need (call at engine init, i.e.
-    OUTSIDE cudagraph capture; runtime dispatch then never JITs).
+    """Prepare the requested specializations eagerly before graph capture.
 
     shapes: iterable of (m_tok, n_w, k, out_dtype) or
             (m_tok, n_w, k, out_dtype, k_ext).
@@ -113,8 +112,7 @@ def warmup_fold_default(major: int, minor: int, shapes) -> None:
     served from a `weight_ext[:, :k_base_packed]` view, whose row stride makes
     it a DIFFERENT compiled kernel from the contiguous one (a_ld is part of the
     compile cache key). Omitting k_ext here would leave that variant to JIT on
-    first use -- i.e. inside cudagraph capture, which is the one place warmup
-    exists to prevent. Pass k_ext == k (or omit it) for a contiguous weight.
+    first use. Pass k_ext == k (or omit it) for a contiguous weight.
     """
     from .host import compile_fold_gemm_sm120
 

@@ -6,17 +6,12 @@ own warmup and must prepare the fallback before CUDA graph capture.
 """
 from __future__ import annotations
 
-from typing import Callable, Sequence
-import warnings
+from typing import Callable
 
 import torch
 
 _ANNOUNCED: set[str] = set()
 _DEGRADED: set[str] = set()
-
-
-def bucket_of(buckets: Sequence[int], m: int) -> int:
-    return next((b for b in buckets if m <= b), buckets[-1])
 
 
 def weight_geometry(weight: torch.Tensor) -> tuple[int, int, int | None]:
@@ -41,21 +36,6 @@ def make_tuning_config(buckets, map_fn, *, use_cold_l2_cache=True):
             gen_tuning_buckets=buckets if callable(buckets) else tuple(buckets),
             map_to_tuning_buckets=map_fn),),
     )
-
-
-def precompile(op_name, compiler, specs):
-    """Prepare (args, kwargs) specs; failed compilations never become ready."""
-    torch.zeros(1, device="cuda")  # CuTe needs a current CUDA context.
-    done = 0
-    for args, kwargs in specs:
-        try:
-            compiler(*args, **kwargs)
-            done += 1
-        except Exception as exc:
-            warnings.warn(
-                f"[residue] {op_name} precompile failed {args} {kwargs}: "
-                f"{type(exc).__name__}: {str(exc)[:160]}", RuntimeWarning)
-    return done
 
 
 def make_runner_pair(
@@ -105,9 +85,9 @@ def make_runner_pair(
 
 
 def tuned_call(op_name, runners_getter, config_getter, inputs,
-               fallback_forward, kill_env_value=None, record=None):
+               fallback_forward, enabled=True, record=None):
     """Disabled/unavailable tuner uses fallback; otherwise delegate to FlashInfer."""
-    if kill_env_value == "0":
+    if not enabled:
         if record is not None:
             record("offline_table")
         return fallback_forward(inputs)

@@ -178,7 +178,14 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
 
 def warmup_fold_default(major: int, minor: int, *, families=(),
                         strided=(False, True), out_dtype=None) -> int:
-    'Pre-compile the fold kernels this GPU can reach. Returns the count.'
+    """Pre-compile the fold kernels this GPU can reach. Returns the count.
+
+    Call eagerly before capture to prepare the requested specializations.
+
+    Best-effort per spec: one illegal combination must not cost the rest of
+    the coverage. Failures are printed, never swallowed -- a warmup that
+    silently covers nothing is exactly the state this replaced.
+    """
     from .host import _compile_fold_gemm
 
     arch = kernel_arch_for_capability(major, minor)

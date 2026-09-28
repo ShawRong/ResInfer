@@ -95,5 +95,5 @@ def tuned_linear(inputs: list[torch.Tensor], spec: LinearSpec):
             f"residue_linear_{spec.format}_v1",
             lambda: _runners(spec), lambda: _config(spec), inputs,
             lambda args: spec.fallback(args, spec.policy),
-            kill_env_value="1" if spec.enabled else "0", record=spec.record,
+            enabled=spec.enabled, record=spec.record,
         )

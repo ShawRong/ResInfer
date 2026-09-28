@@ -6,14 +6,14 @@ using a persisted tactic outside the FlashInfer tuning window.
 """
 from __future__ import annotations
 
+import warnings
 
 import torch
 
-from .fi_tuner_base import precompile, weight_geometry
+from .fi_tuner_base import weight_geometry
 
 KLOOP_TILES = ((128, 128, 128),)
 KLOOP_SM100_CFGS = (((128, 128), (1, 1)), ((256, 128), (2, 1)))
-_CUSTOM_OP = "residue_ratio1_prefill_fp4_gemm"
 
 
 def _is_sm10x():
@@ -82,6 +82,14 @@ def prepare_kloop(inputs):
     x, weight = inputs[:2]
     n, k, a_ld = weight_geometry(weight)
     sm10x = _is_sm10x()
-    return precompile(_CUSTOM_OP, _kernel, [
-        ((sm10x, i, x.dtype, n, k, a_ld), {})
-        for i in _kloop_valid_tactics(inputs, True)])
+    torch.zeros(1, device="cuda")  # CuTe needs a current CUDA context.
+    done = 0
+    for i in _kloop_valid_tactics(inputs, True):
+        try:
+            _kernel(sm10x, i, x.dtype, n, k, a_ld)
+            done += 1
+        except Exception as exc:
+            warnings.warn(
+                f"[residue] ratio1 prefill K-loop tactic {i} compilation failed: "
+                f"{type(exc).__name__}: {str(exc)[:160]}", RuntimeWarning)
+    return done
