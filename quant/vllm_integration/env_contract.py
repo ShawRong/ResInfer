@@ -231,6 +231,14 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
             "the decode band use RESIDUE_PREFILL_RESIDUE_OFF=1 with "
             "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M=<fold band>.")
 
+    migrated = ("RESIDUE_SHARE_AUTOTUNE_CACHE", "RESIDUE_PREFILL_RESIDUE_OFF",
+                "RESIDUE_TENSOR_DUMP", "RESIDUE_STACK_DUMP_SIGNAL")
+    if env.get("RESINFER_DEV_EXPERIMENTS") != "1":
+        active = [name for name in migrated if env.get(name) not in (None, "", "0")]
+        if active:
+            fatals.append(f"{', '.join(active)} moved to .dev; launch with "
+                          ".dev/tools/vllm_patch/serve_vllm.py --residue_experiments")
+
     mode = val("RESIDUE_PATCH_MODE")
 
     if has_metadata and mode == "mext_r1":

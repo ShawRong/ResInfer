@@ -75,73 +75,6 @@ def _choose_linear_method_cls(version: str = "auto"):
     return ResidueNvFp4LinearMethodV2, tag
 
 
-def _install_shared_autotune_cache() -> None:
-    "Let models with the same GEMM shapes reuse each other's tuned tactics."
-    if os.environ.get("RESIDUE_SHARE_AUTOTUNE_CACHE", "0") != "1":
-        return
-
-    
-    
-    
-    
-    
-    
-    fac = None
-    try:
-        from vllm.model_executor.warmup import flashinfer_autotune_cache as fac
-    except ImportError:
-        pass
-    try:
-        from vllm.model_executor.warmup import kernel_warmup as kw
-    except Exception as e:                                # noqa: BLE001
-        print(f"[residue] shared autotune cache unavailable: {e}", flush=True)
-        return
-
-    holders = []                    # (module, attribute) pairs to rebind
-    if fac is not None and hasattr(fac, "resolve_flashinfer_autotune_file"):
-        holders.append((fac, "resolve_flashinfer_autotune_file"))
-        # kernel_warmup imported the symbol by name at module load, so
-        # rebinding the source module alone would leave the caller pointing
-        # at the original.
-        if hasattr(kw, "resolve_flashinfer_autotune_file"):
-            holders.append((kw, "resolve_flashinfer_autotune_file"))
-    elif hasattr(kw, "_resolve_flashinfer_autotune_file"):
-        holders.append((kw, "_resolve_flashinfer_autotune_file"))
-    if not holders:
-        print("[residue] shared autotune cache unavailable: no known "
-              "resolver in this vLLM's warmup module", flush=True)
-        return
-
-    anchor = holders[0][0]
-    if getattr(anchor, "_residue_shared_cache_installed", False):
-        return
-    _orig_resolve = getattr(*holders[0])
-
-    def _resolve_shared(runner):
-        # Reuse the original to get the fully-formed path (it also creates the
-        # directory and honours VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR), then swap
-        # the model-hash component for a fixed one. Deriving the root by hand
-        # would duplicate vLLM's version/arch layout and drift from it.
-        try:
-            per_model = _orig_resolve(runner)
-            shared_dir = per_model.parent.parent / "shared"
-            shared_dir.mkdir(parents=True, exist_ok=True)
-            return shared_dir / per_model.name
-        except Exception as e:                            # noqa: BLE001
-            print(f"[residue] shared autotune cache path failed, using "
-                  f"per-model: {type(e).__name__}: {e}", flush=True)
-            return _orig_resolve(runner)
-
-    for mod, attr in holders:
-        setattr(mod, attr, _resolve_shared)
-    anchor._residue_shared_cache_installed = True
-    print("[residue] FlashInfer autotune cache SHARED across models "
-          "(RESIDUE_SHARE_AUTOTUNE_CACHE=1). Entries are keyed by "
-          "(op, runner, shape), so only genuinely new shapes are profiled. "
-          "Do not start two servers concurrently against it -- FlashInfer "
-          "documents concurrent writes as best-effort.", flush=True)
-
-
 def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> bool:
     """Replace ModelOptNvFp4Config.LinearMethodCls with a residue method.
 
@@ -254,25 +187,6 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> 
                 print(f"[residue] Added {target_cls.__name__} to WEIGHT_LOADER_V2_SUPPORTED")
         except (ImportError, AttributeError) as e:
             print(f"[residue] Warning: Could not patch WEIGHT_LOADER_V2_SUPPORTED: {e}")
-
-        # Must run BEFORE kernel_warmup resolves the cache path. Self-gated on
-        # RESIDUE_SHARE_AUTOTUNE_CACHE=1 and a no-op otherwise.
-        _install_shared_autotune_cache()
-
-        
-        
-        
-        
-        
-        
-        if os.environ.get("RESIDUE_STACK_DUMP_SIGNAL") == "1":
-            import faulthandler
-            import signal as _signal
-
-            faulthandler.register(_signal.SIGUSR1, all_threads=True,
-                                  chain=False)
-            print(f"[residue] SIGUSR1 stack dumps armed in pid={os.getpid()}",
-                  flush=True)
 
         _patched = True
         print(

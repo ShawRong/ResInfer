@@ -27,37 +27,23 @@ class NVFP4Policy(NamedTuple):
     fold_max_m: int
     ratio1_fold_max_m: int
     force_fold: bool
-    residue_off: bool
-    off_min_m: int | None
-    off_max_m: int | None
     prefill: str
     sm10x_tuner: bool
     sm120_tuner: bool
     candidates: tuple = ()
 
 
-def _residue_off(m, policy):
-    if not policy.residue_off:
-        return False
-    if policy.off_max_m is not None and m <= policy.off_max_m:
-        return True
-    if policy.off_min_m is not None:
-        return m > policy.off_min_m
-    return policy.off_max_m is None and m > policy.fold_max_m
-
-
 def _route(m, policy):
     """Choose the numerical path for both synthesized and serving M."""
-    off = _residue_off(int(m), policy)
-    fold = not off and policy.fold_eligible and policy.arch is not None and (
+    fold = policy.fold_eligible and policy.arch is not None and (
         policy.ratio1 or policy.force_fold or m <= policy.fold_max_m)
     if fold:
         if policy.ratio1 and m > policy.ratio1_fold_max_m:
             return "ratio1_prefill"
         return "sm10x_fold" if policy.arch in ("sm100", "sm103") else "sm120_fold"
-    if policy.ratio1 and not off:
+    if policy.ratio1:
         return "invalid_mext"
-    return "plain" if policy.num_salient == 0 or (policy.ratio1 and off) else "k_ext"
+    return "plain" if policy.num_salient == 0 else "k_ext"
 
 
 def _fold_inputs(inputs, policy):
@@ -125,9 +111,6 @@ def tuned_nvfp4_linear(inputs, policy):
         raise RuntimeError("M-extension requires a prepared Fold path")
     boundaries = {policy.fold_max_m, policy.fold_max_m + 1,
                   policy.ratio1_fold_max_m, policy.ratio1_fold_max_m + 1}
-    for switch in (policy.off_min_m, policy.off_max_m):
-        if switch is not None:
-            boundaries.update((switch, switch + 1))
     buckets = tuple(sorted({b for b in (*_BUCKETS, *boundaries)
                             if 0 < b <= max(_BUCKETS)}))
     # All candidate families share this call and its cold-L2 measurement.

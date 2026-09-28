@@ -137,60 +137,6 @@ def mext_fold_max_m_for(arch: str | None) -> int:
 # block/grid in invokeFP4QuantizationMExtR1.
 _FORCE_FOLD = os.environ.get("RESIDUE_FORCE_DECODE_MEXT", "0") == "1"
 
-# ── prefill-side residue kill switch (EXPERIMENT ONLY) ─────────────────────
-# `RESIDUE_PREFILL_RESIDUE_OFF=1` makes every residue layer compute PLAIN
-# NVFP4 above the M threshold while leaving decode untouched, i.e. the arm
-# "no prefill residue + mext decode". It exists because the attribution
-# control for the per-layer ratio search has never been run: every published
-# comparison was b4.5 (4.5 effective bits) against b8.0 (8.0) or against
-# plain (no residue anywhere), and neither isolates the prefill contribution.
-# With this flag the same checkpoint serves both sides of the A/B, so nothing
-# but the prefill path differs -- no re-export, no weight change.
-#
-# How each layer kind is neutered, and why that way:
-#   K-extension  the extended activation's residue columns are ZEROED. fp4
-#                code 0 is +0.0, so those columns contribute exactly nothing
-#                and the output equals plain NVFP4 over the base columns.
-#                Nothing about the weight layout, the scale layout or the
-#                cutlass padding changes -- which is the point: slicing the
-#                weight to k_base would mean a non-contiguous view and a
-#                re-derived padding, i.e. two new ways to be silently wrong.
-#   mext_r1      no extension exists to zero; the fold is simply not taken and
-#                the layer falls through to the plain cutlass bypass, whose
-#                weight/weight_scale already span the full (== base) K.
-#
-# The band is chosen by two optional bounds; the gate turns the switch on.
-#
-#   neither bound       MIN_M defaults to the fold band -> kills above it, so
-#                       "prefill only" and decode keeps its residue everywhere
-#   ..._MIN_M = t       kill where m >  t
-#   ..._MAX_M = t       kill where m <= t
-#   both                kill where either holds (residue survives only between
-#                       them) -- an intersection nobody has needed yet, but the
-#                       union is what the two rules mean read together
-#
-# _MAX_M completes the 2x2 the attribution study needs. Without it the fourth
-# cell is unreachable:
-#
-#   both          no flags                          residue everywhere
-#   decode-only   OFF=1                             kill above the fold band
-#   plain         OFF=1  MIN_M=0                    kill everywhere
-#   prefill-only  OFF=1  MAX_M=<fold band>          kill in the decode band
-#
-# and without the fourth cell you cannot tell whether both ~= prefill + decode
-# (complementary) or both ~= max(prefill, decode) (redundant) -- i.e. whether
-# two mechanisms are doing work or one.
-#
-# Naming wart, stated rather than hidden: the gate says PREFILL because when it
-# was added only the "above" direction existed. With _MAX_M the same switch
-# kills the DECODE band. Renaming it would break the arms already in flight and
-# the results that cite them, so the name stays and this paragraph explains it.
-_PREFILL_RESIDUE_OFF = (
-    os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF", "0") == "1")
-_PREFILL_RESIDUE_OFF_MIN_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M")
-_PREFILL_RESIDUE_OFF_MAX_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MAX_M")
-
-
 # ── SM100/SM103 (B200/B300) CuTeDSL fold path ──────────────────────────────
 # Blackwell datacenter GPUs use the CuTeDSL sm100/sm103 fork
 # (nvfp4.cute_fold). (This comment used to contrast with 'the SM120 C++ fold
@@ -305,9 +251,6 @@ def _linear_policy(k_base, num_salient, padding, output_size,
         int(k_base), int(num_salient), int(padding), int(output_size),
         bool(fold_eligible), bool(use_swap), bool(ratio1), arch,
         fold_max_m_for(sm10x), mext_fold_max_m_for(sm10x), _FORCE_FOLD,
-        _PREFILL_RESIDUE_OFF,
-        int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
-        int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,
         _RATIO1_PREFILL_PATH,
         os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1",
         os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1") == "1",
@@ -317,7 +260,7 @@ def _linear_policy(k_base, num_salient, padding, output_size,
 def _nvfp4_linear_impl(inputs, policy):
     """Execute the static implementation of the shared numerical route."""
     from ..flashinfer_integration.nvfp4_linear_tuner import (
-        _fold_inputs, _residue_off, _route,
+        _fold_inputs, _route,
     )
 
     x, weight, scale_inv, weight_scale, _base_sf, mask, alpha = inputs
@@ -351,8 +294,6 @@ def _nvfp4_linear_impl(inputs, policy):
         x_fp4, x_sf = nvfp4.scaled_fp4_quant_with_mask(
             x, scale_inv, mask, policy.num_salient,
             use_swapped_residue=policy.use_swap)
-        if _residue_off(m, policy):
-            x_fp4[:, k // 2:].zero_()
         x_sf = x_sf.view(torch.float8_e4m3fn).view(
             ((m + 127) // 128) * 128,
             ((k + policy.num_salient + 63) // 64) * 4)

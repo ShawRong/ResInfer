@@ -46,7 +46,6 @@ from .layout_utils import (
     prepare_decode_mext_weight_layout_from_raw_scale,
 )
 from .linear_warmup import precompile_linear
-from .linear_debug import maybe_tap_tensor
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
 from .residue_tp import (
     SF_VEC_SIZE as SF_VEC_SIZE_FOR_TP,
@@ -577,7 +576,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        x = maybe_tap_tensor(x)
         # Keep ordinary NVFP4 layers on vLLM's selected backend. We only
         # intercept layers that actually need residue quantization or an
         # explicitly prepared decode-MExt fold layout.
@@ -585,7 +583,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             out = self._apply_residue_v2(layer, x, bias)
         else:
             out = self.kernel.apply_weights(layer=layer, x=x, bias=bias)
-        return maybe_tap_tensor(out)
+        return out
 
     def _apply_residue_v2(
         self,
@@ -608,6 +606,10 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         if self._uses_cutlass_compatible_layout():
             return self._apply_residue_via_op(layer, x, bias)
         return self._apply_residue_inline(layer, x, bias)
+
+    @staticmethod
+    def _linear_op(*args):
+        return torch.ops.residue.nvfp4_linear(*args)
 
     def _apply_residue_via_op(
         self,
@@ -670,7 +672,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         if channel_mask is None:
             channel_mask = x_2d.new_zeros(1, dtype=torch.uint8)
 
-        output = torch.ops.residue.nvfp4_linear(
+        output = self._linear_op(
             x_2d,
             layer.weight,
             layer.input_global_scale_inv,
