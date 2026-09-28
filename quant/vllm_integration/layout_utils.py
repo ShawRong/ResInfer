@@ -66,4 +66,3 @@ def prepare_decode_mext_weight_layout_from_raw_scale(
     )
     layer._mext_decode_k_base = int(layer.original_in_features)
     layer._decode_mext_layout_enabled = True
-

@@ -72,8 +72,7 @@ def load_residue_metadata_json(metadata_path: str | Path) -> dict:
 
     try:
         data = read_residue_metadata_json(metadata_path)
-    except Exception as e:
-        print(f"[residue] Warning: Failed to load metadata: {e}")
+    except FileNotFoundError:
         data = {}
 
     _RESIDUE_METADATA_CACHE[cache_key] = data

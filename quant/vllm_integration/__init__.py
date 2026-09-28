@@ -40,7 +40,6 @@ __all__ = [
     "patch_vllm_modelopt",
     "patch_vllm_modelopt_mext_r1",
     "patch_vllm_modelopt_v2",
-    "unpatch_vllm_modelopt",
     "is_patched",
     "is_patched_mext_r1",
 ]

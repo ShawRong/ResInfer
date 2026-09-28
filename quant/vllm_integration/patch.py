@@ -1,273 +1,82 @@
-"""Patch vLLM's ModelOpt to use Residue linear methods.
+"""Install the Residue LinearMethod in vLLM 0.26's ModelOpt loader.
 
-This module provides a monkey-patch that replaces vLLM's standard
-ModelOptNvFp4LinearMethod with our Residue NVFP4 linear method.
-
-This is a HACK / workaround approach:
-- We're monkey-patching vLLM's internal class attribute
-- This bypasses vLLM's normal quantization registration mechanism
-- The patch must be applied BEFORE model loading
-
-Why we need it:
-- vLLM's auto-detection aggressively overrides user quantization settings
-- hf_quant_config.json with quant_method="modelopt" triggers this override
-- There's no official way to extend ModelOpt quantization in vLLM
-
-Usage:
-    from quant.vllm_integration.patch import patch_vllm_modelopt
-    patch_vllm_modelopt(model_dir="./exported")  # Pass model dir!
-
-    llm = LLM(model="./exported", quantization="modelopt_fp4")
+Call before model construction. Installation is idempotent; dependency and
+loader failures propagate so an explicitly enabled residue model cannot
+silently become a plain NVFP4 model.
 """
+from __future__ import annotations
 
 import os
 
-# Environment variable for passing model directory across process boundaries
-# vLLM uses spawn multiprocessing, so class variables don't survive
-RESIDUE_MODEL_DIR_ENV = "RESIDUE_VLLM_MODEL_DIR"
-RESIDUE_PATCH_MODE_ENV = "RESIDUE_PATCH_MODE"
-
-_patched = False
+_installed_mode: str | None = None
 
 
-def _choose_linear_method_cls(version: str = "auto"):
-    """Resolve the residue LinearMethod class + tag.
-
-    There used to be two distinct subclasses (V2 + MExtR1). MExt has since been
-    folded into V2.PWAL — both modes now resolve to the same class. We still
-    accept the `mext_r1` / `mext` aliases (legacy suites and scripts pass them
-    via `RESIDUE_PATCH_MODE`) and return a `"mext_r1"` tag so `is_patched_mext_r1`
-    can still distinguish what mode the user asked for, but the class returned
-    is always V2.
-    """
-    if version == "auto":
-        patch_mode = os.environ.get(RESIDUE_PATCH_MODE_ENV, "v2")
-        patch_mode = patch_mode.strip().lower().replace("-", "_")
-        if patch_mode in {"", "v2", "mext_r1"}:
-            version = patch_mode or "v2"
-        else:
-            
-            
-            
-            
-            
-            
-            
-            
-            raise ValueError(
-                f"Unknown {RESIDUE_PATCH_MODE_ENV}={patch_mode!r}. Valid: "
-                "'v2' (default -- metadata-driven; metadata-less layers "
-                "stay plain) or 'mext_r1' (additionally name-force "
-                "metadata-less projections onto the runtime M-extension "
-                "path)."
-            )
-
-    if version not in {"v2", "mext_r1"}:
-        raise ValueError(
-            f"Unknown residue vLLM patch version: {version!r}. "
-            "Valid: 'v2', 'mext_r1'."
-        )
-
-    from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel  # noqa: F401
-    from .linear_method_v2 import ResidueNvFp4LinearMethodV2
-
-    tag = "mext_r1" if version == "mext_r1" else "v2"
-    return ResidueNvFp4LinearMethodV2, tag
-
-
-def patch_vllm_modelopt(model_dir: str | None = None, version: str = "auto") -> bool:
-    """Replace ModelOptNvFp4Config.LinearMethodCls with a residue method.
-
-    Must be called BEFORE vLLM creates model. Safe to call multiple times.
-
-    Args:
-        model_dir: Path to the exported model directory. REQUIRED for residue
-            quantization to work. This is passed via environment variable
-            to survive vLLM's spawn multiprocessing.
-
-    Returns:
-        True if patch was applied, False if already patched.
-    """
-    global _patched
-
-    # Always set/update model_dir even if already patched
-    # (user might call with different model)
+def patch_vllm_modelopt(model_dir: str | None = None, version: str = 'auto') -> bool:
+    """Return True after installation, False when already installed."""
+    global _installed_mode
     if model_dir is not None:
-        os.environ[RESIDUE_MODEL_DIR_ENV] = str(model_dir)
-        print(f"[residue] Set {RESIDUE_MODEL_DIR_ENV}={model_dir}")
-
-    # The env contract, enforced where every launcher converges. Prints one
-    # resolved-config line (so logs always say what actually ran) and refuses
-    # known-fatal combinations at startup instead of hours later -- each rule
-    # in env_contract.py names the real incident it prevents.
-    # RESIDUE_ENV_CHECK=0 downgrades refusals to warnings.
-    from .env_contract import enforce as _enforce_env_contract
-    _enforce_env_contract(model_dir=os.environ.get(RESIDUE_MODEL_DIR_ENV))
-
-    if _patched:
+        os.environ['RESIDUE_VLLM_MODEL_DIR'] = str(model_dir)
+    requested = version if version != 'auto' else os.environ.get('RESIDUE_PATCH_MODE', 'v2')
+    requested = requested.strip().lower().replace('-', '_') or 'v2'
+    if requested not in ('v2', 'mext_r1'):
+        raise ValueError(f'Unknown residue patch mode: {requested!r}')
+    if _installed_mode is not None:
+        if requested != _installed_mode:
+            raise ValueError('Residue patch mode cannot change after installation')
         return False
+    os.environ['RESIDUE_PATCH_MODE'] = requested
+    from .env_contract import enforce, settings
 
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptNvFp4Config,
-        )
+    settings.cache_clear()
+    cfg = enforce(os.environ.get('RESIDUE_VLLM_MODEL_DIR'))
+    from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
+    from vllm.model_executor.layers import linear
+    from .linear_method_v2 import ResidueNvFp4LinearMethodV2 as method_cls
 
-        target_cls, resolved_version = _choose_linear_method_cls(version)
+    # Merged projections need vLLM's scalar-to-shard weight loader.
+    supported = linear.WEIGHT_LOADER_V2_SUPPORTED
+    if method_cls.__name__ not in supported:
+        supported.append(method_cls.__name__)
+    original_init = ModelOptNvFp4Config.__init__
+    original_get = ModelOptNvFp4Config.get_quant_method
 
-        # Store original for potential restoration
-        if not hasattr(ModelOptNvFp4Config, "_original_LinearMethodCls"):
-            ModelOptNvFp4Config._original_LinearMethodCls = (
-                ModelOptNvFp4Config.LinearMethodCls
-            )
+    def initialize(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        # The parent sets this on each instance, overriding its class attribute.
+        if getattr(self, 'quant_method', None) == 'NVFP4':
+            self.LinearMethodCls = method_cls
 
-        # Apply patch
-        ModelOptNvFp4Config.LinearMethodCls = target_cls
-        ModelOptNvFp4Config._residue_patch_version = resolved_version
+    def get_quant_method(self, layer, prefix):
+        method = original_get(self, layer, prefix)
+        if isinstance(method, method_cls):
+            method.layer_prefix = prefix
+        return method
 
-        # vLLM >= 0.23 also sets `self.LinearMethodCls` inside
-        # ModelOptNvFp4Config.__init__ based on quant_algo, which overrides the
-        # class attribute above for each new config instance. Patch __init__ so
-        # serialized NVFP4 checkpoints still instantiate the residue method.
-        if not hasattr(ModelOptNvFp4Config, "_residue_original_init"):
-            ModelOptNvFp4Config._residue_original_init = ModelOptNvFp4Config.__init__
-
-            def _residue_init(self, *args, **kwargs):
-                self._residue_original_init(*args, **kwargs)
-                qm = getattr(self, "quant_method", None)
-                if qm == "NVFP4":
-                    self.LinearMethodCls = target_cls
-                if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
-                    print(
-                        f"[residue:config_init] quant_method={qm!r} "
-                        f"LinearMethodCls={getattr(self, 'LinearMethodCls', None)}",
-                        flush=True,
-                    )
-
-            ModelOptNvFp4Config.__init__ = _residue_init
-
-        # Newer vLLM calls LinearMethodCls(self) from get_quant_method() and
-        # does not pass the layer prefix into the method constructor. The
-        # prefix is still needed for residue metadata lookup, especially for
-        # vLLM-fused layers such as qkv_proj and gate_up_proj whose checkpoint
-        # keys are split as q_proj/k_proj/v_proj and gate_proj/up_proj.
-        if not hasattr(ModelOptNvFp4Config, "_residue_original_get_quant_method"):
-            ModelOptNvFp4Config._residue_original_get_quant_method = (
-                ModelOptNvFp4Config.get_quant_method
-            )
-
-            def _residue_get_quant_method(self, layer, prefix: str):
-                method = self._residue_original_get_quant_method(layer, prefix)
-                if isinstance(method, target_cls):
-                    method.layer_prefix = prefix
-                if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
-                    print(
-                        f"[residue:get_quant_method] prefix={prefix!r} "
-                        f"method={type(method).__name__} "
-                        f"cfg_cls={getattr(self, 'LinearMethodCls', None)}",
-                        flush=True,
-                    )
-                return method
-
-            ModelOptNvFp4Config.get_quant_method = _residue_get_quant_method
-
-        # CRITICAL: Add our LinearMethod to WEIGHT_LOADER_V2_SUPPORTED
-        # Without this, vLLM uses the old weight_loader which doesn't correctly
-        # handle PerTensorScaleParameter (weight_scale_2) for merged layers
-        # like gate_up_proj. The old loader walks into an else branch that
-        # asserts param_data.shape == loaded_weight.shape, but:
-        #   - param_data.shape = [2] (for gate_up_proj with 2 partitions)
-        #   - loaded_weight.shape = [] (scalar from checkpoint)
-        # The new weight_loader_v2 correctly calls param.load_merged_column_weight()
-        # which handles scalar-to-array mapping via _load_into_shard_id().
-        try:
-            from vllm.model_executor.layers import linear
-
-            if target_cls.__name__ not in linear.WEIGHT_LOADER_V2_SUPPORTED:
-                linear.WEIGHT_LOADER_V2_SUPPORTED.append(target_cls.__name__)
-                print(f"[residue] Added {target_cls.__name__} to WEIGHT_LOADER_V2_SUPPORTED")
-        except (ImportError, AttributeError) as e:
-            print(f"[residue] Warning: Could not patch WEIGHT_LOADER_V2_SUPPORTED: {e}")
-
-        _patched = True
-        print(
-            "[residue] Patched ModelOptNvFp4Config.LinearMethodCls "
-            f"-> {target_cls.__name__} ({resolved_version})"
-        )
-        return True
-
-    except ImportError as e:
-        print(f"[residue] Warning: Could not patch vLLM: {e}")
-        return False
-
-
-def unpatch_vllm_modelopt() -> bool:
-    """Restore original ModelOptNvFp4LinearMethod.
-
-    Returns:
-        True if restored, False if not patched.
-    """
-    global _patched
-    if not _patched:
-        return False
-
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptNvFp4Config,
-        )
-
-        if hasattr(ModelOptNvFp4Config, "_original_LinearMethodCls"):
-            ModelOptNvFp4Config.LinearMethodCls = (
-                ModelOptNvFp4Config._original_LinearMethodCls
-            )
-            _patched = False
-            print("[residue] Restored original ModelOptNvFp4LinearMethod")
-            return True
-    except ImportError:
-        pass
-
-    return False
+    ModelOptNvFp4Config.LinearMethodCls = method_cls
+    ModelOptNvFp4Config.__init__ = initialize
+    ModelOptNvFp4Config.get_quant_method = get_quant_method
+    _installed_mode = cfg.mode
+    print(f'[residue] ModelOpt NVFP4 -> {method_cls.__name__} ({cfg.mode})', flush=True)
+    return True
 
 
 def patch_vllm_modelopt_v2(model_dir: str | None = None) -> bool:
-    return patch_vllm_modelopt(model_dir=model_dir, version="v2")
+    return patch_vllm_modelopt(model_dir, version='v2')
 
 
 def patch_vllm_modelopt_mext_r1(model_dir: str | None = None) -> bool:
-    return patch_vllm_modelopt(model_dir=model_dir, version="mext_r1")
+    return patch_vllm_modelopt(model_dir, version='mext_r1')
 
 
 def is_patched() -> bool:
-    """Check if the patch's DECLARED configuration is actually installed.
-
-    NOTE: This checks actual class attributes, not the module-level _patched
-    variable. This is important because in spawn multiprocessing, _patched
-    resets to False in worker processes, but the class attribute check tells
-    us the actual state.
-    """
+    """Compatibility query for external callers; installation itself raises on failure."""
     try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptNvFp4Config,
-        )
-
+        from vllm.model_executor.layers.quantization.modelopt import ModelOptNvFp4Config
         from .linear_method_v2 import ResidueNvFp4LinearMethodV2
-
-        return ModelOptNvFp4Config.LinearMethodCls is ResidueNvFp4LinearMethodV2
     except ImportError:
         return False
+    return ModelOptNvFp4Config.LinearMethodCls is ResidueNvFp4LinearMethodV2
 
 
 def is_patched_mext_r1() -> bool:
-    """Whether the patch was installed in mext_r1 mode.
-
-    Since MExt was folded into V2, both modes resolve to the same class — this
-    check now reads the patch *tag* (stored at patch time) rather than checking
-    class identity, so callers can still see what mode the user requested.
-    """
-    try:
-        from vllm.model_executor.layers.quantization.modelopt import (
-            ModelOptNvFp4Config,
-        )
-
-        return getattr(ModelOptNvFp4Config, "_residue_patch_version", None) == "mext_r1"
-    except ImportError:
-        return False
+    return _installed_mode == 'mext_r1' and is_patched()

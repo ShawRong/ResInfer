@@ -21,6 +21,9 @@ import os
 
 
 def _maybe_patch_vllm() -> None:
+    import sys
+    from pathlib import Path
+
     if os.environ.get("RESIDUE_NVFP4") != "1":
         return
 
@@ -28,12 +31,9 @@ def _maybe_patch_vllm() -> None:
     model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
 
     try:
-        from quant.vllm_integration.patch import is_patched, patch_vllm_modelopt
+        from quant.vllm_integration.patch import patch_vllm_modelopt
 
         patch_vllm_modelopt(model_dir=model_dir)
-        if not is_patched():
-            raise RuntimeError(
-                "patch_vllm_modelopt did not install the requested patch")
     except Exception as exc:
         import traceback
 

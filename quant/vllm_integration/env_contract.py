@@ -1,314 +1,87 @@
-# SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
-# SPDX-License-Identifier: Apache-2.0
-'The RESIDUE_* environment contract, as one checkable object.'
+"""Parse NVFP4 runtime settings once, before constructing the model.
 
+Kernel-specific and attention settings remain owned by those integrations.
+Development experiments are accepted only through the repository launcher.
+"""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from functools import lru_cache
 import os
-from typing import Mapping
-
-METADATA_FILENAME = "residue_kernel_metadata.json"
-
-# Values that read as "on" to a human but as OFF to `== "1"` parsing.
-_TRUTHY_LOOKING = {"true", "yes", "on", "y", "enable", "enabled"}
-
-# name -> (kind, allowed/None, one-line meaning)
-#   kind: "one"    parsed with == "1"; anything else means OFF
-#         "enum"   must be one of `allowed` (case-sensitive)
-#         "int"    must parse as int
-#         "path"   filesystem path
-#         "free"   uninterpreted string (csv lists, filenames)
-KNOWN: dict[str, tuple] = {
-    # -- activation / core -------------------------------------------------
-    "RESIDUE_NVFP4": ("one", None, "install the NVFP4 LinearMethod patch"),
-    "RESIDUE_MXFP4": ("one", None, "register the ModelOpt MXFP4 adapter"),
-    "RESIDUE_VLLM_MODEL_DIR": ("path", None,
-                               "export dir; metadata source, REQUIRED for "
-                               "residue exports"),
-    "RESIDUE_PATCH_MODE": ("enum", {"v2", "mext_r1"},
-                           "patch flavor; mext_r1 also name-forces "
-                           "metadata-less projections to runtime mext_r1"),
-    "RESIDUE_SWAP": ("one", None, "swapped-residue layout; must match export"),
-    "RESIDUE_MEXT_PROJ_NAMES": ("free", None,
-                                "csv name fragments the mext_r1 name-forcing "
-                                "applies to"),
-    "RESIDUE_MEXT_ATTN_PROJ_NAMES": ("free", None,
-                                     "legacy alias of RESIDUE_MEXT_PROJ_NAMES"),
-    # -- fold dispatch -----------------------------------------------------
-    "RESIDUE_ENABLE_DECODE_MEXT": ("one", None,
-                                   "fold layout for extended_k/plain layers"),
-    "RESIDUE_DECODE_MEXT_MAX_M": ("int", None, "fold band M threshold"),
-    "RESIDUE_FORCE_DECODE_MEXT": ("one", None,
-                                  "fold at every M (PD decode-only servers)"),
-    # EXPERIMENT: the attribution control for the per-layer ratio search.
-    # Serves the SAME checkpoint with the prefill residue removed and decode
-    # untouched. Declared here above all so it lands in the resolved line --
-    # it is a server-side env, which is exactly the class of knob lighteval's
-    # generation cache key cannot see, so two arms that differ only in this
-    
-    "RESIDUE_PREFILL_RESIDUE_OFF": ("one", None,
-                                    "EXPERIMENT: no residue above the M "
-                                    "threshold (decode keeps its residue)"),
-    "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M": ("int", None,
-                                          "kill switch: deactivate where "
-                                          "m > t (default: the fold band)"),
-    "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M": ("int", None,
-                                          "kill switch: deactivate where "
-                                          "m <= t -- the 'prefill only' arm"),
-    "RESIDUE_RATIO1_PREFILL_PATH": ("enum",
-                                    {"auto", "two_gemm", "k_loop"},
-                                    "ratio-1 prefill route; decode Fold is separate"),
-    "RESIDUE_MEXT_PREFILL_PATH": ("enum",
-                                  {"auto", "two_gemm", "k_loop"},
-                                  "legacy alias of RESIDUE_RATIO1_PREFILL_PATH"),
-    "RESIDUE_FOLD_MEXT": ("one", None, "enable A4/A6 tile8 families (sm10x)"),
-    "RESIDUE_MEXT_FOLD_MAX_M": ("int", None,
-                                 "largest SM10x MExt-r1 M routed to Fold; default 512"),
-    "RESIDUE_FOLD_SILENCE_DEFAULT": ("one", None,
-                                     "silence the static-tactic-table warning"),
-    "RESIDUE_SM120_FOLD_TUNER": ("enum", {"0", "1"},
-                                 "sm120 decode-fold FlashInfer tile tuner "
-                                 "(default on; 0 = serve the offline-swept "
-                                 "static table directly)"),
-    "RESIDUE_SM10X_FOLD_TUNER": ("enum", {"0", "1"},
-                                 "sm10x decode-fold FlashInfer tactic tuner "
-                                 "(default ON since task-014 passed on B200; "
-                                 "0 = the existing static row-pair policy)"),
-    "RESIDUE_MXFP4_FOLD_TUNER": ("enum", {"0", "1"},
-                                 "SM100 MXFP4 group-32 Fold FlashInfer tactic "
-                                 "tuner (experimental; default off pending "
-                                 "GPU validation)"),
-    "RESIDUE_MXFP4_TP_EXPERIMENTAL": ("enum", {"0", "1"},
-                                     "enable experimental SM100 packed MXFP4 "
-                                     "tensor-parallel loading (default off)"),
-    "RESIDUE_DISABLE_SM10X_FOLD": ("one", None,
-                                   "kill the sm10x fold (mext_r1 layers then "
-                                   "refuse to serve, by design)"),
-    "RESIDUE_MEXT_R1_LAYOUT": ("enum", {"concat", "row_pair", "tile8"},
-                               "mext quant activation layout override"),
-    "NVFP4_MEXT_R1_LAYOUT": ("enum", {"concat", "row_pair", "tile8"},
-                             "legacy alias of RESIDUE_MEXT_R1_LAYOUT"),
-    "NVFP4_MEXT_R1_ELTS_PER_THREAD": ("enum", {"auto", "8", "16"},
-                                      "mext quant vector width"),
-    # -- autotune / warmup ---------------------------------------------------
-    "RESIDUE_SHARE_AUTOTUNE_CACHE": ("one", None,
-                                     "share the FlashInfer autotune cache "
-                                     "across models"),
-    # -- attention (experimental) -------------------------------------------
-    "RESIDUE_ATTN_TUNER": (
-        "enum", {"0", "1"},
-        "opt in to FlashInfer split/reduction selection; default 0 pending "
-        "the tuner GPU gate. Requires valid decode warmup inputs before "
-        "graph capture; uncached configurations retain the default policy",
-    ),
-    "RESIDUE_ATTN": (
-        "one", None,
-        "register phase-separated ResAttn: pure decode uses ResAttn; "
-        "pure prefill uses stock FlashInfer/TRT; mixed steps are rejected",
-    ),
-    "RESIDUE_ATTN_DISABLE_QK_RESIDUE": (
-        "one",
-        None,
-        "debug ablation: disable the default GQA4/6/8 decode QK residue and "
-        "run the base-only ResAttn kernel; does not affect vendor "
-        "context/prefill",
-    ),
-    "RESIDUE_ATTN_CUDAGRAPH": ("one", None,
-                               "capture ResAttn decode into CUDA graphs "
-                               "(1.70-2.08x decode on sm100). PERFORMANCE "
-                               "only: a graph fixes the launch sequence, not "
-                               "CTA scheduling, so it does not make decode "
-                               "repeat bitwise in either mode. For that, see "
-                               "RESIDUE_ATTN_REDUCTION"),
-    "RESIDUE_ATTN_REDUCTION": ("enum", {"legacy", "auto", "deterministic"},
-                               'How split-K partials merge. legacy uses atomics; auto uses atomics for 1-2 splits and a second-pass merge otherwise; deterministic always uses a second-pass merge. Select a repeatable mode for quality comparisons.'),
-    "RESIDUE_ATTN_CG_CAPTURE_LEN": ("int", None,
-                                    "sequence length the CUDA-graph capture "
-                                    "plans against (default max_model_len); "
-                                    "a short value selects the no-split "
-                                    "kernel, which uses no atomics at all and "
-                                    "is measured bitwise repeatable"),
-    # -- debug ----------------------------------------------------------------
-    "RESIDUE_DEBUG": ("one", None, "verbose debug prints"),
-    "RESIDUE_DEBUG_MASK": ("one", None, "mask debug prints"),
-    "RESIDUE_DEBUG_TP": ("one", None, "TP debug prints"),
-    "RESIDUE_DEBUG_CREATE_WEIGHTS": ("one", None, "create_weights prints"),
-    "RESIDUE_TENSOR_DUMP": ("free", None,
-                            "dump linear tensors to this dir. The tap is a "
-                            "real op and compiles into the graph -- do NOT "
-                            "use it to diagnose compile-related effects; the "
-                            "probe changes the compiled artifact"),
-    "RESIDUE_TENSOR_DUMP_MAX_M": (
-        "int", None,
-        "tap rows above this are skipped (default 400, to skip warmup "
-        "dummies). Raise for real-length prompts: at the default a dump of "
-        "a long prompt records nothing from prefill, and 'all identical' "
-        "then means 'not measured', not 'no divergence'"),
-    "RESIDUE_STACK_DUMP_SIGNAL": ("one", None,
-                                  "arm SIGUSR1 all-thread stack dumps"),
-    "RESIDUE_ENV_CHECK": ("enum", {"0", "1"},
-                          "0 downgrades contract refusals to warnings"),
-}
-
-# Set in tests / internal tooling; never a typo worth warning about.
-_IGNORED_PREFIXES = ("RESIDUE_TEST_",)
+from pathlib import Path
 
 
-def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
-    """Pure rule evaluation. Returns {resolved, warnings, fatals}.
+@dataclass(frozen=True)
+class NVFP4Settings:
+    mode: str
+    projections: tuple[str, ...]
+    decode_mext: bool
+    swap: bool
+    force_fold: bool
+    disable_sm10x: bool
+    decode_max_m: int | None
+    ratio1_max_m: int | None
+    ratio1_prefill: str
+    sm10x_tuner: bool
+    sm120_tuner: bool
 
-    `model_dir` defaults to env's RESIDUE_VLLM_MODEL_DIR. Filesystem access is
-    limited to two existence probes on it.
-    """
-    warnings: list[str] = []
-    fatals: list[str] = []
 
-    def val(name: str) -> str | None:
-        return env.get(name)
+def parse_settings(env) -> NVFP4Settings:
+    def flag(name, default='0'):
+        value = env.get(name, default)
+        if value not in ('0', '1'):
+            raise ValueError(f'{name} must be 0 or 1, got {value!r}')
+        return value == '1'
 
-    # R1: unknown RESIDUE_* -- typos silently do nothing.
-    for name in sorted(env):
-        if not name.startswith("RESIDUE_"):
-            continue
-        if name in KNOWN or name.startswith(_IGNORED_PREFIXES):
-            continue
-        warnings.append(
-            f"unknown variable {name} -- nothing reads it (typo?)")
-
-    # R2/R7/R8/R9: per-variable value checks.
-    for name, (kind, allowed, _desc) in KNOWN.items():
-        raw = val(name)
+    def threshold(name):
+        raw = env.get(name)
         if raw is None:
-            continue
-        if kind == "one" and raw != "1":
-            if raw.strip().lower() in _TRUTHY_LOOKING:
-                warnings.append(
-                    f"{name}={raw!r} parses as OFF -- this switch only "
-                    f"understands '1'")
-        elif kind == "enum" and raw not in (allowed or set()):
-            fatals.append(
-                f"{name}={raw!r} is not one of {sorted(allowed)} -- an "
-                f"unrecognized value would silently fall back")
-        elif kind == "int":
-            try:
-                int(raw)
-            except ValueError:
-                fatals.append(
-                    f"{name}={raw!r} is not an integer -- it is parsed with "
-                    f"int() deep in the dispatch and would crash there")
+            return None
+        value = int(raw)
+        if value < 0:
+            raise ValueError(f'{name} must be nonnegative')
+        return value
 
-    model_dir = model_dir or val("RESIDUE_VLLM_MODEL_DIR")
-    has_metadata = False
-    if model_dir:
-        if not os.path.isdir(model_dir):
-            # Incident: a wrong path behaves exactly like an unset one.
-            fatals.append(
-                f"RESIDUE_VLLM_MODEL_DIR={model_dir!r} does not exist")
-        else:
-            has_metadata = os.path.isfile(
-                os.path.join(model_dir, METADATA_FILENAME))
-    else:
-        
-        
-        warnings.append(
-            "RESIDUE_VLLM_MODEL_DIR is unset -- if the checkpoint is a "
-            "residue export, create_weights will size merged params at stock "
-            "K and weight loading dies on `assert param_data.shape == "
-            "loaded_weight.shape`. Set it to the export directory.")
-
-    if val("RESIDUE_DECODE_MEXT_MAX_M") == "0":
-        # Reads like "turn the decode-side residue off". It is not: this is a
-        # DISPATCH threshold, so 0 only routes the layer to the other kernel,
-        # and residue_linear_op's own docstring says the two paths are
-        # numerically equivalent. An extended_k layer still applies its
-        # residue through the K-extension, and a mext_r1 layer ignores the
-        # threshold entirely. An arm named "decode mext off" set this way is
-        # not off, and nothing else would have said so.
-        warnings.append(
-            "RESIDUE_DECODE_MEXT_MAX_M=0 changes the KERNEL, not the maths: "
-            "residue is still applied (extended_k through its K-extension, "
-            "mext_r1 unconditionally). To actually deactivate the residue in "
-            "the decode band use RESIDUE_PREFILL_RESIDUE_OFF=1 with "
-            "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M=<fold band>.")
-
-    migrated = ("RESIDUE_SHARE_AUTOTUNE_CACHE", "RESIDUE_PREFILL_RESIDUE_OFF",
-                "RESIDUE_TENSOR_DUMP", "RESIDUE_STACK_DUMP_SIGNAL")
-    if env.get("RESINFER_DEV_EXPERIMENTS") != "1":
-        active = [name for name in migrated if env.get(name) not in (None, "", "0")]
-        if active:
-            fatals.append(f"{', '.join(active)} moved to .dev; launch with "
-                          ".dev/tools/vllm_patch/serve_vllm.py --residue_experiments")
-
-    mode = val("RESIDUE_PATCH_MODE")
-
-    if has_metadata and mode == "mext_r1":
-        
-        
-        
-        warnings.append(
-            "RESIDUE_PATCH_MODE=mext_r1 while the export carries "
-            f"{METADATA_FILENAME}: any projection WITHOUT a metadata entry is "
-            "silently name-forced to runtime mext_r1. For exports you almost "
-            "always want the mode unset (v2).")
-
-    if has_metadata and val("RESIDUE_ENABLE_DECODE_MEXT") != "1":
-        
-        
-        
-        
-        
-        
-        warnings.append(
-            "residue export without RESIDUE_ENABLE_DECODE_MEXT=1: on vLLM "
-            "0.26 this crashed weight loading with KeyError "
-            "'weight_scale_base' (implementation constraints, Still "
-            "open). If loading fails there, set RESIDUE_ENABLE_DECODE_MEXT=1.")
-
-
-    new_prefill = val("RESIDUE_RATIO1_PREFILL_PATH")
-    old_prefill = val("RESIDUE_MEXT_PREFILL_PATH")
-    if new_prefill is not None and old_prefill is not None and new_prefill != old_prefill:
-        fatals.append("RESIDUE_RATIO1_PREFILL_PATH conflicts with its legacy "
-                      "alias RESIDUE_MEXT_PREFILL_PATH")
-
-    resolved = (
-        f"mode={mode or 'v2(default)'} "
-        f"model_dir={'set' if model_dir else 'UNSET'}"
-        f"{'+metadata' if has_metadata else ''} "
-        f"decode_mext={'on' if val('RESIDUE_ENABLE_DECODE_MEXT') == '1' else 'off'} "
-        f"max_m={val('RESIDUE_DECODE_MEXT_MAX_M') or 'default'} "
-        f"ratio1_prefill_path={new_prefill or old_prefill or 'auto'} "
-        f"prefill_residue="
-        f"{'OFF' if val('RESIDUE_PREFILL_RESIDUE_OFF') == '1' else 'on'} "
-        f"share_autotune={'on' if val('RESIDUE_SHARE_AUTOTUNE_CACHE') == '1' else 'off'} "
-        f"swap={'on' if val('RESIDUE_SWAP') == '1' else 'off'} "
-        f"attn={'on' if val('RESIDUE_ATTN') == '1' else 'off'}"
+    mode = env.get('RESIDUE_PATCH_MODE', 'v2').strip().lower().replace('-', '_') or 'v2'
+    if mode not in ('v2', 'mext_r1'):
+        raise ValueError(f'Unknown RESIDUE_PATCH_MODE={mode!r}; expected v2 or mext_r1')
+    new = env.get('RESIDUE_RATIO1_PREFILL_PATH')
+    old = env.get('RESIDUE_MEXT_PREFILL_PATH')
+    if new is not None and old is not None and new != old:
+        raise ValueError('RESIDUE_RATIO1_PREFILL_PATH conflicts with RESIDUE_MEXT_PREFILL_PATH')
+    prefill = new if new is not None else old if old is not None else 'auto'
+    if prefill not in ('auto', 'two_gemm', 'k_loop'):
+        raise ValueError(f'Unknown ratio1 prefill path {prefill!r}')
+    projections = env.get('RESIDUE_MEXT_PROJ_NAMES', env.get(
+        'RESIDUE_MEXT_ATTN_PROJ_NAMES',
+        'q_proj,k_proj,v_proj,qkv_proj,o_proj,gate_proj,up_proj,gate_up_proj,down_proj'))
+    return NVFP4Settings(
+        mode, tuple(part.strip() for part in projections.split(',') if part.strip()),
+        flag('RESIDUE_ENABLE_DECODE_MEXT'), flag('RESIDUE_SWAP'),
+        flag('RESIDUE_FORCE_DECODE_MEXT'), flag('RESIDUE_DISABLE_SM10X_FOLD'),
+        threshold('RESIDUE_DECODE_MEXT_MAX_M'), threshold('RESIDUE_MEXT_FOLD_MAX_M'),
+        prefill, flag('RESIDUE_SM10X_FOLD_TUNER', '1'), flag('RESIDUE_SM120_FOLD_TUNER', '1'),
     )
-    return {"resolved": resolved, "warnings": warnings, "fatals": fatals}
 
 
-def enforce(model_dir: str | None = None) -> None:
-    """Check os.environ, print the resolved line, refuse fatal combinations.
+@lru_cache(maxsize=1)
+def settings() -> NVFP4Settings:
+    return parse_settings(os.environ)
 
-    Called from patch_vllm_modelopt in EVERY vLLM process (the plugin runs in
-    the spawned EngineCore too). RESIDUE_ENV_CHECK=0 downgrades refusals to
-    warnings; nothing disables the resolved-config line.
-    """
-    report = check(os.environ, model_dir=model_dir)
-    print(f"[residue:env] {report['resolved']}", flush=True)
-    for w in report["warnings"]:
-        print(f"[residue:env] WARNING: {w}", flush=True)
-    if not report["fatals"]:
-        return
-    if os.environ.get("RESIDUE_ENV_CHECK") == "0":
-        for f in report["fatals"]:
-            print(f"[residue:env] (downgraded) FATAL: {f}", flush=True)
-        return
-    lines = "\n  - ".join(report["fatals"])
-    raise RuntimeError(
-        f"[residue:env] refusing to start with a known-fatal configuration:"
-        f"\n  - {lines}\n"
-        "Fix the variables above, or set RESIDUE_ENV_CHECK=0 to run anyway "
-        "(the failure mode is documented next to each rule in "
-        "quant/vllm_integration/env_contract.py)."
+
+def enforce(model_dir=None) -> NVFP4Settings:
+    cfg = settings()
+    if model_dir and not Path(model_dir).is_dir():
+        raise ValueError(f'RESIDUE_VLLM_MODEL_DIR is not a directory: {model_dir!r}')
+    migrated = (
+        'RESIDUE_SHARE_AUTOTUNE_CACHE', 'RESIDUE_PREFILL_RESIDUE_OFF',
+        'RESIDUE_PREFILL_RESIDUE_OFF_MIN_M', 'RESIDUE_PREFILL_RESIDUE_OFF_MAX_M',
+        'RESIDUE_TENSOR_DUMP', 'RESIDUE_TENSOR_DUMP_MAX_M',
+        'RESIDUE_STACK_DUMP_SIGNAL', 'RESIDUE_OBSERVE_COMPILES',
     )
+    active = [name for name in migrated if os.environ.get(name) not in (None, '', '0')]
+    if active:
+        raise ValueError(f'Unsupported development switches: {", ".join(active)}')
+    print(f'[residue:env] mode={cfg.mode} decode_mext={cfg.decode_mext} '
+          f'max_m={cfg.decode_max_m} ratio1_prefill={cfg.ratio1_prefill}', flush=True)
+    return cfg

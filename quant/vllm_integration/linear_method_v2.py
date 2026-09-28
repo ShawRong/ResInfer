@@ -45,6 +45,7 @@ except ImportError:
 from .layout_utils import (
     prepare_decode_mext_weight_layout_from_raw_scale,
 )
+from .env_contract import settings
 from .linear_warmup import precompile_linear
 from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
 from .residue_tp import (
@@ -68,24 +69,6 @@ try:
     from vllm.model_executor.kernels.linear import FlashInferCuteDslNvFp4LinearKernel
 except ImportError:  # Added after the pinned development wheel.
     FlashInferCuteDslNvFp4LinearKernel = None  # type: ignore[assignment]
-
-
-# Process-startup cache: `RESIDUE_SWAP=1` toggles the swap-residue input
-# layout in the legacy K-ext quant kernel. Read once at module import so
-# the apply hot path does not call `os.environ.get` per forward (the V1
-# inline path used to read it per-call; harmless for eager, but a Python
-# side-effect that torch.compile would graph-break on under non-eager).
-_USE_SWAP = os.environ.get("RESIDUE_SWAP", "0") == "1"
-
-# Process-startup cache: `RESIDUE_ENABLE_DECODE_MEXT=1` enables fold-layout
-# prep for legacy `extended_k` residue layers — V2.PWAL snapshots the raw
-# FP8 weight scale before super-swizzle, then builds the base-K prefix
-# tensors via `prepare_decode_mext_weight_layout_from_raw_scale`. Without
-# this flag, extended_k layers never set `_decode_mext_layout_enabled` and
-# the op dispatcher always takes the legacy K-extension branch. Pure
-# `mext_r1` layers are always fold-eligible regardless of this flag — they
-# don't have a legacy fallback layout to choose from.
-_DECODE_MEXT_ENABLED = os.environ.get("RESIDUE_ENABLE_DECODE_MEXT", "0") == "1"
 
 
 def _is_kernel_instance(kernel: object, kernel_cls: type | None) -> bool:
@@ -135,19 +118,10 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         self.layer_prefix = layer_prefix
         self.group_size = getattr(quant_config, "group_size", 16)
         self._nvfp4 = None
+        self._settings = settings()
 
     def _get_runtime_mode(self, layer_name: str) -> str:
-        """Return the runtime mode for a layer.
-
-        Precedence:
-          1. Explicit residue metadata (exported residue checkpoints).
-          2. Global mext_r1 patch (RESIDUE_PATCH_MODE=mext_r1) applied to a
-             plain NVFP4 checkpoint: force mext_r1 fold on attention
-             projection layers only (by name); everything else — MoE experts,
-             MLP gate_up/down — stays STANDARD and delegates to native vLLM.
-             This is how decode-MExt runs on a stock NVFP4 model with no
-             residue export (the residue is computed at runtime).
-        """
+        """Explicit metadata wins; optional name selection applies to plain layers."""
         meta = get_layer_metadata(self.quant_config, layer_name)
         if meta:
             return meta.get("runtime_mode", self._RUNTIME_MODE_EXTENDED_K)
@@ -155,35 +129,9 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             return self._RUNTIME_MODE_MEXT_R1
         return self._RUNTIME_MODE_STANDARD
 
-    # Linear-projection layer-name fragments the global mext_r1 patch scopes the
-    # fold to. DEFAULT: ALL linear projections (attention q/k/v/o + MLP
-    # gate/up/down). MoE expert / router GEMMs are never folded.
-    #
-    # Override via RESIDUE_MEXT_PROJ_NAMES (comma-separated fragments). To fold
-    # attention only, set it to "q_proj,k_proj,v_proj,qkv_proj,o_proj". The
-    # legacy name RESIDUE_MEXT_ATTN_PROJ_NAMES is still honored as an alias.
-    _DEFAULT_FOLD_PROJ_NAMES = (
-        "q_proj,k_proj,v_proj,qkv_proj,o_proj,"
-        "gate_proj,up_proj,gate_up_proj,down_proj"
-    )
-    _FOLD_PROJ_NAME_FRAGMENTS = tuple(
-        s.strip() for s in os.environ.get(
-            "RESIDUE_MEXT_PROJ_NAMES",
-            os.environ.get(  # backward-compat alias
-                "RESIDUE_MEXT_ATTN_PROJ_NAMES", _DEFAULT_FOLD_PROJ_NAMES),
-        ).split(",") if s.strip()
-    )
-
     def _forced_mext_r1_for_layer(self, layer_name: str) -> bool:
-        """True iff the global mext_r1 patch should force this (metadata-less)
-        layer to the fold path -- i.e. the layer is one of the configured linear
-        projections (RESIDUE_MEXT_PROJ_NAMES; all linear projections by
-        default)."""
-        from .patch import is_patched_mext_r1
-
-        if not is_patched_mext_r1():
-            return False
-        return any(frag in layer_name for frag in self._FOLD_PROJ_NAME_FRAGMENTS)
+        return self._settings.mode == "mext_r1" and any(
+            fragment in layer_name for fragment in self._settings.projections)
 
     # Kernels whose PWAL produces the cutlass NVFP4 weight/scale layout our
     # residue op consumes. This is a LAYOUT compatibility set, not a backend
@@ -255,7 +203,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 f"layer_name={layer_name!r} "
                 f"input_size_per_partition={input_size_per_partition} "
                 f"extended_dim={extended_dim} "
-                f"decode_mext_enabled={_DECODE_MEXT_ENABLED}",
+                f"decode_mext_enabled={self._settings.decode_mext}",
                 flush=True,
             )
         # Row-parallel layers (o_proj / down_proj) arrive with the input
@@ -406,7 +354,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         # `layer.weight_scale` in place. The decode-mext layout prep needs the
         # un-swizzled FP8 scale to slice off the base-K prefix in raw layout.
         raw_weight_scale_ext = None
-        if _DECODE_MEXT_ENABLED and self._uses_cutlass_compatible_layout():
+        if self._settings.decode_mext and self._uses_cutlass_compatible_layout():
             raw_weight_scale_ext = layer.weight_scale.detach()
 
         salient_indices = None
@@ -469,7 +417,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
 
         layer._runtime_mode = runtime_mode
         layer._decode_mext_layout_enabled = False
-        if _DECODE_MEXT_ENABLED and self._uses_cutlass_compatible_layout():
+        if self._settings.decode_mext and self._uses_cutlass_compatible_layout():
             if (
                 getattr(layer, "_is_residue_layer", False)
                 and raw_weight_scale_ext is not None
@@ -496,7 +444,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 f"layer_name={layer_name!r} "
                 f"is_residue={getattr(layer, '_is_residue_layer', False)} "
                 f"uses_cutlass={self._uses_cutlass_compatible_layout()} "
-                f"decode_mext_enabled={_DECODE_MEXT_ENABLED} "
+                f"decode_mext_enabled={self._settings.decode_mext} "
                 f"decode_layout={getattr(layer, '_decode_mext_layout_enabled', False)} "
                 f"has_weight_scale_base={hasattr(layer, 'weight_scale_base')} "
                 f"k_base={getattr(layer, '_mext_decode_k_base', None)}",
@@ -625,11 +573,8 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
           • otherwise                          → legacy K-extension path
         All three select the same op symbol; only the arguments differ.
 
-        torch.compile captures one node per invocation with the per-layer arg
-        values baked in. cudagraph replay re-executes that node verbatim, so
-        kernel choice is consistent across all batch sizes — fixing the trace
-        baking bug where a single trace at max-M used to lock every captured
-        graph to the legacy K-ext branch.
+        torch.compile sees an opaque node. Its Python body chooses the path
+        at each CUDA graph capture size; replay runs the recorded kernels.
 
         V2 stays agnostic to *how* the mext layout was produced — both real
         M-extension layouts (pure mext_r1 layers) and K-extension + prepare-
@@ -685,7 +630,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             int(getattr(layer, "weights_padding_cols", 0)),
             int(output_n),
             bool(fold_eligible),
-            _USE_SWAP,
+            self._settings.swap,
             # mext_r1 layers were charged for a residue, so they must apply it
             # at EVERY M -- see the dispatch comment in residue_linear_op. A
             # plain-NVFP4 layer is also fold_eligible (the small-M fold is a
@@ -724,7 +669,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         output_shape = [*x.shape[:-1], output_size]
         x_2d = x.reshape(-1, x.shape[-1])
 
-        use_swap = _USE_SWAP
+        use_swap = self._settings.swap
         x_fp4, x_sf_block = self._nvfp4.scaled_fp4_quant_with_mask(
             x_2d,
             layer.input_global_scale_inv,

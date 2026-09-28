@@ -115,7 +115,8 @@ def tuned_nvfp4_linear(inputs, policy):
                             if 0 < b <= max(_BUCKETS)}))
     # All candidate families share this call and its cold-L2 measurement.
     fold_tuner = policy.sm10x_tuner if policy.arch in ("sm100", "sm103") else policy.sm120_tuner
-    enabled = policy.fold_eligible and (fold_tuner or (policy.ratio1 and policy.prefill == "auto"))
+    enabled = (policy.fold_eligible and policy.arch is not None
+               and (fold_tuner or (policy.ratio1 and policy.prefill == "auto")))
     if not enabled:
         return _fallback(inputs, policy)
     from .sm10x_fold_tuner import candidates_hash
