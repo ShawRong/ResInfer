@@ -46,7 +46,7 @@ from .layout_utils import (
     prepare_decode_mext_weight_layout_from_raw_scale,
 )
 from .env_contract import settings
-from .linear_utils import _InputQuantizerState, get_extended_dim, get_layer_metadata
+from .metadata import get_extended_dim, get_layer_metadata
 from .residue_tp import (
     SF_VEC_SIZE as SF_VEC_SIZE_FOR_TP,
     current_tp_rank,
@@ -97,6 +97,14 @@ def _log_selected_kernel_once(method) -> None:
               "decode-MExt layout) will be disabled or fail on this kernel. "
               "Pin a compatible one: --linear-backend cutlass "
               "(or flashinfer_cutlass / flashinfer_cutedsl).", flush=True)
+
+
+class _InputQuantizerState(torch.nn.Module):
+    """Receive input_quantizer.* checkpoint tensors during NVFP4 loading."""
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("_salient_indices", torch.empty(0, dtype=torch.int64))
 
 
 class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):

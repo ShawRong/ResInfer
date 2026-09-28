@@ -24,7 +24,6 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
 
     def __init__(self, exclude_modules=None):
         super().__init__(exclude_modules or [])
-        self._metadata = None
 
     @classmethod
     def get_name(cls):
@@ -60,25 +59,9 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
             raise ValueError("ModelOpt exclude_modules/ignore must be a list of strings")
         return cls(excluded)
 
-    def _load_metadata(self):
-        if self._metadata is not None:
-            return self._metadata
-        from pathlib import Path
-        from .metadata import load_residue_metadata
-
-        model_dir = os.environ.get("RESIDUE_VLLM_MODEL_DIR")
-        if not model_dir:
-            from vllm.config import get_current_vllm_config
-            model_dir = get_current_vllm_config().model_config.model
-        if not Path(model_dir).is_dir():
-            raise ValueError("MXFP4 residue metadata requires a local model directory; "
-                             "set RESIDUE_VLLM_MODEL_DIR to the checkpoint directory")
-        # Native non-residue checkpoints need no sidecar. Parse errors must fail.
-        self._metadata = load_residue_metadata(model_dir)
-        return self._metadata
-
     def get_quant_method(self, layer, prefix):
-        from .linear_utils import get_residue_layer_candidates, get_fused_hf_candidates
+        from .metadata import (get_residue_metadata, get_residue_layer_candidates,
+                               get_fused_hf_candidates)
         from vllm.model_executor.layers.fused_moe import RoutedExperts
 
         if isinstance(layer, RoutedExperts):
@@ -99,7 +82,7 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
             if not whole and not all_members:
                 raise ValueError(f"partially quantized fused group: {prefix}")
             return UnquantizedLinearMethod()
-        data = self._load_metadata()
+        data = get_residue_metadata(self, require_local=True)
         layers = data.get("layers", {})
         metas = [layers[name] for name in candidates if name in layers]
         if metas and any(meta != metas[0] for meta in metas[1:]):
