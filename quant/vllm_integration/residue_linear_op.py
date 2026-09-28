@@ -65,36 +65,6 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
 # Row-pair layout used by the two-GEMM prefill fallback.
 _LAYOUT_ROW_PAIR = 1
 
-# ── how a layer represents its residue ─────────────────────────────────────
-# Derived, never passed: the op already receives `num_salient` and
-# `is_mext_r1` separately, so the information is unambiguous AT THE BOUNDARY.
-# What was ambiguous was the CODE, which branched on `num_salient == 0` — a
-# value that means two opposite things:
-#
-#   "plain layer, no residue at all"                        -> RESIDUE_NONE
-#   "mext_r1 layer, the M-extension layout IS the residue,
-#    so there are no separate salient channels"             -> RESIDUE_MEXT_R1
-#
-# That collision produced one silent-wrong-numerics bug (4083dee: above the
-# fold's M threshold a mext_r1 layer took the plain bypass and returned
-# bit-identical-to-plain output), and it has since misled two readers who
-# stopped at the `== 0` test. Branch on the name, not the number.
-RESIDUE_NONE = "none"
-RESIDUE_K_EXT = "k_ext"
-RESIDUE_MEXT_R1 = "mext_r1"
-
-
-def residue_kind_of(num_salient: int, is_mext_r1: bool) -> str:
-    """Which residue representation this layer uses.
-
-    `is_mext_r1` wins: a mext_r1 layer legitimately reports num_salient == 0
-    because every channel is salient and the residue lives in the doubled
-    token rows, not in a channel subset.
-    """
-    if is_mext_r1:
-        return RESIDUE_MEXT_R1
-    return RESIDUE_NONE if int(num_salient) == 0 else RESIDUE_K_EXT
-
 
 
 
@@ -223,28 +193,6 @@ _PREFILL_RESIDUE_OFF = (
 _PREFILL_RESIDUE_OFF_MIN_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M")
 _PREFILL_RESIDUE_OFF_MAX_M = os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MAX_M")
 
-
-def prefill_residue_disabled(original_m: int, fold_max_m: int) -> bool:
-    """Should the kill switch neuter the residue at this M?
-
-    Same deactivation path in every case -- computed to zero, no load-time
-    change -- which is why this switch works where overloading a dispatch
-    threshold does not.
-    """
-    if not _PREFILL_RESIDUE_OFF:
-        return False
-    m = int(original_m)
-    if _PREFILL_RESIDUE_OFF_MAX_M is not None and m <= int(_PREFILL_RESIDUE_OFF_MAX_M):
-        return True
-    if _PREFILL_RESIDUE_OFF_MIN_M is not None:
-        return m > int(_PREFILL_RESIDUE_OFF_MIN_M)
-    # Neither bound given, or only _MAX_M: the "above" rule falls back to the
-    # fold band ONLY when no bound was named at all. Applying it alongside an
-    # explicit _MAX_M would kill both sides and silently produce the plain arm
-    # under the name "prefill-only".
-    if _PREFILL_RESIDUE_OFF_MAX_M is not None:
-        return False
-    return m > int(fold_max_m)
 
 # ── SM100/SM103 (B200/B300) CuTeDSL fold path ──────────────────────────────
 # Blackwell datacenter GPUs use the CuTeDSL sm100/sm103 fork
@@ -515,225 +463,71 @@ def _run_ratio1_prefill_two_gemm(
     return y[0::2] + y[1::2]
 
 
-def _nvfp4_linear_impl(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    input_global_scale_inv: torch.Tensor,
-    weight_scale: torch.Tensor,
-    weight_scale_base: torch.Tensor,
-    channel_mask: torch.Tensor,
-    alpha: torch.Tensor,
-    k_base: int,
-    num_salient: int,
-    weights_padding_cols: int,
-    output_size: int,
-    fold_eligible: bool,
-    use_swap: bool,
-    is_mext_r1: bool,
-) -> torch.Tensor:
-    """Static NVFP4 fallback shared by tuning and serving.
+def _linear_policy(k_base, num_salient, padding, output_size,
+                   fold_eligible, use_swap, ratio1):
+    from ..flashinfer_integration.nvfp4_linear_tuner import NVFP4Policy
 
-    Dispatch rule (computed inside the opaque body, so each cudagraph capture
-    sees the real M of its capture size):
+    sm10x = _sm10x_fold_arch()
+    arch = sm10x or ("sm120" if torch.cuda.get_device_capability()[0] == 12 else None)
+    return NVFP4Policy(
+        int(k_base), int(num_salient), int(padding), int(output_size),
+        bool(fold_eligible), bool(use_swap), bool(ratio1), arch,
+        fold_max_m_for(sm10x), mext_fold_max_m_for(sm10x), _FORCE_FOLD,
+        _PREFILL_RESIDUE_OFF,
+        int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
+        int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,
+        _RATIO1_PREFILL_PATH,
+        os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1",
+        os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1") == "1",
+    )
 
-        use_fold = fold_eligible AND (is_mext_r1 OR _FORCE_FOLD
-                                      OR x.shape[0] <= fold_max_m_for(arch))
 
-      • use_fold → scaled_fp4_quant_mext_r1 + fold-tile8 GEMM (k_base prefix)
-      • else    → scaled_fp4_quant_with_mask + cutlass_scaled_fp4_mm (full K_ext)
+def _nvfp4_linear_impl(inputs, policy):
+    """Execute the static implementation of the shared numerical route."""
+    from ..flashinfer_integration.nvfp4_linear_tuner import (
+        _fold_inputs, _residue_off, _route,
+    )
 
-    The two paths are numerically equivalent; only kernel layout differs.
-
-    `_FORCE_FOLD` (env: `RESIDUE_FORCE_DECODE_MEXT=1`) skips the M threshold,
-    so every fold-eligible layer takes fold regardless of M — used by the
-    decode-only server in PD-disaggregated deployments to lock the captured
-    kernel sequence to a single path.
-
-    Args:
-        x: (M, K) bfloat16 activation tensor.
-        weight: (N, K_extended_packed) FP4-packed weight.
-        input_global_scale_inv: scalar reciprocal of the input global scale.
-        weight_scale: full-K block scale for `weight` (used by legacy path).
-        weight_scale_base: base-K block scale (used by fold path; covers only
-            the first k_base columns of `weight`). Caller passes the same as
-            `weight_scale` if the layer has no separate base-scale.
-        channel_mask: salient-channel bitmask (used by legacy path quant).
-            Caller passes a 1-byte placeholder if the layer has no mask.
-        alpha: per-tensor output scale.
-        k_base: effective K dim for the fold path GEMM.
-        num_salient: salient-channel count for the legacy path quant.
-        weights_padding_cols: cutlass weight col-padding (legacy path needs to
-            pad activation to match).
-        output_size: output feature dim, used by legacy path to slice off any
-            column padding the cutlass kernel produced.
-        fold_eligible: per-layer constant — True iff the layer has the mext
-            fold layout prepared (`_decode_mext_layout_enabled`, plus a valid
-            base-K scale and k_base). The op decides at runtime whether to
-            actually take the fold branch based on actual M.
-        use_swap: swap-residue layout flag (legacy path only).
-
-    Returns:
-        (M, N) bfloat16 output. Caller adds bias and applies any final
-        view/reshape outside this op.
-    """
-    original_m = x.shape[0]
-    K_base = x.shape[-1]
-    output_n = weight.shape[0]
-
-    if original_m == 0:
-        return x.new_empty((0, output_n))
-
-    output_dtype = x.dtype
-
-    
-    
-    
-    
-    
-    
-    
-    sm10x_arch = _sm10x_fold_arch()
-    fold_arch = sm10x_arch or (
-        "sm120" if torch.cuda.get_device_capability()[0] == 12 else None)
-    fold_max_m = fold_max_m_for(sm10x_arch)
-    mext_fold_max_m = mext_fold_max_m_for(sm10x_arch)
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    _prefill_off = prefill_residue_disabled(original_m, fold_max_m)
-    use_fold = (not _prefill_off) and fold_eligible and fold_arch is not None and (
-        is_mext_r1 or _FORCE_FOLD or original_m <= fold_max_m)
-
-    if use_fold:
-        args = [x, _base_k_weight_view(weight, k_base),
-                input_global_scale_inv, weight_scale_base, alpha]
-        if is_mext_r1 and original_m > mext_fold_max_m:
-            if _RATIO1_PREFILL_PATH == "k_loop":
+    x, weight, scale_inv, weight_scale, _base_sf, mask, alpha = inputs
+    m, k = x.shape
+    if m == 0:
+        return x.new_empty((0, policy.output_size))
+    route = _route(m, policy)
+    if route == "invalid_mext":
+        raise RuntimeError("Ratio-1 residue requires a prepared Fold path")
+    if route in ("ratio1_prefill", "sm10x_fold", "sm120_fold"):
+        args = _fold_inputs(inputs, policy)
+        if route == "ratio1_prefill":
+            if policy.prefill == "k_loop":
                 from ..flashinfer_integration.ratio1_prefill_tuner import (
-                    _kloop_valid_tactics, _run_kloop)
+                    _kloop_valid_tactics, _run_kloop,
+                )
                 ready = _kloop_valid_tactics(args, False)
                 if ready:
                     return _run_kloop(args, ready[0])
-            return _run_ratio1_prefill_two_gemm(*args, output_dtype)
-        if sm10x_arch is not None:
+            return _run_ratio1_prefill_two_gemm(*args, x.dtype)
+        if route == "sm10x_fold":
             from ..flashinfer_integration.sm10x_fold_tuner import _run_fallback
-            return _run_fallback(args, output_dtype)[:original_m]
+            return _run_fallback(args, x.dtype)[:m]
         from ..flashinfer_integration.sm120_fold_tuner import run_fold_table
-        return run_fold_table(args, output_dtype)[:original_m]
+        return run_fold_table(args, x.dtype)[:m]
 
-    # ── no residue at all: stock vLLM NVFP4 ────────────────────────────────
-    # Reached when a layer that carries no residue entered the op anyway and
-    # the fold was not chosen (RESIDUE_ENABLE_DECODE_MEXT=0 -> fold_eligible
-    # False, or M > fold_max_m_for(arch)).
-    #
-    # The legacy K-ext path below would call scaled_fp4_quant_with_mask, which
-    # needs a real channel_mask; a plain layer passes a 1-byte dummy via
-    # _apply_residue_via_op and that combination crashes in the C++ binding.
-    # The stock cutlass chain is bit-equivalent to
-    # CutlassNvFp4LinearKernel.apply_weights.
-    kind = residue_kind_of(num_salient, is_mext_r1)
-
-    if kind == RESIDUE_MEXT_R1 and _prefill_off:
-        # The kill switch is the ONE legitimate way for a mext_r1 layer to
-        # reach this point, and it wants exactly what the guard below exists
-        # to prevent: plain NVFP4. `weight` for a mext_r1 layer is stored once
-        # and k_base spans it, so `weight`/`weight_scale` are already the
-        # full-K pair the cutlass bypass expects -- no view, no re-padding.
-        kind = RESIDUE_NONE
-
-    if kind == RESIDUE_MEXT_R1:
-        # Unreachable today: use_fold is forced true for mext_r1, so we
-        # returned above. Assert it rather than trust that, because the
-        # protection is indirect -- fold_eligible can still be False on an
-        # unsupported arch or with RESIDUE_DISABLE_SM10X_FOLD=1, and then this
-        # would fall through to the plain path below and compute NO residue.
-        # That is not a degraded answer, it is the wrong one, and there is no
-        # correct fallback: a mext_r1 layer has no K-extended weight to use.
-        # Failing here is how that stays a crash instead of a quiet -Npp.
-        raise RuntimeError(
-            "mext_r1 layer reached the non-fold path (fold_eligible="
-            f"{bool(fold_eligible)}, M={int(x.shape[0])}). The residue cannot "
-            "be applied without the fold kernel and there is no K-extended "
-            "weight to fall back to. Check the GPU architecture and "
-            "RESIDUE_DISABLE_SM10X_FOLD rather than letting this serve plain "
-            "NVFP4."
-        )
-
-    if kind == RESIDUE_NONE:
+    if route == "plain":
         x_fp4, x_sf = scaled_fp4_quant(
-            x,
-            input_global_scale_inv,
-            is_sf_swizzled_layout=True,
-            backend="cutlass",
-        )
-        x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, int(weights_padding_cols))
-        out = cutlass_scaled_fp4_mm(
-            x_fp4,
-            weight,
-            x_sf,
-            weight_scale,
-            alpha,
-            output_dtype,
-        )
-        return slice_nvfp4_output(out, int(output_size))
-
-    # ── legacy K-extension residue path (cutlass backend) ──────────────────
-    # n_ext = K_base + num_salient (per residue contract); M stays as M.
-    # All shape math derived from `x.shape` and the int `num_salient`, never
-    # from x_fp4.shape.
-    n_ext = K_base + int(num_salient)
-    num_m_tiles = (original_m + 127) // 128
-    num_k_tiles = (n_ext + 63) // 64
-
-    x_fp4, x_sf_block = nvfp4.scaled_fp4_quant_with_mask(
-        x,
-        input_global_scale_inv,
-        channel_mask,
-        int(num_salient),
-        use_swapped_residue=use_swap,
-    )
-    if _prefill_off:
-        # EXPERIMENT (RESIDUE_PREFILL_RESIDUE_OFF): drop the residue without
-        # touching any layout. The extended activation is [base | residue] with
-        # the residue a contiguous suffix at extended-K positions
-        # [K_base, K_base + num_salient), i.e. packed columns
-        # [K_base // 2, n_ext // 2). fp4 code 0 decodes to +0.0, so zeroing
-        # those bytes makes the extension contribute exactly nothing and the
-        # GEMM returns plain NVFP4 over the base columns -- with the same
-        # weight, the same weight_scale and the same padding as the residue
-        # path, so the two arms differ in nothing else.
-        x_fp4[:, K_base // 2:].zero_()
-    x_sf_block = x_sf_block.view(torch.float8_e4m3fn).view(
-        num_m_tiles * 128,
-        num_k_tiles * 4,
-    )
-    x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, int(weights_padding_cols))
+            x, scale_inv, is_sf_swizzled_layout=True, backend="cutlass")
+    else:
+        x_fp4, x_sf = nvfp4.scaled_fp4_quant_with_mask(
+            x, scale_inv, mask, policy.num_salient,
+            use_swapped_residue=policy.use_swap)
+        if _residue_off(m, policy):
+            x_fp4[:, k // 2:].zero_()
+        x_sf = x_sf.view(torch.float8_e4m3fn).view(
+            ((m + 127) // 128) * 128,
+            ((k + policy.num_salient + 63) // 64) * 4)
+    x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, policy.padding)
     out = cutlass_scaled_fp4_mm(
-        x_fp4,
-        weight,
-        x_sf_block,
-        weight_scale,
-        alpha,
-        output_dtype,
-    )
-    return slice_nvfp4_output(out, int(output_size))
+        x_fp4, weight, x_sf, weight_scale, alpha, x.dtype)
+    return slice_nvfp4_output(out, policy.output_size)
 
 
 @torch.library.custom_op(
@@ -760,21 +554,8 @@ def nvfp4_linear(
         return x.new_empty((0, weight.shape[0]))
     from ..flashinfer_integration.nvfp4_linear_tuner import tuned_nvfp4_linear
 
-    sm10x_arch = _sm10x_fold_arch()
-    arch = sm10x_arch or (
-        "sm120" if torch.cuda.get_device_capability()[0] == 12 else None)
-    policy = (
-        int(k_base), int(num_salient), int(weights_padding_cols),
-        int(output_size), bool(fold_eligible), bool(use_swap), bool(is_mext_r1),
-        arch, fold_max_m_for(sm10x_arch),
-        mext_fold_max_m_for(sm10x_arch), bool(_FORCE_FOLD),
-        bool(_PREFILL_RESIDUE_OFF),
-        int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
-        int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,
-        _RATIO1_PREFILL_PATH,
-        os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1",
-        os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1") == "1",
-    )
+    policy = _linear_policy(k_base, num_salient, weights_padding_cols,
+                            output_size, fold_eligible, use_swap, is_mext_r1)
     return tuned_nvfp4_linear(
         [x, weight, input_global_scale_inv, weight_scale,
          weight_scale_base, channel_mask, alpha], policy,
