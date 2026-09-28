@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 from functools import lru_cache
 
 import torch
@@ -164,7 +163,3 @@ def valid_tactics(inputs, out_dtype, tuning):
         pi_via_layout=_candidates()[i][0] == ("tile8", "pi"),
         strided_weight=a_ld is not None, dual_alpha=inputs[4].numel() == 2,
         compile_if_missing=False) is not None]
-
-
-def tuner_enabled() -> bool:
-    return os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1"
