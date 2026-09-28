@@ -7,6 +7,8 @@ import os
 
 import torch
 
+from .. import diagnostics
+
 
 def _sample_shapes(runner):
     cfg = runner.vllm_config
@@ -90,7 +92,7 @@ def _run_samples(runner, dummy_run, layers, shapes, phase):
                 raise RuntimeError("ResAttn startup sample missed its tuned cache entry")
             records.append(dict(batch=batch, length=length, layers=len(layers),
                                 selections=statuses))
-    print(f"[residue] ResAttn {phase}: {records}", flush=True)
+    diagnostics.log_tuning_report(phase, records)
     return records
 
 

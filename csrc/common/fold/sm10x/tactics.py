@@ -4,14 +4,14 @@
 
 from __future__ import annotations
 
-import os
 import statistics
 
 import torch
 
+from ..diagnostics import silence_default_notice
+
 # Escape hatch for harnesses that call the fallback on purpose.
-_SILENCE_DEFAULT = os.environ.get(
-    "RESIDUE_FOLD_SILENCE_DEFAULT", "0") == "1"
+_SILENCE_DEFAULT = silence_default_notice()
 
 from .host import mext_fold_gemm_sm103
 

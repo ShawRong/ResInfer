@@ -7,7 +7,6 @@ vLLM's newer kernel registry.
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
@@ -33,6 +32,7 @@ from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
 )
 from vllm.utils.flashinfer import flashinfer_scaled_fp4_mm
 
+from . import diagnostics
 from .util import prepare_decode_mext_scale, swizzle_blockscale
 from .env_contract import settings
 from .metadata import get_extended_dim, get_layer_metadata
@@ -61,31 +61,6 @@ except ImportError:  # Added after the pinned development wheel.
 
 def _is_kernel_instance(kernel: object, kernel_cls: type | None) -> bool:
     return kernel_cls is not None and isinstance(kernel, kernel_cls)
-
-
-_KERNEL_LOGGED = [False]
-
-
-def _log_selected_kernel_once(method) -> None:
-    """Print which NVFP4 kernel vLLM selected, once, at model-build time.
-
-    This runs at the first create_weights -- BEFORE weight loading -- so an
-    incompatible selection is visible in the first screen of the log instead
-    of surfacing minutes later as a PWAL error.
-    """
-    if _KERNEL_LOGGED[0]:
-        return
-    _KERNEL_LOGGED[0] = True
-    compatible = isinstance(method.kernel, method._CUTLASS_LAYOUT_KERNELS)
-    print(f"[residue] vLLM NVFP4 linear kernel: "
-          f"{type(method.kernel).__name__} "
-          f"(residue-compatible layout: {'yes' if compatible else 'NO'})",
-          flush=True)
-    if not compatible:
-        print("[residue] WARNING: residue features (mext_r1 fold, "
-              "decode-MExt layout) will be disabled or fail on this kernel. "
-              "Pin a compatible one: --linear-backend cutlass "
-              "(or flashinfer_cutlass / flashinfer_cutedsl).", flush=True)
 
 
 class _InputQuantizerState(torch.nn.Module):
@@ -190,17 +165,10 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         registered or applied at runtime.
         """
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
-        _log_selected_kernel_once(self)
+        diagnostics.log_selected_kernel_once(self)
         extended_dim = self._get_extended_dim(layer_name)
-        if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
-            print(
-                "[residue:create_weights] "
-                f"layer_name={layer_name!r} "
-                f"input_size_per_partition={input_size_per_partition} "
-                f"extended_dim={extended_dim} "
-                f"decode_mext_enabled={self._settings.decode_mext}",
-                flush=True,
-            )
+        diagnostics.log_weight_creation(
+            self, layer_name, input_size_per_partition, extended_dim)
         # Row-parallel layers (o_proj / down_proj) arrive with the input
         # already sharded, so the extended K has to be sharded too. The plan
         # is built from these arguments alone -- `input_size_per_partition <
@@ -231,18 +199,8 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
             else:
                 input_size_per_partition = extended_dim
                 input_size = extended_dim
-            print(
-                f"[residue] {layer_name}: overriding input_size "
-                f"{original_input} -> {input_size_per_partition}"
-                + (
-                    f" (row-parallel tp={shard_plan.tp_size} "
-                    f"rank={shard_plan.tp_rank}: "
-                    f"{shard_plan.base_shard} base + "
-                    f"{shard_plan.salient_shard} salient)"
-                    if shard_plan is not None
-                    else ""
-                )
-            )
+            diagnostics.log_extended_input(
+                layer_name, original_input, input_size_per_partition, shard_plan)
 
         ModelOptNvFp4LinearMethod.create_weights(
             self,
@@ -281,7 +239,6 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         """
         from .residue_tp import interleave_extended_for_tp
 
-        layer_tag = getattr(layer, 'prefix', '?')
         targets = (("weight", 2), ("weight_scale", SF_VEC_SIZE_FOR_TP))
         for name, scale in targets:
             param = getattr(layer, name, None)
@@ -299,11 +256,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                         loaded_weight = interleave_extended_for_tp(
                             loaded_weight, shard_plan, scale=col_scale
                         )
-                    if os.environ.get("RESIDUE_DEBUG_TP", "0") == "1":
-                        print(f"[residue:tp-loader] {layer_tag} "
-                              f"loaded={tuple(loaded_weight.shape)} "
-                              f"expected_last={expected} interleaved={fired} "
-                              f"param={tuple(param_.data.shape)}", flush=True)
+                    diagnostics.log_tp_load(layer, loaded_weight, param_, expected, fired)
                     return orig_loader(param_, loaded_weight, *args, **kwargs)
 
                 return loader
@@ -432,18 +385,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                 layer._decode_mext_layout_enabled = True
                 layer.weight_scale_base = layer.weight_scale
                 layer._mext_decode_k_base = int(layer.original_in_features)
-        if os.environ.get("RESIDUE_DEBUG_CREATE_WEIGHTS", "0") == "1":
-            print(
-                "[residue:post_process_weights] "
-                f"layer_name={layer_name!r} "
-                f"is_residue={getattr(layer, '_is_residue_layer', False)} "
-                f"uses_cutlass={self._uses_cutlass_compatible_layout()} "
-                f"decode_mext_enabled={self._settings.decode_mext} "
-                f"decode_layout={getattr(layer, '_decode_mext_layout_enabled', False)} "
-                f"has_weight_scale_base={hasattr(layer, 'weight_scale_base')} "
-                f"k_base={getattr(layer, '_mext_decode_k_base', None)}",
-                flush=True,
-            )
+        diagnostics.log_weight_layout(self, layer, layer_name)
 
     def _pwal_mext_r1(self, layer: torch.nn.Module, layer_name: str) -> None:
         """PWAL for pure mext_r1 layers — bypasses the ModelOpt parent.

@@ -3,6 +3,8 @@
 """Lazy kernel loading and the decode residue feature gate."""
 import os
 
+from .. import diagnostics
+
 _DECODE_KERNEL_HOST = None
 _DECODE_KERNEL_CHECKED = False
 _QK_RESIDUE = os.environ.get("RESIDUE_ATTN_DISABLE_QK_RESIDUE", "0") != "1"
@@ -27,10 +29,5 @@ def _load_decode_kernel():
         _DECODE_KERNEL_HOST = host
     except Exception as exc:
         _DECODE_KERNEL_HOST = None
-        print(
-            "[residue] ResAttn: decode kernel `nvfp4.cute_attn.host` failed to "
-            f"import ({type(exc).__name__}: {exc}) -- backend will refuse at "
-            "the first decode forward.",
-            flush=True,
-        )
+        diagnostics.log_decode_import_failure(exc)
     return _DECODE_KERNEL_HOST

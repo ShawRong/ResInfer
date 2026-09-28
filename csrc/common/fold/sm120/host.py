@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import torch
 
+from ..diagnostics import log_compilation
+
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -108,8 +110,7 @@ def compile_fold_gemm_sm120(
         return _KERNEL_CACHE[key]
     if not compile_if_missing:
         return None
-    import os as _os
-    if _os.environ.get("NVFP4_FOLD_COMPILE_LOG", "0") == "1":
+    if log_compilation():
         print(f"[fold-compile] n_w={m} k={k} (dynamic m) "
               f"tile={tile_shape_mnk} a_ld={a_ld} k_loop={k_loop}", flush=True)
     from .kernel import Sm120BlockScaledGemmKernel

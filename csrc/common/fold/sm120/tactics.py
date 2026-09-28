@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import os
-
 import torch
+
+from ..diagnostics import silence_default_notice
 
 
 
@@ -88,7 +88,7 @@ def run_fold_default(
     # sm120 it is a legitimate serving path (the fallback under the FlashInfer
     # tuner in quant/.../sm120_fold_tuner.py, the whole path when that tuner
     # is off). Announce once, as information, not as an alarm.
-    if (os.environ.get("RESIDUE_FOLD_SILENCE_DEFAULT", "0") != "1"
+    if (not silence_default_notice()
             and not _TABLE_ANNOUNCED[0]):
         _TABLE_ANNOUNCED[0] = True
         m_tok = act_fp4_rowpair.shape[0] // 2

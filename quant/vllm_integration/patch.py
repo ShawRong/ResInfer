@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+from . import diagnostics
+
 _installed_mode: str | None = None
 
 
@@ -56,7 +58,7 @@ def patch_vllm_modelopt(model_dir: str | None = None, version: str = 'auto') -> 
     ModelOptNvFp4Config.__init__ = initialize
     ModelOptNvFp4Config.get_quant_method = get_quant_method
     _installed_mode = cfg.mode
-    print(f'[residue] ModelOpt NVFP4 -> {method_cls.__name__} ({cfg.mode})', flush=True)
+    diagnostics.log_patch(method_cls.__name__, cfg.mode)
     return True
 
 

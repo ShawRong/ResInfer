@@ -5,6 +5,8 @@
 import inspect
 import os
 
+from .. import diagnostics
+
 _INSTALLED_ATTR = "_residue_res_attn_registered"
 _BACKEND_CLASS_PATH = (
     "quant.vllm_integration.attn.backend.ResAttnFlashInferBackend"
@@ -24,34 +26,18 @@ def _registry_shape_ok(reg) -> bool:
     if not hasattr(reg, "register_backend") or not hasattr(
         reg, "AttentionBackendEnum"
     ):
-        print(
-            "[residue] ResAttn register: vLLM registry lacks "
-            "register_backend/AttentionBackendEnum (layout drift); refusing.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("registry lacks register_backend/AttentionBackendEnum")
         return False
     if "CUSTOM" not in reg.AttentionBackendEnum.__members__:
-        print(
-            "[residue] ResAttn register: AttentionBackendEnum has no CUSTOM "
-            "member (vLLM drift); refusing.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("registry has no CUSTOM member")
         return False
     try:
         params = inspect.signature(reg.register_backend).parameters
     except (TypeError, ValueError) as e:
-        print(
-            f"[residue] ResAttn register: cannot introspect register_backend "
-            f"({e}); refusing.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("cannot introspect register_backend", e)
         return False
     if "backend" not in params or "class_path" not in params:
-        print(
-            "[residue] ResAttn register: register_backend signature changed "
-            f"(params={list(params)}); refusing.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("register_backend signature changed", list(params))
         return False
     return True
 
@@ -69,12 +55,7 @@ def install(force: bool = False) -> bool:
     try:
         import vllm.v1.attention.backends.registry as reg
     except Exception as e:  # pragma: no cover - vLLM missing/drifted
-        print(
-            f"[residue] ResAttn register: vLLM v1 attention registry "
-            f"unavailable ({e}); refusing -- vLLM runs with its default "
-            "backend.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("vLLM attention registry unavailable", e)
         return False
 
     if getattr(reg, _INSTALLED_ATTR, False):
@@ -89,12 +70,7 @@ def install(force: bool = False) -> bool:
             other = reg.AttentionBackendEnum.CUSTOM.get_path()
         except Exception:
             other = "<unknown>"
-        print(
-            f"[residue] ResAttn register: CUSTOM already registered to "
-            f"{other!r}; refusing to overwrite. Unset the other registration "
-            "or clear_override() first.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("CUSTOM already registered; refusing to overwrite", other)
         return False
 
     # Import our backend BEFORE registering: if the vLLM interfaces our class
@@ -108,25 +84,14 @@ def install(force: bool = False) -> bool:
 
         assert issubclass(ResAttnFlashInferBackend, AttentionBackend)
     except Exception as e:
-        print(
-            f"[residue] ResAttn register: backend class failed to import/"
-            f"validate ({e!r}); refusing -- vLLM runs with its default "
-            "backend.",
-            flush=True,
-        )
+        diagnostics.log_registration_failure("backend class failed to import/validate", e)
         return False
 
     reg.register_backend(
         reg.AttentionBackendEnum.CUSTOM, class_path=_BACKEND_CLASS_PATH
     )
     setattr(reg, _INSTALLED_ATTR, True)
-    print(
-        "[residue] ResAttn backend REGISTERED on AttentionBackendEnum.CUSTOM "
-        f"({_BACKEND_CLASS_PATH}). Select it with --attention-backend CUSTOM "
-        "--kv-cache-dtype nvfp4 --block-size 128. Decode runs the fp4 kernel; "
-        "Pure prefill uses stock FlashInfer/TRT; mixed steps are unsupported.",
-        flush=True,
-    )
+    diagnostics.log_registration_success(_BACKEND_CLASS_PATH)
     return True
 
 

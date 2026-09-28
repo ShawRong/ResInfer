@@ -10,6 +10,8 @@ from functools import lru_cache
 import os
 from pathlib import Path
 
+from . import diagnostics
+
 
 @dataclass(frozen=True)
 class NVFP4Settings:
@@ -82,6 +84,5 @@ def enforce(model_dir=None) -> NVFP4Settings:
     active = [name for name in migrated if os.environ.get(name) not in (None, '', '0')]
     if active:
         raise ValueError(f'Unsupported development switches: {", ".join(active)}')
-    print(f'[residue:env] mode={cfg.mode} decode_mext={cfg.decode_mext} '
-          f'max_m={cfg.decode_max_m} ratio1_prefill={cfg.ratio1_prefill}', flush=True)
+    diagnostics.log_settings(cfg)
     return cfg
