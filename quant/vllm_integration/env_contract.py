@@ -55,9 +55,12 @@ KNOWN: dict[str, tuple] = {
     "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M": ("int", None,
                                           "kill switch: deactivate where "
                                           "m <= t -- the 'prefill only' arm"),
+    "RESIDUE_RATIO1_PREFILL_PATH": ("enum",
+                                    {"auto", "two_gemm", "k_loop"},
+                                    "ratio-1 prefill route; decode Fold is separate"),
     "RESIDUE_MEXT_PREFILL_PATH": ("enum",
                                   {"auto", "two_gemm", "k_loop"},
-                                  'mext_r1 prefill route: auto selects FlashInfer-tuned two_gemm or k_loop; decode routing is independent.'),
+                                  "legacy alias of RESIDUE_RATIO1_PREFILL_PATH"),
     "RESIDUE_FOLD_MEXT": ("one", None, "enable A4/A6 tile8 families (sm10x)"),
     "RESIDUE_MEXT_FOLD_MAX_M": ("int", None,
                                  "largest SM10x MExt-r1 M routed to Fold; default 512"),
@@ -254,13 +257,19 @@ def check(env: Mapping[str, str], model_dir: str | None = None) -> dict:
             "open). If loading fails there, set RESIDUE_ENABLE_DECODE_MEXT=1.")
 
 
+    new_prefill = val("RESIDUE_RATIO1_PREFILL_PATH")
+    old_prefill = val("RESIDUE_MEXT_PREFILL_PATH")
+    if new_prefill is not None and old_prefill is not None and new_prefill != old_prefill:
+        fatals.append("RESIDUE_RATIO1_PREFILL_PATH conflicts with its legacy "
+                      "alias RESIDUE_MEXT_PREFILL_PATH")
+
     resolved = (
         f"mode={mode or 'v2(default)'} "
         f"model_dir={'set' if model_dir else 'UNSET'}"
         f"{'+metadata' if has_metadata else ''} "
         f"decode_mext={'on' if val('RESIDUE_ENABLE_DECODE_MEXT') == '1' else 'off'} "
         f"max_m={val('RESIDUE_DECODE_MEXT_MAX_M') or 'default'} "
-        f"prefill_path={val('RESIDUE_MEXT_PREFILL_PATH') or 'auto'} "
+        f"ratio1_prefill_path={new_prefill or old_prefill or 'auto'} "
         f"prefill_residue="
         f"{'OFF' if val('RESIDUE_PREFILL_RESIDUE_OFF') == '1' else 'on'} "
         f"share_autotune={'on' if val('RESIDUE_SHARE_AUTOTUNE_CACHE') == '1' else 'off'} "

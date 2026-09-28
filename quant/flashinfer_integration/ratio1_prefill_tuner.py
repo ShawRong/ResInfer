@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NVFP4 prefill K-loop candidates used by the shared Linear tuner.
+"""Ratio-1 residue prefill K-loop candidates used by the shared Linear tuner.
 
 SM100 has two candidates; SM120 has one. Kernel readiness is checked before
 using a persisted tactic outside the FlashInfer tuning window.
@@ -13,7 +13,7 @@ from .fi_tuner_base import precompile, weight_geometry
 
 KLOOP_TILES = ((128, 128, 128),)
 KLOOP_SM100_CFGS = (((128, 128), (1, 1)), ((256, 128), (2, 1)))
-_CUSTOM_OP = "residue_mext_prefill_fp4_gemm"
+_CUSTOM_OP = "residue_ratio1_prefill_fp4_gemm"
 
 
 def _is_sm10x():

@@ -349,9 +349,9 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
     # sm100: the kloop kernels are symbolic-shape, so ONE compile per tile
     # config covers every layer -- trigger it from the first mext_r1
     # registration and the whitelist is complete for the whole model.
-    if key[3] and _sm10x_fold_arch() is not None and _mext_prefill_two_gemm():
+    if key[3] and _sm10x_fold_arch() is not None:
         try:
-            from ..flashinfer_integration.mext_prefill_tuner import precompile_kloop_sm100
+            from ..flashinfer_integration.ratio1_prefill_tuner import precompile_kloop_sm100
 
             precompile_kloop_sm100()
         except Exception as e:                            # noqa: BLE001
@@ -406,21 +406,12 @@ def register_sm120_fold_shape(n_w: int, k_base: int, k_ext: int,
         print(f"[residue] fold tuner candidates pre-compiled n_w={key[0]} "
               f"k={key[1]} a_ld={a_ld} x {n_cand} tiles", flush=True)
         if key[3]:
-            # mext_r1 prefill routes to the tuned two_gemm/k_loop dispatch;
+            # ratio-1 prefill routes to the tuned two_gemm/k_loop dispatch;
             # pre-compile the kloop grid HERE so get_valid_tactics can offer it
             # at serving without ever compiling there.
             #
-            # This read `key[3] and not mext_prefill_folds` until now, and that
-            # name has not existed since the fold was retired from prefill
-            # (34784f4 deleted `mext_prefill_folds = key[3] and not
-            # _mext_prefill_two_gemm()` and missed this use). The NameError was
-            # swallowed by the enclosing best-effort handler, printing one line
-            # among the startup warnings -- so the precompile this function
-            # exists to perform has not run since, and every mext_r1 shape has
-            # been JITing inside cudagraph capture instead. Now that prefill
-            # never folds, the condition it guarded is simply always true.
             try:
-                from ..flashinfer_integration.mext_prefill_tuner import precompile_kloop_sm120
+                from ..flashinfer_integration.ratio1_prefill_tuner import precompile_kloop_sm120
 
                 n_kloop = precompile_kloop_sm120(key[0], key[1])
                 if n_kloop:
@@ -525,19 +516,13 @@ def _base_k_weight_view(weight: torch.Tensor, k_base: int) -> torch.Tensor:
 
 
 
-_MEXT_PREFILL_PATH = os.environ.get("RESIDUE_MEXT_PREFILL_PATH", "auto")
+_RATIO1_PREFILL_PATH = os.environ.get(
+    "RESIDUE_RATIO1_PREFILL_PATH",
+    os.environ.get("RESIDUE_MEXT_PREFILL_PATH", "auto"),
+)
 
 
-def _mext_prefill_two_gemm() -> bool:
-    'True iff mext_r1 layers above the fold band LEAVE the direct-fold path.'
-    
-    
-    
-    
-    return True
-
-
-def _run_mext_r1_two_gemm(
+def _run_ratio1_prefill_two_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     input_global_scale_inv: torch.Tensor,
@@ -545,7 +530,7 @@ def _run_mext_r1_two_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """mext_r1 prefill: one backend GEMM at 2M rows + pair-sum epilogue.
+    """ratio-1 prefill: one backend GEMM at 2M rows + pair-sum epilogue.
 
     out[i] = W·base_i + W·res_i, exactly the fold's math. The mext_r1 quant's
     row_pair SF is bytewise the cutlass 128x4 swizzle over the 2M rows (the
@@ -676,14 +661,14 @@ def _nvfp4_linear_impl(
     if use_fold:
         args = [x, _base_k_weight_view(weight, k_base),
                 input_global_scale_inv, weight_scale_base, alpha]
-        if is_mext_r1 and original_m > mext_fold_max_m and _mext_prefill_two_gemm():
-            if _MEXT_PREFILL_PATH == "k_loop":
-                from ..flashinfer_integration.mext_prefill_tuner import (
+        if is_mext_r1 and original_m > mext_fold_max_m:
+            if _RATIO1_PREFILL_PATH == "k_loop":
+                from ..flashinfer_integration.ratio1_prefill_tuner import (
                     _kloop_valid_tactics, _run_kloop)
                 ready = _kloop_valid_tactics(args, False)
                 if ready:
                     return _run_kloop(args, ready[0])
-            return _run_mext_r1_two_gemm(*args, output_dtype)
+            return _run_ratio1_prefill_two_gemm(*args, output_dtype)
         if _sm10x_fold_arch() is not None:
             from ..flashinfer_integration.sm10x_fold_tuner import _run_fallback
             return _run_fallback(args, output_dtype)[:original_m]
@@ -821,7 +806,7 @@ def nvfp4_linear(
         bool(_PREFILL_RESIDUE_OFF),
         int(_PREFILL_RESIDUE_OFF_MIN_M) if _PREFILL_RESIDUE_OFF_MIN_M else None,
         int(_PREFILL_RESIDUE_OFF_MAX_M) if _PREFILL_RESIDUE_OFF_MAX_M else None,
-        _MEXT_PREFILL_PATH,
+        _RATIO1_PREFILL_PATH,
         os.environ.get("RESIDUE_SM10X_FOLD_TUNER", "1") == "1",
         os.environ.get("RESIDUE_SM120_FOLD_TUNER", "1") == "1",
     )

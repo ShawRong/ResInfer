@@ -35,7 +35,7 @@ def _route(m, policy):
     fold = not off and eligible and (is_mext or force_fold or m <= fold_max)
     if fold:
         if is_mext and m > mext_max:
-            return "prefill"
+            return "ratio1_prefill"
         return "sm10x_fold" if arch in ("sm100", "sm103") else "sm120_fold"
     if is_mext and not off:
         return "invalid_mext"
@@ -64,8 +64,8 @@ def _valid(inputs, policy, tuning):
             return []
         from .sm120_fold_tuner import valid_tactics
         return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, tuning)
-    if route == "prefill" and policy[14] == "auto":
-        from .mext_prefill_tuner import _kloop_valid_tactics
+    if route == "ratio1_prefill" and policy[14] == "auto":
+        from .ratio1_prefill_tuner import _kloop_valid_tactics
         return _kloop_valid_tactics(_fold_inputs(inputs, policy), tuning)
     return []
 
@@ -79,8 +79,8 @@ def _run(inputs, policy, tactic):
     if route == "sm120_fold":
         from .sm120_fold_tuner import _run_fold_tile, FOLD_TILES
         return _run_fold_tile(args, FOLD_TILES[tactic], inputs[0].dtype)
-    if route == "prefill":
-        from .mext_prefill_tuner import _run_kloop
+    if route == "ratio1_prefill":
+        from .ratio1_prefill_tuner import _run_kloop
         return _run_kloop(args, tactic)
     raise ValueError(f"tactic {tactic} is not valid for {route}")
 
@@ -119,7 +119,7 @@ def tuned_nvfp4_linear(inputs, policy):
         return _fallback(inputs, policy)
     from .sm10x_fold_tuner import candidates_hash
     from .sm120_fold_tuner import fold_tiles_hash
-    from .mext_prefill_tuner import KLOOP_SM100_CFGS, KLOOP_TILES
+    from .ratio1_prefill_tuner import KLOOP_SM100_CFGS, KLOOP_TILES
 
     cache_policy = (*policy, candidates_hash(), fold_tiles_hash(),
                     KLOOP_SM100_CFGS, KLOOP_TILES)
