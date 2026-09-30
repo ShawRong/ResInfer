@@ -19,6 +19,13 @@ def select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
                        residue_fold=False, reduction_policy=None):
     """Select the static split/reducer, then apply the caller's reduction policy."""
     policy = _reduction_policy(reduction_policy)
+    
+    
+    
+    if (policy != "deterministic" and sm_count == 148 and residue_fold
+            and grouped_head_tile == 8 and batch == 2 and num_kv_heads == 8
+            and 1024 <= max_kv_len <= 4096):
+        return 4, "gmem_fused" if output_nvfp4 else "cga_sharded"
     splits, reducer = _select_decode_plan(
         batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4=output_nvfp4,
         grouped_head_tile=grouped_head_tile, residue_fold=residue_fold)
@@ -45,6 +52,8 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
         plans.extend(((4, "gmem_fused"), (16, "gmem_fused")))
     else:
         plans.append((2, "atomic"))
+        if residue_fold and grouped_head_tile == 8:
+            plans.append((4, "cga_sharded"))
     return tuple(plans)
 
 
