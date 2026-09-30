@@ -13,32 +13,32 @@ def _reduction_policy(value=None):
 
 def select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
                        output_nvfp4=False, grouped_head_tile=16,
-                       residue_fold=False, reduction_policy=None):
+                       residue_fold=True, reduction_policy=None):
     """Select the static split/reducer, then apply the caller's reduction policy."""
     policy = _reduction_policy(reduction_policy)
-    fused = grouped_head_tile == 16 or (grouped_head_tile == 8 and residue_fold)
-    cga = sm_count == 148 and residue_fold and grouped_head_tile in (8, 16)
+    if not residue_fold or grouped_head_tile not in (8, 16):
+        raise NotImplementedError("production ResAttn requires residue Q8/Q16")
     splits, reducer = _select_decode_plan(
-        batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4,
-        fused=fused, cga=cga, fused_split_cap=16 if residue_fold else 32)
+        batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4)
     if policy == "deterministic" and reducer not in ("none", "kernel"):
         reducer = "kernel"
     return splits, reducer
 
 
 def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
-                         residue_fold=False):
+                         residue_fold=True):
     """Represent every static compiler variant, not a sampled input grid.
 
     Batch, KV length and split count are runtime arguments. Only reducer and
     scheduler specialize compilation: fused split4/8 and split16/32 use two
     schedulers. A few extra variants are intentional to cover policy changes.
     """
+    if not residue_fold or grouped_head_tile not in (8, 16):
+        raise NotImplementedError("production ResAttn requires residue Q8/Q16")
     plans = [(1, "none"), (2, "kernel")]
-    if output_nvfp4 and (grouped_head_tile == 16 or
-                         grouped_head_tile == 8 and residue_fold):
+    if output_nvfp4:
         plans.extend(((4, "gmem_fused"), (16, "gmem_fused")))
-    elif not output_nvfp4 and residue_fold and grouped_head_tile in (8, 16):
+    else:
         plans.append((4, "cga_sharded"))
     return tuple(plans)
 
@@ -47,7 +47,7 @@ def _power_of_two(value):
     return 1 << (value.bit_length() - 1)
 
 
-def _select_decode_plan(batch, heads, length, sms, packed, *, fused, cga, fused_split_cap):
+def _select_decode_plan(batch, heads, length, sms, packed):
     'Expose parallel work, then bound reduction cost.'
     grid = max(1, batch * heads)
     tiles = max(1, (length + 255) // 256)
@@ -55,12 +55,10 @@ def _select_decode_plan(batch, heads, length, sms, packed, *, fused, cga, fused_
     splits = min(budget, _power_of_two((tiles + 1) // 2), 64)
     if splits == 1:
         return 1, "none"
-    if packed and fused:
-        # More than 16 fused splits need at least eight KV tiles per CTA.
-        cap = min(fused_split_cap, max(16, _power_of_two(max(1, tiles // 8))))
-        splits = min(budget, max(4, _power_of_two(max(1, tiles // 4))), cap)
+    if packed:
+        splits = min(budget, max(4, _power_of_two(max(1, tiles // 4))), 16)
         return splits, "gmem_fused" if splits >= 4 else "kernel"
-    if packed or not cga:
+    if sms != 148:
         return splits, "kernel"
     cga = min(16, _power_of_two(max(2, sms // (2 * grid))), _power_of_two(tiles))
     if cga >= 2 and (length <= 2048 * cga or splits == 2):

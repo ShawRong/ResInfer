@@ -18,20 +18,12 @@ class ResAttnDecodeMixin:
         batch: int,
         device: torch.device,
         reduction: str = "kernel",
-        residue_fold: bool = False,
+        residue_fold: bool = True,
     ):
         # The CuTe kernel pads each GQA group to its supported N tile. Mirror
         # that effective head count here; using the model's unpadded HQ would
         # make the persistent workspace fail host validation for GQA < 16.
-        group_size = (
-            host._residue_padded_group_size(
-                self.num_heads, self.num_kv_heads
-            )
-            if residue_fold
-            else host._padded_group_size(
-                self.num_heads, self.num_kv_heads
-            )
-        )
+        group_size = host._residue_padded_group_size(self.num_heads, self.num_kv_heads)
         effective_heads = self.num_kv_heads * group_size
         if reduction not in ("kernel", "gmem_fused"):
             raise ValueError(f"unsupported persistent reduction: {reduction}")
@@ -146,12 +138,8 @@ class ResAttnDecodeMixin:
                 self.num_kv_heads,
                 decode.max_seq_len,
                 q_dec.device,
-                grouped_head_tile=(
-                    host._residue_padded_group_size(
-                        self.num_heads, self.num_kv_heads)
-                    if qk_residue else host._padded_group_size(
-                        self.num_heads, self.num_kv_heads)
-                ),
+                grouped_head_tile=host._residue_padded_group_size(
+                    self.num_heads, self.num_kv_heads),
                 residue_fold=qk_residue,
             )
             splits, reduction = decode_plan
