@@ -176,7 +176,7 @@ class ResAttnDecodeMixin:
             k_sf_mode="linear",
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
-            direct_output=True,
+            direct_output=qk_residue,
             plan=decode_plan,
             residue_fold=qk_residue,
         )

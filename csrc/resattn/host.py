@@ -571,6 +571,13 @@ def _quantize_q_residue_cuda(q: torch.Tensor, num_kv_heads: int):
     )
 
 
+@functools.cache
+def _q_quantization_edges(device):
+    # Created during eager warmup; reuse device constants during graph capture.
+    lut = torch.tensor(E2M1_LUT, device=device)
+    return (lut[1:] + lut[:-1]) / 2
+
+
 def _quantize_q(q: torch.Tensor, num_kv_heads: int):
     """bf16 [B, H_q, D] → (q_pack uint8 [B,1,H_q,D/2], q_sf e4m3 扁平 atom 序)。
 
@@ -580,8 +587,7 @@ def _quantize_q(q: torch.Tensor, num_kv_heads: int):
     B, HQ, D = q.shape
     g = HQ // num_kv_heads
     dev = q.device
-    lut = torch.tensor(E2M1_LUT, device=dev)
-    edges = (lut[1:] + lut[:-1]) / 2
+    edges = _q_quantization_edges(dev)
     x = q.float().reshape(B, num_kv_heads, g, D // SF_VEC, SF_VEC)
     sf = (x.abs().amax(-1) / 6.0).to(torch.float8_e4m3fn)
     sf_f = sf.float().clamp_min(1e-12)
