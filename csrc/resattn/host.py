@@ -306,8 +306,6 @@ def _compiled(
         sequence_tile=256,
         reduction_mode=reduction,  # type: ignore[arg-type]
         page_size=128,
-        v_mode=v_mode,  # type: ignore[arg-type]
-        k_sf_mode=k_sf_mode,  # type: ignore[arg-type]
         logical_grouped_heads=(
             output_num_qo_heads // num_kv_heads
             if output_nvfp4 or output_num_qo_heads != num_qo_heads
@@ -315,7 +313,6 @@ def _compiled(
         ),
         single_softmax_wg=single_softmax_wg,
         smem_correction_broadcast=smem_correction_broadcast,
-        residue_fold=residue_fold,
     )
     in_dtype = cutlass.Float4E2M1FN
     if partial_o_dtype not in ("fp32", "bf16"):
@@ -368,10 +365,7 @@ def _compiled(
         ),
         assumed_align=16,
     )
-    if output_nvfp4 and (
-        reduction not in ("none", "kernel", "gmem_fused")
-        or v_mode != "qmul4_tmem"
-    ):
+    if output_nvfp4 and reduction not in ("none", "kernel", "gmem_fused"):
         raise ValueError(
             "fused NVFP4 output requires qmul4_tmem and no reduction, the "
             "deterministic kernel reducer, or the fused last-CTA reducer"
@@ -451,10 +445,10 @@ def _compiled(
         fmha, Int32(1), q_fake, k_fake, v_fake,
         sf_flat(), k_sf_fake, v_sf_fake,
         o_fake, o_sf_fake, o_global_scale_fake,
-        None, None, o_partial_fake, l_partial_fake, m_partial_fake,
+        None, o_partial_fake, l_partial_fake, m_partial_fake,
         completion_fake,
         Float32(1.0), Float32(1.0), seq_lens_fake, block_tables_fake,
-        stream_fake, True, Int32(0),
+        stream_fake, True,
         options=compile_options,
     )
 
@@ -633,8 +627,6 @@ def run_paged_fp4_decode_qmul4_tmem(
     if direct_output and reduction not in ("none", "kernel", "cga_sharded"):
         # The gmem-fused reducer has an NVFP4-specific output contract.
         raise NotImplementedError(f"direct BF16 output: unsupported {reduction=}")
-    if k_sf_mode not in ("atom", "linear"):
-        raise ValueError(f"unsupported K-scale mode: {k_sf_mode}")
     f = compile_decode_variant(decode_compile_spec(
         HQ, H, D, (splits, reduction),
         output_nvfp4=False, residue_fold=residue_fold,
@@ -694,20 +686,15 @@ def run_paged_fp4_decode_qmul4_tmem(
         k_arg,
         v_arg,
         q_sf,
-        (
-            pool.k_sf
-            if k_sf_mode == "linear"
-            else pool.k_sf.reshape(-1).view(torch.float8_e4m3fn)
-        ),
+        pool.k_sf,
         v_sf_bthd,
         out_eff.view(B, 1, HQ if direct_output else H * g_pad, D),
-        None, None, None, None, o_partial, l_partial, m_partial, None,
+        None, None, None, o_partial, l_partial, m_partial, None,
         Float32(sm_scale),
         Float32(value_scale),
         seq_lens,
         block_tables,
         False,
-        Int32(0),
     )
     if out_eff is not out:
         out.view(B, H, g, D).copy_(
@@ -818,8 +805,6 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
     _check_decode_metadata(block_tables, seq_lens, B, q.device)
     g = HQ // H
     g_pad = _residue_padded_group_size(HQ, H)
-    if k_sf_mode not in ("atom", "linear"):
-        raise ValueError(f"unsupported K-scale mode: {k_sf_mode}")
     if v_data_hnd.shape != (pool.k_data.shape[0], H, PAGE_SIZE, D // 2):
         raise ValueError(
             "v_data_hnd must be [page, head, 128, D/2], got "
@@ -969,16 +954,11 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         k_arg,
         v_arg,
         q_sf,
-        (
-            pool.k_sf
-            if k_sf_mode == "linear"
-            else pool.k_sf.reshape(-1).view(torch.float8_e4m3fn)
-        ),
+        pool.k_sf,
         v_sf_bthd,
         out.view(B, 1, HQ, D // 2).view(torch.float4_e2m1fn_x2),
         output_block_scale.reshape(-1),
         output_global_scale_inv.reshape(1),
-        None,
         None,
         o_partial,
         l_partial,
@@ -989,6 +969,5 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         seq_lens,
         block_tables,
         False,
-        Int32(0),
     )
     return out, output_block_scale

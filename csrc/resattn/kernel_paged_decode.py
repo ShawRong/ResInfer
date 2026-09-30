@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors (modifications)
 # SPDX-License-Identifier: BSD-3-Clause
-"ResAttn: paged NVFP4 GQA decode attention (Blackwell tcgen05, CuTeDSL).\n\nDerived from FlashInfer's ``flashinfer/cute_dsl/attention/gqa_decode.py``\n(NVIDIA, BSD-3-Clause). The production mode is ``qmul4_tmem``: FP4 QK with optional Q\nresidue, conventional token-major V, QMUL4 conversion, and BF16 or packed\nNVFP4 output. Paged addressing, padded/residue head mapping and fused output\nreducers are local extensions."
+"ResAttn: paged NVFP4 GQA decode attention (Blackwell tcgen05, CuTeDSL).\n\nDerived from FlashInfer's ``flashinfer/cute_dsl/attention/gqa_decode.py``\n(NVIDIA, BSD-3-Clause). The production mode is ``qmul4_tmem``: FP4 QK with Q\nresidue, conventional token-major V, QMUL4 conversion, and BF16 or packed\nNVFP4 output. Paged addressing, padded/residue head mapping and fused output\nreducers are local extensions."
 
 import math
 from typing import Literal, Type, Tuple, cast
@@ -25,7 +25,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 from cutlass.cute.typing import (
     Float32,
     BFloat16,
-    Float16,
     Int32,
     Int64,
     Optional,
@@ -66,7 +65,17 @@ warp_fmax = partial(cute.arch.warp_redux_sync, kind="fmax", nan=True)
 smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 
 class GroupedQueryAttentionDecodePagedFp4:
-    '分页 nvfp4 变体(MMA-native KV 池,page_size=128)。'
+    """分页 nvfp4 变体(MMA-native KV 池,page_size=128)。
+
+    Single-token residue decode: physical Q8/Q16, D128, linear K scales.
+    Derived from dense ``GroupedQueryAttentionDecode``; paged addressing and
+    compact logical-head output are local extensions.
+
+    页几何(page_size=128 定理):
+      - page_size = SF atom 行粒度 = KQ mma_tile_m ⇒ K 的 sm 子循环即页循环;
+      - 页局部 SF = dense atom 序按页切块 ⇒ SF TMA 结构不变,只换 l 坐标;
+      - V 以 FP4 载入 SMEM，QMUL4 转换后写入 TMEM 供 VP 使用。
+    """
 
     def __init__(
         self,
@@ -79,9 +88,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         ] = "kernel",
         *,
         page_size=128,
-        residue_fold=True,
-        v_mode: Literal["qmul4_tmem"] = "qmul4_tmem",
-        k_sf_mode: Literal["linear"] = "linear",
         logical_grouped_heads: int | None = None,
         single_softmax_wg: bool = False,
         smem_correction_broadcast: bool = False,
@@ -106,11 +112,9 @@ class GroupedQueryAttentionDecodePagedFp4:
                 output slices are reduced by different cluster CTAs and stored once.
               - ``"none"``: no split-K, flash decoding disabled.
         """
-        if (not residue_fold or grouped_head_tile not in (8, 16)
+        if (grouped_head_tile not in (8, 16)
                 or prediction_tile != 1 or headdim != 128):
             raise NotImplementedError("production ResAttn requires residue Q8/Q16, D128, decode")
-        if k_sf_mode != "linear":
-            raise NotImplementedError("production ResAttn uses linear K scales")
         if reduction_mode not in ("none", "kernel", "gmem_fused", "cga_sharded"):
             raise ValueError(f"unsupported production reducer: {reduction_mode}")
         self.headdim = headdim
@@ -126,7 +130,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         self.do_gmem_fused_red = reduction_mode == "gmem_fused"
         self.do_partial_red = self.do_kernel_red or self.do_gmem_fused_red
         self.do_cga_red = reduction_mode == "cga_sharded"
-        self.do_none_red = reduction_mode == "none" or reduction_mode is None
+        self.do_none_red = reduction_mode == "none"
         # Production residue-Q packs base and residual rows per KV head.
         # Fold their QK scores before softmax; the VP operand remains FP8.
         # Store only the model's logical heads in the compact output.
@@ -135,7 +139,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         self.single_softmax_wg = single_softmax_wg
         # TRT's exact Q16 decode cubin broadcasts correction factors with far
         # fewer indexed shuffles than the current one-shuffle-per-head path.
-        # This opt-in experiment reuses correction WG's private sL column as a
+        # The single-softmax scheduler reuses correction WG's private sL column as a
         # 16-float warp-local carrier, then issues four 128-bit shared loads.
         # Arithmetic, TMEM ownership, and the final sL reduction stay fixed.
         self.smem_correction_broadcast = smem_correction_broadcast
@@ -143,11 +147,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         # MMA-N but changes the FP8 P operand to K-major. SM100 permits N=8
         # for a K-major B operand; the MN-major form requires N>=16. Limit
         # this specialization to the compact GQA4 residue geometry first.
-        self.swap_ab_for_gen = (
-            residue_fold
-            and grouped_head_tile == 8
-            and prediction_tile == 1
-        )
+        self.swap_ab_for_gen = grouped_head_tile == 8
         # The direct-to-TMEM path needs a conversion warpgroup in addition to
         # the historical MMA/TMA, 2x softmax, and correction warpgroups.
         self.threads_per_cta = (4 if single_softmax_wg else 5) * warpgroup_threads
@@ -159,30 +159,11 @@ class GroupedQueryAttentionDecodePagedFp4:
             "MMA-native profile 冻结 page=128(SF atom 对齐定理);"
             "64 需 cp.async SF 拼装路径,未实现"
         )
-        assert headdim > 0 and headdim % 64 == 0
-        assert grouped_head_tile * prediction_tile in (1, 2, 4, 8, 16, 32)
         assert sequence_tile > 0 and sequence_tile % 128 == 0
-        assert sequence_tile % page_size == 0
-        assert sum(
-            (
-                self.do_kernel_red,
-                self.do_gmem_fused_red,
-                self.do_cga_red,
-                self.do_none_red,
-            )
-        ) == 1
-        assert v_mode == "qmul4_tmem", v_mode
-        assert k_sf_mode in ("atom", "linear"), k_sf_mode
         if logical_grouped_heads is not None:
             assert 0 < logical_grouped_heads <= grouped_head_tile
-        if single_softmax_wg:
-            assert grouped_head_tile in (8, 16)
         if smem_correction_broadcast:
-            assert (
-                single_softmax_wg
-                and grouped_head_tile in (8, 16)
-            )
-        assert prediction_tile == 1 and grouped_head_tile % 2 == 0
+            assert single_softmax_wg
 
     ##############################
     # Launch helpers
@@ -227,7 +208,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                     f"got {kv_splits}"
                 )
 
-            if self.do_cga_red and o_dtype is not BFloat16:
+            if o_dtype is not BFloat16:
                 raise TypeError(
                     "cga_sharded currently requires BF16 output, "
                     f"got {o_dtype}"
@@ -315,7 +296,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         o_block_scale: Optional[cute.Tensor],
         o_global_scale: Optional[cute.Tensor],
         l_bsh: Optional[cute.Tensor],
-        m_bsh: Optional[cute.Tensor],
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
@@ -326,7 +306,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         block_tables: cute.Tensor,
         stream: cuda.CUstream,
         enable_pdl: bool = True,
-        sfq_tx: Int32 = Int32(0),  # DEBUG: SFQ expect 字节覆盖(0=用布局账)
     ):
         """
         Parameters
@@ -346,8 +325,8 @@ class GroupedQueryAttentionDecodePagedFp4:
             Columns have unit stride; the row stride may include padding.
         o_bshd
             Output tensor. A
-            Float4E2M1FN tensor selects the fused NVFP4 epilogue in either the
-            no-split attention CTA or the deterministic final reducer.
+            Float4E2M1FN tensor selects the fused NVFP4 epilogue in the
+            no-split attention CTA, separate reducer, or last-CTA reducer.
         o_block_scale
             E4M3 output block scales in CUTLASS's 128x4 swizzled layout.
         o_global_scale
@@ -355,9 +334,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             inverse used by the downstream NVFP4 GEMM.
         l_bsh
             Log-sum-exp output (Float32, log2 base). May be None.
-        m_bsh
-            Reserved legacy argument. The kernel-reduction path derives the
-            final maximum directly from ``m_partial_bsh`` and accepts None.
         o_partial_bshd
             Partial O per kv split (kernel-red workspace).
         l_partial_bsh
@@ -889,7 +865,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             scale_o,
             seq_lens,
             block_tables,
-            sfq_tx,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1046,7 +1021,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         scale_o: Float32,
         mSeqLens: cute.Tensor,
         mBlockTables: cute.Tensor,
-        sfq_tx: Int32 = Int32(0),
     ):
         ##############################
         # Static variables
@@ -1128,18 +1102,13 @@ class GroupedQueryAttentionDecodePagedFp4:
         # under uniform allocation.  Reuse the existing role budgets there;
         # this changes register ownership only, not the QK/V arithmetic.
         max_sw_regs_per_wg_thread = 256  # CUDA limitation
-        max_hw_regs_per_wg_thread = (
-            64 * 1024 // warpgroup_threads // 1
-        )  # 64K regs per SM,按驻留 CTA 数均分
-        mma_tma_regs = 64 if 1 == 1 else 24
-        conversion_regs = 64 if 1 == 1 else 24
+        mma_tma_regs = 64
+        conversion_regs = 64
         # A 640-thread qmul4_tmem CTA starts from a 96-register uniform
         # allocation at min_blocks_per_mp=1.  ``decrease(120)`` is therefore
         # an illegal direction on hardware.  Keep those softmax groups at the
         # uniform ceiling and donate the MMA/conversion registers to correction.
-        softmax_regs = (
-            (120 if softmax_warpgroups == 1 else 96) if 1 == 1 else 80
-        )
+        softmax_regs = 120 if softmax_warpgroups == 1 else 96
         # 640 threads round the uniform launch allocation down to 96 registers
         # per thread (61,440 total).  The unused 4,096 physical registers are
         # not donor registers in this CTA's dynamic pool.  Budget qmul4_tmem
@@ -1148,7 +1117,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         role_reg_budget = (
             (softmax_warpgroups + 3)
             * (64 * 1024 // self.threads_per_cta // 8 * 8) - 8
-            if 1 == 1 else max_hw_regs_per_wg_thread
         )
         correction_regs = min(
             max_sw_regs_per_wg_thread,
@@ -1308,8 +1276,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 sfq_expect = cutlass.Int32(
                     cute.size_in_bytes(sf_dtype, smem_layout_sfq)
                 )
-                if sfq_tx > 0:
-                    sfq_expect = sfq_tx
                 cute.arch.mbarrier_arrive_and_expect_tx(sfq_mbar, sfq_expect)
         init_warp += 1
 
@@ -2532,11 +2498,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                     else:
                         scores = tSrS_s.load().reshape((blk_tile_n, tiles_sm))
 
-                    # Residue fold(R1 v0):Q 按 [base; res] concat,S 列 [0:nf)=base、
-                    # [nf:2nf)=res;折叠 = 两半相加(在 softmax 之前)。v0 把折叠结果
-                    # 复制回两半 → 下游(colmax/P/VP/O)形状与字节零改动,res 半列输出
-                    # 为 base 的副本,host 侧只读 base 半。mask 为加性 {0,-inf},与
-                    # 折叠可交换(已在插入点之前施加)。
+                    # Q packs [base; residue]. Add their scores before softmax
+                    # and duplicate into both physical halves for the MMA layout.
+                    # Final output stores only logical heads, excluding duplicate
+                    # residue rows and padding. Masking precedes the fold.
                     _nf = blk_tile_n // 2
                     _s3 = scores.reshape((_nf, 2, tiles_sm))
                     _fold = _s3[None, 0, None] + _s3[None, 1, None]
