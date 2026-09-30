@@ -19,16 +19,13 @@ def select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
                        residue_fold=False, reduction_policy=None):
     """Select the static split/reducer, then apply the caller's reduction policy."""
     policy = _reduction_policy(reduction_policy)
-    
-    
-    
-    if (policy != "deterministic" and sm_count == 148 and residue_fold
-            and grouped_head_tile == 8 and batch == 2 and num_kv_heads == 8
-            and 1024 <= max_kv_len <= 4096):
-        return 4, "gmem_fused" if output_nvfp4 else "cga_sharded"
-    splits, reducer = _select_decode_plan(
-        batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4=output_nvfp4,
-        grouped_head_tile=grouped_head_tile, residue_fold=residue_fold)
+    if sm_count == 148 and residue_fold and grouped_head_tile in (8, 16):
+        splits, reducer = _select_residue_decode_plan(
+            batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4)
+    else:
+        splits, reducer = _select_decode_plan(
+            batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4=output_nvfp4,
+            grouped_head_tile=grouped_head_tile, residue_fold=residue_fold)
     if (policy == "deterministic" and reducer not in ("none", "kernel")
             or policy == "auto" and reducer == "atomic"
             and splits not in ATOMIC_REPRODUCIBLE_SPLITS):
@@ -52,13 +49,31 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
         plans.extend(((4, "gmem_fused"), (16, "gmem_fused")))
     else:
         plans.append((2, "atomic"))
-        if residue_fold and grouped_head_tile == 8:
+        if residue_fold and grouped_head_tile in (8, 16):
             plans.append((4, "cga_sharded"))
     return tuple(plans)
 
 
 def _power_of_two(value):
     return 1 << (value.bit_length() - 1)
+
+
+def _select_residue_decode_plan(batch, heads, length, sms, packed):
+    'B200 residue policy: expose parallel work, then bound reduction cost.'
+    grid = max(1, batch * heads)
+    tiles = max(1, (length + 255) // 256)
+    budget = _power_of_two(max(1, sms // grid))
+    splits = min(budget, _power_of_two((tiles + 1) // 2), 64)
+    if splits == 1:
+        return 1, "none"
+    if packed:
+        # Four splits can help even at 1K; keep the packed scheduler's split16 cap.
+        splits = min(budget, max(4, _power_of_two(max(1, tiles // 4))), 16)
+        return splits, "gmem_fused" if splits >= 4 else "kernel"
+    cga = min(16, _power_of_two(max(2, sms // (2 * grid))), _power_of_two(tiles))
+    if cga >= 2 and (length <= 2048 * cga or splits == 2):
+        return cga, "cga_sharded"
+    return splits, "kernel"
 
 
 def _select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
@@ -94,21 +109,6 @@ def _select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
             return 1, "none"
         splits = _power_of_two(min(wave, max(4, tiles // 4), 16))
         return (1, "none") if splits < 4 else (splits, "gmem_fused")
-
-    # FlashInfer 0.7 autotune selected split8/kernel at B8/Hkv2/GQA4/32K
-    
-    
-    
-    if (not output_nvfp4 and residue_fold and grouped_head_tile == 8
-            and batch == 8 and num_kv_heads == 2
-            and max_kv_len == 32768 and sm_count == 148):
-        return 8, "kernel"
-
-    # Three independent SM100/148-SM runs plus adjacent-length checks:
-    # residue BF16 at 3K-4K benefits from split reduction for small grids.
-    if (residue_fold and sm_count == 148 and grid <= 32
-            and 3072 <= max_kv_len <= 4096):
-        return _power_of_two(min(wave, tiles // 2, 16)), "kernel"
 
     if grid == 1 and max_kv_len >= QMUL4_KERNEL_REDUCTION_MIN_SEQ:
         return 32, "kernel"
