@@ -707,9 +707,8 @@ def run_paged_fp4_decode_qmul4_tmem(
         )
     else:
         splits, reduction = plan
-    if direct_output and reduction not in ("none", "atomic", "kernel"):
-        # CGA has unpredicated scalar stores to all physical heads; the
-        # gmem-fused reducer currently has an NVFP4-specific output contract.
+    if direct_output and reduction not in ("none", "atomic", "kernel", "cga_sharded"):
+        # The gmem-fused reducer has an NVFP4-specific output contract.
         raise NotImplementedError(f"direct BF16 output: unsupported {reduction=}")
     if k_sf_mode not in ("atom", "linear"):
         raise ValueError(f"unsupported K-scale mode: {k_sf_mode}")

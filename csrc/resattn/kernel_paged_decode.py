@@ -889,7 +889,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         )
 
         tma_atom_o = tma_tensor_o = None
-        if cutlass.const_expr(not quantize_o_main):
+        if cutlass.const_expr(not quantize_o_main and not self.do_cga_red):
             tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
                 tma_store_op,
                 mO_mnl,
@@ -964,7 +964,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             # O
             smem_layout_o,
             tma_atom_o,
-            mO_mnl if quantize_o_main else tma_tensor_o,
+            mO_mnl if quantize_o_main or self.do_cga_red else tma_tensor_o,
             mO_mnl if self.do_gmem_fused_red else None,
             (
                 o_block_scale
@@ -1341,7 +1341,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v_sf_d)
-            if cutlass.const_expr(not quantize_o):
+            if cutlass.const_expr(not quantize_o and not do_cga_red):
                 cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_o)
         init_warp += 1
 
@@ -1827,6 +1827,11 @@ class GroupedQueryAttentionDecodePagedFp4:
             if not exit_early and warpgroup_idx == 0:
                 cute.arch.setmaxregister_decrease(mma_tma_regs)
 
+        partial_o = None
+        if cutlass.const_expr(do_cga_red):
+            partial_o = cute.make_rmem_tensor((blk_tile_n,), acc_dtype)
+            partial_o.fill(0)
+
         ##############################
         # Exit early
         ##############################
@@ -1834,6 +1839,31 @@ class GroupedQueryAttentionDecodePagedFp4:
             if warpgroup_idx == correction_warpgroup_id:
                 sM_final_nbar.arrive()
                 sL_final_nbar.arrive()
+            if cutlass.const_expr(quantize_o):
+                if warp_idx == tma_kv_warp_id:
+                    # No-split empty rows still own their packed output. Clear
+                    # the logical payload/scales here so graph replay cannot
+                    # expose the preceding request's values.
+                    mO_bytes = cute.recast_tensor(mO, cutlass.Uint8)
+                    logical_heads = self.logical_grouped_heads
+                    if cutlass.const_expr(logical_heads is None):
+                        logical_heads = grouped_heads
+                    d_blocks = blk_tile_d // 16
+                    num_k_tiles = cute.ceil_div(heads_k * logical_heads * blk_tile_d, 64)
+                    for block in cutlass.range(lane_idx, blk_tile_h * d_blocks, warp_threads):
+                        group_head = coord_hg * blk_tile_h + block // d_blocks
+                        d_block = block % d_blocks
+                        if group_head < logical_heads:
+                            for byte in cutlass.range_constexpr(8):
+                                mO_bytes[d_block * 8 + byte, (group_head, 0),
+                                         (coord_hk, coord_b)] = cutlass.Uint8(0)
+                            k_idx = (coord_hk * logical_heads + group_head) * d_blocks + d_block
+                            sf_offset = (
+                                (coord_b // 128 * num_k_tiles + k_idx // 4) * 512
+                                + coord_b % 32 * 16
+                                + (coord_b // 32) % 4 * 4 + k_idx % 4
+                            )
+                            mOSF[sf_offset] = sf_dtype(0)
 
         ##############################
         # TMA KV Dispatch
@@ -2075,14 +2105,14 @@ class GroupedQueryAttentionDecodePagedFp4:
                 kv_split_idx * batches + coord_b if do_partial_red else coord_b
             )
             gO = None
-            if cutlass.const_expr(not quantize_o):
+            if cutlass.const_expr(not quantize_o and not do_cga_red):
                 gO = cute.local_tile(
                     mO,
                     tiler=(blk_tile_d, blk_tile_hp),
                     coord=(0, coord_hp, (coord_hk, coord_b_partial)),
                 )
             sO_tma = gO_tma = None
-            if cutlass.const_expr(not quantize_o):
+            if cutlass.const_expr(not quantize_o and not do_cga_red):
                 # (MMA_TILE_M, MMA_TILE_N, #TILE_DM, #TILE_HN=1)
                 gO_mma = cute.flat_divide(gO, (mma_tile_m, mma_tile_n))
                 gO_mma = gO_mma[None, None, None, 0]
@@ -2196,7 +2226,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                     # The completion counter may not be published until this
                     # CTA's partial numerator is globally visible.
                     cute.arch.cp_async_bulk_commit_group()
-                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
             phase_mark(1, 212, True)
 
         ##############################
@@ -3222,6 +3252,30 @@ class GroupedQueryAttentionDecodePagedFp4:
             phase_mark(2, 161)
 
             if cutlass.const_expr(do_cga_red):
+                partial_o.store(output_final.reshape((blk_tile_n,)))
+            else:
+                # Apply final normalization.  atomic's cluster reduction and
+                # the no-split path publish it through sM.
+                if cutlass.const_expr(do_atomic_red or do_none_red):
+                    phase_mark(2, 170)
+                    sM_final_nbar.arrive_and_wait()
+                    phase_mark(2, 171)
+                    normalization = sM.load()
+                    output_final *= normalization
+                    phase_mark(2, 172)
+
+                # Store O to smem and notify the TMA warp.
+                tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
+                phase_mark(2, 180)
+                cute.arch.fence_view_async_shared()
+                phase_mark(2, 181)
+                sO_final_nbar.arrive()
+                phase_mark(2, 182)
+
+        # Empty splits participate too: their initialized zero numerator and
+        # (-inf, 0) statistics must reach every peer's transaction barrier.
+        if cutlass.const_expr(do_cga_red):
+            if warpgroup_idx == correction_warpgroup_id:
                 # The reduction warp has collapsed the four softmax-warp sums
                 # into sL[:,0].  Every target output slice needs the same
                 # per-head stats, so broadcast the tiny stats vectors while O
@@ -3242,8 +3296,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 owner_thread = warpgroup_tidx // kv_splits
                 owner_threads = warpgroup_threads // kv_splits
 
-                partial_o = cute.make_rmem_tensor((blk_tile_n,), acc_dtype)
-                partial_o.store(output_final.reshape((blk_tile_n,)))
                 partial_o_offset = (
                     (kv_split_idx * owner_threads + owner_thread)
                     * blk_tile_n
@@ -3336,8 +3388,12 @@ class GroupedQueryAttentionDecodePagedFp4:
                         for source in cutlass.range(1, kv_splits):
                             local_max = sCgaStats[source, head, 0]
                             next_max = cute.arch.fmax(reduced_max, local_max)
-                            corr_old = exp2(reduced_max - next_max)
-                            corr_new = exp2(local_max - next_max)
+                            corr_old = Float32(0)
+                            corr_new = Float32(0)
+                            if reduced_sum > 0:
+                                corr_old = exp2(reduced_max - next_max)
+                            if sCgaStats[source, head, 1] > 0:
+                                corr_new = exp2(local_max - next_max)
                             local_o = Float32(
                                 sCgaO[
                                     (source * owner_threads + owner_thread)
@@ -3352,11 +3408,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                             reduced_o = reduced_o * corr_old + local_o * corr_new
                             reduced_max = next_max
 
-                        final_o[head] = o_dtype(
-                            reduced_o
-                            * cute.arch.rcp_approx(reduced_sum)
-                            * scale_o
-                        )
+                        value = Float32(0)
+                        if reduced_sum > 0:
+                            value = reduced_o * cute.arch.rcp_approx(reduced_sum) * scale_o
+                        final_o[head] = o_dtype(value)
 
                     # VP is a 128xN tile and the Ld32x32b correction slice
                     # assigns one D row plus all N heads to each physical
@@ -3367,29 +3422,13 @@ class GroupedQueryAttentionDecodePagedFp4:
                     # global tensor for CopyUniversalOp: it produces a
                     # coordinate tensor rather than a gmem MemRef.
                     for head in cutlass.range_constexpr(blk_tile_n):
-                        mOFinal[
-                            warpgroup_tidx,
-                            (coord_hg * blk_tile_h + head, 0),
-                            (coord_hk, coord_b),
-                        ] = final_o[head]
-            else:
-                # Apply final normalization.  atomic's cluster reduction and
-                # the no-split path publish it through sM.
-                if cutlass.const_expr(do_atomic_red or do_none_red):
-                    phase_mark(2, 170)
-                    sM_final_nbar.arrive_and_wait()
-                    phase_mark(2, 171)
-                    normalization = sM.load()
-                    output_final *= normalization
-                    phase_mark(2, 172)
-
-                # Store O to smem and notify the TMA warp.
-                tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))
-                phase_mark(2, 180)
-                cute.arch.fence_view_async_shared()
-                phase_mark(2, 181)
-                sO_final_nbar.arrive()
-                phase_mark(2, 182)
+                        group_head = coord_hg * blk_tile_h + head
+                        if group_head < mOFinal.shape[1][0]:
+                            mOFinal[
+                                warpgroup_tidx,
+                                (group_head, 0),
+                                (coord_hk, coord_b),
+                            ] = final_o[head]
 
         ##############################
         # Reduction Dispatch
