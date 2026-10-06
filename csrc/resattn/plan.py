@@ -43,6 +43,24 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
     return tuple(plans)
 
 
+def validate_decode_plan(plan, *, output_nvfp4=False):
+    """Check launch constraints before compilation or workspace allocation."""
+    splits, reducer = plan
+    if type(splits) is not int or splits < 1:
+        raise ValueError(f"decode plan splits must be a positive integer, got {splits!r}")
+    if reducer not in ("none", "kernel", "cga_sharded", "gmem_fused"):
+        raise ValueError(f"unsupported decode reducer: {reducer!r}")
+    if (output_nvfp4 and reducer == "cga_sharded"
+            or not output_nvfp4 and reducer == "gmem_fused"):
+        raise NotImplementedError(f"{reducer} does not support output_nvfp4={output_nvfp4}")
+    if reducer == "none" and splits != 1:
+        raise ValueError("none reduction requires splits=1")
+    if reducer == "cga_sharded" and splits not in (1, 2, 4, 8, 16):
+        raise ValueError("cga_sharded requires splits in {1,2,4,8,16}")
+    if reducer == "gmem_fused" and splits not in (4, 8, 16, 32, 64):
+        raise ValueError("gmem_fused requires splits in {4,8,16,32,64}")
+
+
 def _power_of_two(value):
     return 1 << (value.bit_length() - 1)
 

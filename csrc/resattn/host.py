@@ -22,7 +22,7 @@ from .kv_layout import (
 )
 
 
-from .plan import select_decode_plan, static_compile_plans
+from .plan import select_decode_plan, static_compile_plans, validate_decode_plan
 
 N_PAD = 128  # Q-SF 缓冲的 N 垫高(UTCCP 按 N=128 粒度)
 
@@ -624,9 +624,6 @@ def run_paged_fp4_decode_qmul4_tmem(
         )
     else:
         splits, reduction = plan
-    if direct_output and reduction not in ("none", "kernel", "cga_sharded"):
-        # The gmem-fused reducer has an NVFP4-specific output contract.
-        raise NotImplementedError(f"direct BF16 output: unsupported {reduction=}")
     f = compile_decode_variant(decode_compile_spec(
         HQ, H, D, (splits, reduction),
         output_nvfp4=False, residue_fold=residue_fold,
@@ -718,6 +715,7 @@ def decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan, *,
         raise NotImplementedError("production ResAttn uses linear K scales")
     if direct_output is False:
         raise NotImplementedError("padded output moved to .dev/tools/resattn/experimental")
+    validate_decode_plan(plan, output_nvfp4=output_nvfp4)
     splits, reduction = plan
     tile = _residue_padded_group_size(num_qo_heads, num_kv_heads)
     ssw = _use_single_softmax_scheduler(tile, reduction, "qmul4_tmem", splits)
@@ -853,26 +851,24 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
             f"{expected_scale} on {q.device}"
         )
 
-    max_len = max_seq_len or int(seq_lens.max().item())
     if plan is None:
+        max_len = max_seq_len or int(seq_lens.max().item())
         splits, reduction = plan_qmul4_decode_nvfp4(
             B, HQ, H, max_len, q.device, residue_fold=residue_fold
         )
     else:
         splits, reduction = plan
-        if splits < 1:
-            raise ValueError(f"decode plan splits must be positive, got {splits}")
-    if reduction not in ("none", "kernel", "gmem_fused"):
-        raise NotImplementedError(
-            "direct NVFP4 output supports split=1, deterministic kernel, "
-            "or fused gmem "
-            f"reduction; planner selected splits={splits}, reduction={reduction!r}"
-        )
-
-    # Allocate before selecting the compiled specialization so the kernel's
-    # partial-O dtype always matches the workspace passed at launch.  In
-    # particular, gmem_fused defaults to BF16 partials while a missing
-    # workspace otherwise looks like FP32 to the specialization helper.
+    # Validate the plan before allocation. An absent workspace uses the same
+    # dtype defaults as the allocators: BF16 for fused, FP32 for separate.
+    spec = decode_compile_spec(
+        HQ, H, D, (splits, reduction),
+        output_nvfp4=True, residue_fold=residue_fold,
+        k_sf_mode=k_sf_mode, direct_output=True,
+        partial_o_dtype=(
+            _reduction_workspace_partial_o_dtype(reduction_workspace)
+            if reduction_workspace is not None else None
+        ),
+    )
     if reduction_workspace is None and reduction in ("kernel", "gmem_fused"):
         if reduction == "gmem_fused":
             reduction_workspace = allocate_qmul4_gmem_reduction_workspace(
@@ -883,12 +879,7 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
                 splits, B, H * g_pad, D, q.device
             )
 
-    f = compile_decode_variant(decode_compile_spec(
-        HQ, H, D, (splits, reduction),
-        output_nvfp4=True, residue_fold=residue_fold,
-        k_sf_mode=k_sf_mode, direct_output=True,
-        partial_o_dtype=_reduction_workspace_partial_o_dtype(reduction_workspace),
-    ))
+    f = compile_decode_variant(spec)
     q_eff = q
     fused_q = _quantize_q_residue_cuda(q_eff, H)
     if fused_q is None:

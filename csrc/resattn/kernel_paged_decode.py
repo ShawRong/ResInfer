@@ -168,61 +168,6 @@ class GroupedQueryAttentionDecodePagedFp4:
     ##############################
     # Launch helpers
     ##############################
-    # Runtime implementable check
-    def can_implement(
-        self, kv_splits, qo_shape_bshd, kv_shape_bshd, qkv_dtype, o_dtype
-    ):
-        b_k, s_q, h_q, d_q = qo_shape_bshd
-        b_q, s_k, h_k, d_k = kv_shape_bshd
-
-        if qkv_dtype is not cutlass.Float4E2M1FN:
-            raise TypeError("production decode requires FP4 Q/K/V")
-
-        if not (d_q == d_k == self.headdim):
-            raise ValueError(
-                f"headdim_q({d_q}), headdim_k({d_k}) must be {self.headdim}"
-            )
-
-        if h_q % h_k != 0:
-            raise ValueError(f"heads_q({h_q}) must be a multiple of heads_k({h_k})")
-
-        if 0 < s_k < s_q:
-            raise ValueError(
-                f"non-zero seqlen({s_k}) must be at least prediction({s_q})"
-            )
-
-        # Only causal mask up to two tiles
-        if s_q > self.sequence_tile:
-            raise ValueError(
-                f"prediction({s_q}) with causal mask can be at most {self.sequence_tile}"
-            )
-
-
-        if b_k != b_q:
-            raise ValueError(f"batches_k({b_k}) and batches_q({b_q}) mismatch")
-
-        if self.do_cga_red:
-            if kv_splits not in (1, 2, 4, 8, 16):
-                raise ValueError(
-                    "cluster reduction requires kv_splits po2 <= 16, "
-                    f"got {kv_splits}"
-                )
-
-            if o_dtype is not BFloat16:
-                raise TypeError(
-                    "cga_sharded currently requires BF16 output, "
-                    f"got {o_dtype}"
-                )
-
-        if self.do_gmem_fused_red and kv_splits not in (4, 8, 16, 32, 64):
-            raise ValueError(
-                "gmem_fused reduction requires kv_splits in "
-                f"{{4,8,16,32,64}}, got {kv_splits}"
-            )
-
-        if self.do_none_red and kv_splits != 1:
-            raise ValueError("KV splits must be 1 if flash decoding is disabled")
-
     # Pack grouped heads with predicted tokens (s_q)
     @staticmethod
     def gqa_pack(t_bshd: cute.Tensor, h_k: int):
