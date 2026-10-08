@@ -30,6 +30,7 @@ from cutlass.cute.typing import (
     Optional,
 )
 
+from .output import quantize_nvfp4_block16, output_scale_offset
 from .qmul4 import (
     dequantize_nvfp4x8_ldsm,
 )
@@ -152,8 +153,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         # the historical MMA/TMA, 2x softmax, and correction warpgroups.
         self.threads_per_cta = (4 if single_softmax_wg else 5) * warpgroup_threads
         self.page_size = page_size
-        # 页表 smem 环深度(上游同款:> prefetch_iters + 1)
-        self.pt_stages = 4
 
         assert page_size == 128, (
             "MMA-native profile 冻结 page=128(SF atom 对齐定理);"
@@ -240,7 +239,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         o_bshd: cute.Tensor,
         o_block_scale: Optional[cute.Tensor],
         o_global_scale: Optional[cute.Tensor],
-        l_bsh: Optional[cute.Tensor],
         o_partial_bshd: Optional[cute.Tensor],
         l_partial_bsh: Optional[cute.Tensor],
         m_partial_bsh: Optional[cute.Tensor],
@@ -277,8 +275,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         o_global_scale
             One-element Float32 tensor containing the activation global-scale
             inverse used by the downstream NVFP4 GEMM.
-        l_bsh
-            Log-sum-exp output (Float32, log2 base). May be None.
         o_partial_bshd
             Partial O per kv split (kernel-red workspace).
         l_partial_bsh
@@ -303,6 +299,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         ##############################
         # QK uses blockscaled FP4; V is converted to FP8 in TMEM.
         assert q_bshd.dtype == cutlass.Float4E2M1FN
+        assert q_bshd.shape[1] == 1, "production decode requires one Q token"
         assert q_sf is not None and k_sf is not None
         quantize_o = cutlass.const_expr(
             o_bshd.dtype == cutlass.Float4E2M1FN
@@ -399,7 +396,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         mma_tile_k_vp = mma_tile_k
         mma_tile_m_vp = mma_tile_m
         mma_tile_mnk_vp = (mma_tile_m_vp, mma_tile_n, mma_tile_k_vp)
-        tiles_sk_host = blk_tile_s // mma_tile_k_vp
         tiles_dm = math.ceil(blk_tile_d / mma_tile_m_vp)
         tiled_mma_vp = sm100_utils.make_trivial_tiled_mma(
             mma_dtype,
@@ -718,12 +714,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 tma_tile_mnk[:2],
             )
 
-        # GEMM view for LSE output
-        # ((h_g, s_q), (h_k, b))
-        mL_nl = None if l_bsh is None else self.gemm_view_bsh(l_bsh, h_k)
-        assert l_bsh is None or l_bsh.dtype == acc_dtype
-
-
         # GEMM views for workspace tensors
         mM_partial_nl = mL_partial_nl = None
         if cutlass.const_expr(self.do_partial_red):
@@ -802,7 +792,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 else None
             ),
             # Rest
-            mL_nl,
             mL_partial_nl,
             mM_partial_nl,
             completion_counter,
@@ -823,7 +812,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             self.launch_reduction(
                 self.headdim,
                 o_bshd,
-                l_bsh,
                 o_partial_bshd,
                 l_partial_bsh,
                 m_partial_bsh,
@@ -958,7 +946,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         mOGlobalScale: Optional[cute.Tensor],
         mOFinal: Optional[cute.Tensor],
         # Rest
-        mL: Optional[cute.Tensor],  # LSE output (Float32, log2 base)
         mL_partial: Optional[cute.Tensor],
         mM_partial: Optional[cute.Tensor],
         mCompletion: Optional[cute.Tensor],
@@ -992,10 +979,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         if cutlass.const_expr(quantize_o):
             assert mOSF is not None and mOGlobalScale is not None
             assert tma_atom_o is None
-        quantize_o_final = cutlass.const_expr(
-            mOFinal is not None
-            and mOFinal.dtype == cutlass.Float4E2M1FN
-        )
 
         # Shapes for MMA tile indexing (Read TMA partition for example)
         blk_tile_s, blk_tile_h, blk_tile_p, blk_tile_d = blk_tile_shpd
@@ -1010,12 +993,10 @@ class GroupedQueryAttentionDecodePagedFp4:
         tiles_dk = cute.ceil_div(blk_tile_d, mma_tile_k)
 
         # Static control flow
-        do_kernel_red = self.do_kernel_red
         do_gmem_fused_red = self.do_gmem_fused_red
         do_partial_red = self.do_partial_red
         do_cga_red = self.do_cga_red
         do_none_red = self.do_none_red
-        store_lse = mL is not None and mL.dtype == acc_dtype
 
         ##############################
         # Warp specialization
@@ -1146,9 +1127,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         correction_threads = warpgroup_threads
         reduction_threads = warp_threads
         tma_threads = warp_threads
-        # Shared KV pipeline requires ordering MMA
-        mma_order_kq_nbar = nbar(1, tma_threads + tma_threads)
-        mma_order_vp_nbar = nbar(2, tma_threads + tma_threads)
         sM_producer_nbar = nbar(3, softmax_threads + correction_threads)
         sM_consumer_nbar = nbar(4, softmax_threads + correction_threads)
         tL_producer_nbar = nbar(5, softmax_threads + correction_threads)
@@ -1187,7 +1165,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         correction_group = warpgroup_cooperative
 
         # Initialize cluster colmax + colsum mbar (even if this split exits early)
-        reduction_mbars_ptr = None
         cga_partial_mbar = None
         if cutlass.const_expr(do_cga_red):
             cga_partial_mbar = smem.allocate_array(Int64, 1)
@@ -1325,10 +1302,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             stensor_align,
             smem_layout_v.inner,
         )  # native/ready V, or packed 8-bit carrier for qmul4_tmem
-        tAsVRaw = None
-        tAsVRawTma = None
-        tAsVReady = None
-        tAsVSFD = None
         tAsVRaw = tAsV
         tAsVSFD = smem.allocate_tensor(
             sf_dtype, smem_layout_v_sf_d, stensor_align
@@ -1398,10 +1371,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         tBsP_nm_layout = sm100_utils.make_smem_layout_b(
             tiled_mma_vp, blk_tile_nm, vp_dtype, p_stages
         )
-        # 坑23:local_tile 视图上的 make_fragment_B 对 fp4+SW128 生成坏描述符。
-        # fp4 分支走 Q 同款直连链(std);nm 仅作分区形状用途,别名到 std 同块
-        # 内存(fp4 从不经 nm 寻址)——省 8KB smem。fp8 走原 nm 实分配。
-        tBsP_std = None
+        # FP8 P uses its own shared-memory allocation.
         tBsP_nm = smem.allocate_tensor(
             vp_dtype, tBsP_nm_layout.outer, stensor_align, tBsP_nm_layout.inner
         )
@@ -1594,7 +1564,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                     if cutlass.const_expr(logical_heads is None):
                         logical_heads = grouped_heads
                     d_blocks = blk_tile_d // 16
-                    num_k_tiles = cute.ceil_div(heads_k * logical_heads * blk_tile_d, 64)
+                    hidden = heads_k * logical_heads * blk_tile_d
                     for block in cutlass.range(lane_idx, blk_tile_h * d_blocks, warp_threads):
                         group_head = coord_hg * blk_tile_h + block // d_blocks
                         d_block = block % d_blocks
@@ -1603,11 +1573,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                                 mO_bytes[d_block * 8 + byte, (group_head, 0),
                                          (coord_hk, coord_b)] = cutlass.Uint8(0)
                             k_idx = (coord_hk * logical_heads + group_head) * d_blocks + d_block
-                            sf_offset = (
-                                (coord_b // 128 * num_k_tiles + k_idx // 4) * 512
-                                + coord_b % 32 * 16
-                                + (coord_b // 32) % 4 * 4 + k_idx % 4
-                            )
+                            sf_offset = output_scale_offset(coord_b, k_idx, hidden)
                             mOSF[sf_offset] = sf_dtype(0)
 
         ##############################
@@ -1632,7 +1598,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             tAgK = thrblk_mma_kq.partition_A(
                 gK
             )  # (MMA, #MMA_M, #MMA_K, #TILE_DK, #P)
-            tAgV = None
             tAgV = thrblk_mma_vp.partition_A(
                 gV
             )  # (MMA, #MMA_M, #MMA_K, #TILE_DM, #TILE_SK, #P)
@@ -1701,7 +1666,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             # K0/V0 TMA issue from the first producer iteration.
             v_prefetch_iters = 0 if self.swap_ab_for_gen else prefetch_iters
             prefetch_tiles = v_prefetch_iters * kv_splits
-            kv_token = True  # Producer always acquires first
             k_token_tma = True
             v_raw_token_tma = True
             for s in cutlass.range(kv_split_idx, prefetch_tiles + tiles_s, kv_splits):
@@ -1864,7 +1828,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                 if cutlass.const_expr(logical_grouped_heads is None):
                     logical_grouped_heads = grouped_heads
                 hidden = heads_k * logical_grouped_heads * blk_tile_d
-                num_k_tiles = cute.ceil_div(hidden, 64)
                 row_idx = coord_b
 
                 for block_idx in cutlass.range(
@@ -1875,7 +1838,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     group_head = coord_hg * blk_tile_h + local_head
                     if group_head < logical_grouped_heads:
                         values = cute.make_rmem_tensor((16,), Float32)
-                        amax = Float32(0)
                         for value_idx in cutlass.range_constexpr(16):
                             value = Float32(
                                 sO_mma[
@@ -1885,27 +1847,14 @@ class GroupedQueryAttentionDecodePagedFp4:
                                 ]
                             )
                             values[value_idx] = value
-                            amax = cute.arch.fmax(
-                                amax, cute.arch.fmax(value, -value)
-                            )
-
-                        sf_value = sf_dtype(
-                            amax * global_scale * Float32(1.0 / 6.0)
+                        packed_values, sf_value = quantize_nvfp4_block16(
+                            values.load(), global_scale
                         )
-                        sf_rounded = Float32(sf_value)
-                        quant_multiplier = Float32(0)
-                        if sf_rounded != Float32(0):
-                            quant_multiplier = global_scale * cute.arch.rcp_approx(
-                                sf_rounded
-                            )
-                        values.store(values.load() * quant_multiplier)
 
                         packed_fp4 = cute.make_rmem_tensor(
                             (16,), cutlass.Float4E2M1FN
                         )
-                        packed_fp4.store(
-                            values.load().to(cutlass.Float4E2M1FN)
-                        )
+                        packed_fp4.store(packed_values)
                         packed_bytes = cute.recast_tensor(
                             packed_fp4, cutlass.Uint8
                         )
@@ -1920,17 +1869,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                             coord_hk * logical_grouped_heads + group_head
                         )
                         k_idx = global_head * d_scale_blocks + d_block
-                        m_tile_idx = row_idx // 128
-                        outer_m_idx = row_idx % 32
-                        inner_m_idx = (row_idx // 32) % 4
-                        k_tile_idx = k_idx // 4
-                        inner_k_idx = k_idx % 4
-                        sf_offset = (
-                            (m_tile_idx * num_k_tiles + k_tile_idx) * 512
-                            + outer_m_idx * 16
-                            + inner_m_idx * 4
-                            + inner_k_idx
-                        )
+                        sf_offset = output_scale_offset(row_idx, k_idx, hidden)
                         mOSF[sf_offset] = sf_value
             else:
                 sO_final_nbar.arrive_and_wait()
@@ -2016,11 +1955,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             for _s in cutlass.range(iters_s):
                 for _sk in cutlass.range_constexpr(tiles_sk):
                     for _dm in cutlass.range_constexpr(tiles_dm):
-                        _cvt_flat = (
-                            _s * tiles_sk * tiles_dm
-                            + _sk * tiles_dm
-                            + _dm
-                        )
                         v_handle = v_raw_consumer.wait_and_advance(v_token)
                         cvt_handle = v_ready_producer.acquire_and_advance(
                             cvt_token
@@ -2197,7 +2131,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             # Setup mma descriptors
             # 坑26 候选:set() 必须在 make_fragment 之后(KQ 的顺序)——
             # set 先行会破坏 fp4 desc 原型推导(probe4:双侧 mma_k 偏移失效)
-            tAsV_desc = None
             tBsP_desc = thrblk_mma_vp.make_fragment_B(tBsP_nk)
             tiled_mma_vp.set(
                 tcgen05.Field.ACCUMULATE,
@@ -2361,35 +2294,12 @@ class GroupedQueryAttentionDecodePagedFp4:
             )
             tSrL_shape = tSrL_shape[:1]
 
-            # Causal masking for spec decode verification
+            # Single-token decode only masks the final, partial KV tile.
             masked_iters_s = masked_start_s = masked_coord_s = 0
-            check_safe_max = False
             is_last_split = kv_split_idx == (tiles_s - 1) % kv_splits
-            is_prev_split = kv_split_idx == (tiles_s - 2) % kv_splits
             is_last_phase = softmax_phase == (iters_s - 1) % softmax_warpgroups
-            is_prev_phase = softmax_phase == (iters_s - 2) % softmax_warpgroups
-            # 2 masked tiles
-            if 0 < seqlen % blk_tile_s < prediction:
-                # 1 split masks 2 tiles
-                if kv_splits == 1:
-                    masked_start_s = 0 if is_prev_phase else 1
-                    masked_iters_s = 2
-                    masked_coord_s = tiles_s - 2
-                # 2 splits mask 1 tile each
-                elif (is_last_split or is_prev_split) and is_last_phase:
-                    masked_start_s = 0
-                    masked_iters_s = 1
-                    masked_coord_s = (
-                        (tiles_s - 1) if is_last_split else (tiles_s - 2)
-                    )
-                    # if last split only has 1 tile then some cols will never
-                    # see inbounds values, so P = exp(-inf + inf) -> nan
-                    check_safe_max = is_last_split and iters_s == 1
-            # 1 masked tile
-            elif prediction > 1 or seqlen % blk_tile_s != 0:
-                # 1 split masks 1 tile
+            if seqlen % blk_tile_s != 0:
                 if is_last_split and is_last_phase:
-                    masked_start_s = 0
                     masked_iters_s = 1
                     masked_coord_s = tiles_s - 1
 
@@ -2993,9 +2903,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     sL,
                 )
             elif cutlass.const_expr(do_none_red):
-                gL = None
-                if cutlass.const_expr(store_lse):
-                    gL = cute.local_tile(mL, (blk_tile_hp,), (coord_hp, coord_hb))
                 self.reduction_none(
                     lane_store_max,
                     lane_idx,
@@ -3003,7 +2910,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                     sL_final_nbar,
                     sM,
                     sL,
-                    gL,
                     scale_o,
                 )
             cute.arch.griddepcontrol_launch_dependents()
@@ -3084,7 +2990,6 @@ class GroupedQueryAttentionDecodePagedFp4:
                         mOFinal,
                         mOSF,
                         mOGlobalScale,
-                        mL,
                         mL_partial,
                         mM_partial,
                         scale_o,
@@ -3109,7 +3014,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         mO_final: cute.Tensor,
         mOSF: cute.Tensor,
         mOGlobalScale: cute.Tensor,
-        mL: Optional[cute.Tensor],
         mL_partial: cute.Tensor,
         mM_partial: cute.Tensor,
         scale_o: Float32,
@@ -3229,31 +3133,14 @@ class GroupedQueryAttentionDecodePagedFp4:
                     * (cute.arch.rcp_approx(sum_final) * scale_o)
                 )
 
-            amax = Float32(0)
-            for value_idx in cutlass.range_constexpr(16):
-                value = final_values[value_idx]
-                amax = cute.arch.fmax(
-                    amax, cute.arch.fmax(value, -value)
-                )
-
-            global_scale = Float32(mOGlobalScale[0])
-            sf_value = cutlass.Float8E4M3FN(
-                amax * global_scale * Float32(1.0 / 6.0)
+            packed_values, sf_value = quantize_nvfp4_block16(
+                final_values.load(), Float32(mOGlobalScale[0])
             )
-            sf_rounded = Float32(sf_value)
-            quant_multiplier = Float32(0)
-            if sf_rounded != Float32(0):
-                quant_multiplier = global_scale * cute.arch.rcp_approx(
-                    sf_rounded
-                )
-            final_values.store(final_values.load() * quant_multiplier)
 
             packed_fp4 = cute.make_rmem_tensor(
                 (16,), cutlass.Float4E2M1FN
             )
-            packed_fp4.store(
-                final_values.load().to(cutlass.Float4E2M1FN)
-            )
+            packed_fp4.store(packed_values)
             packed_bytes = cute.recast_tensor(packed_fp4, cutlass.Uint8)
             mO_bytes = cute.recast_tensor(mO_final, cutlass.Uint8)
             for byte_idx in cutlass.range_constexpr(8):
@@ -3266,26 +3153,9 @@ class GroupedQueryAttentionDecodePagedFp4:
             global_head = coord_hk * logical_grouped_heads + group_head
             k_idx = global_head * d_scale_blocks + d_block
             hidden = heads_k * logical_grouped_heads * blk_tile_d
-            num_k_tiles = cute.ceil_div(hidden, 64)
             row_idx = coord_b * prediction + coord_p
-            m_tile_idx = row_idx // 128
-            outer_m_idx = row_idx % 32
-            inner_m_idx = (row_idx // 32) % 4
-            k_tile_idx = k_idx // 4
-            inner_k_idx = k_idx % 4
-            sf_offset = (
-                (m_tile_idx * num_k_tiles + k_tile_idx) * 512
-                + outer_m_idx * 16
-                + inner_m_idx * 4
-                + inner_k_idx
-            )
+            sf_offset = output_scale_offset(row_idx, k_idx, hidden)
             mOSF[sf_offset] = sf_value
-
-            if cutlass.const_expr(mL is not None and mL.dtype == Float32):
-                if d_block == 0:
-                    mL[
-                        (group_head, coord_p), (coord_hk, coord_b)
-                    ] = max_final + cute.math.log2(sum_final)
 
     @staticmethod
     @cute.jit
@@ -3317,16 +3187,10 @@ class GroupedQueryAttentionDecodePagedFp4:
         sL_final_nbar: nbar,
         sM: cute.Tensor,
         sL: cute.Tensor,
-        gL: Optional[cute.Tensor],
         scale_o: Float32,
     ):
-        store_lse = gL is not None
-        colmax = Float32(0)
         colsum = Float32(0)
         sM_final_nbar.arrive_and_wait()
-        if cutlass.const_expr(store_lse):
-            if lane_store_max:
-                colmax = sM[lane_idx]
         sL_final_nbar.arrive_and_wait()
         if lane_store_max:
             sL_lane = sL[lane_idx, None]
@@ -3334,9 +3198,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             normalization = cute.arch.rcp_approx(colsum) * scale_o
             sM[lane_idx] = normalization
         sM_final_nbar.arrive()
-        if cutlass.const_expr(store_lse):
-            if lane_store_max:
-                gL[lane_idx] = colmax + cute.math.log2(colsum)
 
     @staticmethod
     @cute.jit
@@ -3398,7 +3259,6 @@ class GroupedQueryAttentionDecodePagedFp4:
     def launch_reduction(
         d_per_blk: int,
         o_bshd: cute.Tensor,
-        l_bsh: Optional[cute.Tensor],  # LSE output (log2 base) or None
         o_partial_bshd: cute.Tensor,  # partial O per kv split
         l_partial_bsh: cute.Tensor,  # partial colsum_p per kv split
         m_partial_bsh: cute.Tensor,  # partial colmax_s per kv split
@@ -3431,7 +3291,6 @@ class GroupedQueryAttentionDecodePagedFp4:
             return cute.make_tensor(t.iterator, layout)
 
         o_dhsb = reverse(o_bshd)
-        l_hsb = reverse(l_bsh) if l_bsh is not None else None
         o_partial_dhsb = reverse(o_partial_bshd)
         l_partial_hsb = reverse(l_partial_bsh)
         m_partial_hsb = reverse(m_partial_bsh)
@@ -3446,7 +3305,6 @@ class GroupedQueryAttentionDecodePagedFp4:
         GroupedQueryAttentionDecodePagedFp4.reduction_kernel(
             (thr_per_blk, d_per_thr, d_per_blk),
             o_dhsb,
-            l_hsb,
             o_partial_dhsb,
             l_partial_hsb,
             m_partial_hsb,
@@ -3470,7 +3328,6 @@ class GroupedQueryAttentionDecodePagedFp4:
     def reduction_kernel(
         tile_d: cute.Tile,
         o_dhsb: cute.Tensor,
-        l_hsb: Optional[cute.Tensor],
         o_partial_dhsb: cute.Tensor,
         l_partial_hsb: cute.Tensor,
         m_partial_hsb: cute.Tensor,
@@ -3596,25 +3453,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                 # produced once after all split numerators share the same
                 # final max/sum origin.  No BF16 output is materialized.
                 assert o_block_scale is not None and o_global_scale is not None
-                amax = Float32(0)
-                for value_idx in cutlass.range_constexpr(16):
-                    value = Float32(tCrO_final[value_idx])
-                    amax = cute.arch.fmax(
-                        amax, cute.arch.fmax(value, -value)
-                    )
-
-                global_scale = Float32(o_global_scale[0])
-                sf_value = cutlass.Float8E4M3FN(
-                    amax * global_scale * Float32(1.0 / 6.0)
+                packed_values, sf_value = quantize_nvfp4_block16(
+                    tCrO_final, Float32(o_global_scale[0])
                 )
-                sf_rounded = Float32(sf_value)
-                quant_multiplier = Float32(0)
-                if sf_rounded != Float32(0):
-                    quant_multiplier = global_scale * cute.arch.rcp_approx(
-                        sf_rounded
-                    )
-                scaled_o = tCrO_final * quant_multiplier
-                tCgO.store(scaled_o.to(cutlass.Float4E2M1FN))
+                tCgO.store(packed_values)
 
                 d_block = (
                     d_blk_idx * d_per_blk + tidx * d_per_thr
@@ -3622,29 +3464,10 @@ class GroupedQueryAttentionDecodePagedFp4:
                 d_scale_blocks = d // 16
                 k_idx = coord_h * d_scale_blocks + d_block
                 hidden = h_q * d
-                num_k_tiles = cute.ceil_div(hidden, 64)
                 row_idx = coord_b * s_q + coord_s
-                m_tile_idx = row_idx // 128
-                outer_m_idx = row_idx % 32
-                inner_m_idx = (row_idx // 32) % 4
-                k_tile_idx = k_idx // 4
-                inner_k_idx = k_idx % 4
-                sf_offset = (
-                    (m_tile_idx * num_k_tiles + k_tile_idx) * 512
-                    + outer_m_idx * 16
-                    + inner_m_idx * 4
-                    + inner_k_idx
-                )
+                sf_offset = output_scale_offset(row_idx, k_idx, hidden)
                 o_block_scale[sf_offset] = sf_value
             else:
                 tCgO.store(tCrO_final.to(o_dhsb.dtype))
 
-        if cutlass.const_expr(l_hsb is not None and l_hsb.dtype == Float32):
-            if d_blk_idx == 0 and tidx == 0:
-                l_hsb[coord_h, coord_s, coord_b] = max_final + cute.math.log2(sum_final)
-
         return
-
-# 注:dense 文件末尾的独立 __main__ 驱动(run/parser)在分页变体中已删除 ——
-# 它面向 dense 语义,分页验证统一走 wrappers/batch_decode.py 的
-# _get_compiled_paged_fp4_decode_kernel + harness 的 pagedfp4 模式。

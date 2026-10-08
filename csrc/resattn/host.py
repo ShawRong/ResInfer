@@ -322,9 +322,8 @@ def _compiled(
         )
     sym_batch = cute.sym_int()
     sym_pages = cute.sym_int()
-    sym_prediction = cute.sym_int()
     q_fake = cute.runtime.make_fake_compact_tensor(
-        in_dtype, (sym_batch, sym_prediction, num_qo_heads, head_dim),
+        in_dtype, (sym_batch, 1, num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0), assumed_align=16)
     # 池张量用**符号步长**编译,不能用 compact:vLLM 把 KV 池切成
     # [data|scale] 的分侧视图后,页步长是 2*H*ps*full_dim 而非 H*ps*(D/2),
@@ -373,7 +372,7 @@ def _compiled(
     o_dtype = cutlass.Float4E2M1FN if output_nvfp4 else cutlass.BFloat16
     o_fake = cute.runtime.make_fake_compact_tensor(
         o_dtype,
-        (sym_batch, sym_prediction, output_num_qo_heads, head_dim),
+        (sym_batch, 1, output_num_qo_heads, head_dim),
         stride_order=(3, 2, 1, 0), assumed_align=16)
     o_sf_fake = o_global_scale_fake = None
     if output_nvfp4:
@@ -400,7 +399,7 @@ def _compiled(
             (
                 sym_splits,
                 sym_batch,
-                sym_prediction,
+                1,
                 num_qo_heads,
                 head_dim,
             ),
@@ -410,7 +409,7 @@ def _compiled(
         partial_shape = (
             sym_splits,
             sym_batch,
-            sym_prediction,
+            1,
             num_qo_heads,
         )
         l_partial_fake = cute.runtime.make_fake_compact_tensor(
@@ -445,7 +444,7 @@ def _compiled(
         fmha, Int32(1), q_fake, k_fake, v_fake,
         sf_flat(), k_sf_fake, v_sf_fake,
         o_fake, o_sf_fake, o_global_scale_fake,
-        None, o_partial_fake, l_partial_fake, m_partial_fake,
+        o_partial_fake, l_partial_fake, m_partial_fake,
         completion_fake,
         Float32(1.0), Float32(1.0), seq_lens_fake, block_tables_fake,
         stream_fake, True,
@@ -684,7 +683,7 @@ def run_paged_fp4_decode_qmul4_tmem(
         pool.k_sf,
         v_sf_bthd,
         out.view(B, 1, HQ, D),
-        None, None, None, o_partial, l_partial, m_partial, None,
+        None, None, o_partial, l_partial, m_partial, None,
         Float32(sm_scale),
         Float32(value_scale),
         seq_lens,
@@ -943,7 +942,6 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
         out.view(B, 1, HQ, D // 2).view(torch.float4_e2m1fn_x2),
         output_block_scale.reshape(-1),
         output_global_scale_inv.reshape(1),
-        None,
         o_partial,
         l_partial,
         m_partial,
