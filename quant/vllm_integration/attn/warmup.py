@@ -30,7 +30,7 @@ class _DecodeWarmupProvider:
             _validate_residue_geometry(hq, hkv)
             for output_nvfp4 in ((False, True) if packed else (False,)):
                 for spec in host.decode_compile_variants(
-                    hq, hkv, dim, output_nvfp4=output_nvfp4,
+                    hq, hkv, dim, residue_fold=True, output_nvfp4=output_nvfp4,
                 ):
                     key = ('resattn_decode', spec['args'], tuple(sorted(spec['kwargs'].items())))
                     if key in seen:
