@@ -69,9 +69,10 @@ def _legal_indices(m_tok: int) -> list[int]:
     from nvfp4.cute_fold.tactics import _rank_tactics
 
     arch = _arch()
+    if arch != "sm100":
+        return []
     legal = {(family, tactic) for family in _families()
              for tactic in _rank_tactics(family, m_tok, arch)
-             if arch == "sm100" or (tactic[3] is None and tactic[1][1] >= 128)
              # A4 (128,32) returned incomplete output at N1152/K8192.
              if not (family == ("tile8", "std") and tactic[1] == (128, 32))}
     return [i for i, c in enumerate(_candidates()) if (c[0], c[1:]) in legal]
@@ -101,7 +102,7 @@ def _quant_for_family(inputs, family, pad_multiple: int = _M_PAD_MULTIPLE):
 
 
 def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
-    from nvfp4.cute_fold.host import mext_fold_gemm_sm103
+    from nvfp4.cute_fold.host import mext_fold_gemm
     from nvfp4.cute_fold.tactics import _needs_pi_layout
 
     family, mode, tiler, cluster, ab = _candidates()[idx]
@@ -109,7 +110,7 @@ def _run_tactic(inputs, idx, out_dtype) -> torch.Tensor:
     x_fp4, x_sf = _quant_for_family(
         inputs, family, pad_multiple=tile8_pad_multiple(mode, tiler))
     _, weight, _, wsb, alpha = inputs
-    out = mext_fold_gemm_sm103(
+    out = mext_fold_gemm(
         weight, x_fp4, wsb, x_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster, store_mode=mode,
         kernel_arch=_arch(), ab_stage_override=ab,

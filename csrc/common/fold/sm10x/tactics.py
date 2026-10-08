@@ -13,8 +13,7 @@ from ..diagnostics import silence_default_notice
 # Escape hatch for harnesses that call the fallback on purpose.
 _SILENCE_DEFAULT = silence_default_notice()
 
-from .host import mext_fold_gemm_sm103
-
+from .host import mext_fold_gemm
 
 
 
@@ -47,26 +46,13 @@ ARCH_TACTIC_BY_M: dict[str, list[tuple[int, str, tuple[int, int], tuple[int, int
         (64, "sm100", (128, 64), (1, 1)),            # decode: N=64 1SM floor
         (_SENTINEL_M, "sm100", (256, 128), (2, 1)),  # m>64: 2SM (safe blanket)
     ],
-    "sm103": [
-        
-        
-        
-        
-        
-        
-        (64, "sm100", (128, 64), (1, 1)),            # decode: sm100 kernel, N=64 1SM
-        (256, "sm103", (256, 128), (2, 1)),          # transition band (mixed winners)
-        (_SENTINEL_M, "sm103", (256, 256), (2, 1)),  # m>256: K=96 amortization wins
-    ],
 }
 
 
 def kernel_arch_for_capability(major: int, minor: int) -> str | None:
     """Map a CUDA compute capability to the fold kernel arch, or None if the
     fold path is unsupported (caller falls back to unfused)."""
-    if major != 10:
-        return None
-    return "sm103" if minor == 3 else "sm100"
+    return "sm100" if (major, minor) == (10, 0) else None
 
 
 def select_arch_tactic(
@@ -106,7 +92,7 @@ def run_fold_default(
         from ..fold import warn_default_path
 
         warn_default_path(arch, m_tok, f"tile={tiler}")
-    return mext_fold_gemm_sm103(
+    return mext_fold_gemm(
         weight_fp4, act_fp4_rowpair, weight_sf, act_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster,
         store_mode="tma", kernel_arch=kernel_arch,
@@ -119,10 +105,10 @@ def warmup_specs(arch: str, families=(), strided=(False, True)) -> list[dict]:
     Shape-independent BY CONSTRUCTION, which is why this needs no shapes while
     the sm120 warmup does: this kernel's compile cache key holds only
     (tiler, cluster, dtype, mode, arch, ab_stage, dual_alpha, pi_via_layout,
-    split_k, splitk_ablate, dsmem_split, strided_weight) -- no n_w, no k, no
+    strided_weight) -- no n_w, no k, no
     m_tok. So the whole compile space is a small fixed set.
 
-    `strided` is the part that used to be missed. `mext_fold_gemm_sm103`
+    `strided` is the part that used to be missed. `mext_fold_gemm`
     derives strided_weight from the tensor at call time
     (`weight.stride(0) != k_packed`), so an extended_k layer -- whose weight is
     a [:, :k_base] view of the ext-K weight -- reaches a DIFFERENT compiled
@@ -458,7 +444,7 @@ def _measure_family(
             family, m_tok, kernel_arch)[:AUTOTUNE_TOP_N]:
         try:
             fn = lambda mode=mode, tiler=tiler, cluster=cluster, ab=ab: (
-                mext_fold_gemm_sm103(
+                mext_fold_gemm(
                     weight_fp4, act_fp4, weight_sf, act_sf, alpha,
                     out_dtype, mma_tiler_mn=tiler, cluster_shape_mn=cluster,
                     store_mode=mode, kernel_arch=kernel_arch,
@@ -499,7 +485,7 @@ def run_fold_autotuned(
                 f"tiny-m to the ('row_pair','std') N-ext family instead")
         _AUTOTUNE_CACHE[key] = hit
     mode, tiler, cluster, ab = _norm_tactic(hit)
-    return mext_fold_gemm_sm103(
+    return mext_fold_gemm(
         weight_fp4, act_fp4, weight_sf, act_sf, alpha, out_dtype,
         mma_tiler_mn=tiler, cluster_shape_mn=cluster,
         store_mode=mode, kernel_arch=kernel_arch, ab_stage_override=ab,
@@ -533,7 +519,7 @@ FAMILY_ACT_LAYOUT: dict[tuple[str, str], str] = {
 }
 
 # Families needing the pi weight permutation. pi is a pure axis transpose that
-# COMMUTES with quantise+swizzle (a6_weight_perm_indices has the proof), so
+# COMMUTES with quantise+swizzle (the archived host documents the proof), so
 # this is a LAYOUT requirement, not a second weight buffer and not a load-time
 # commitment -- one physical weight can back both N-ext and A6. The kernel
 # carries the transpose in its TMA/SF layouts (pi_via_layout, gated bitwise on

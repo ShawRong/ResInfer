@@ -299,9 +299,9 @@ def run_fold(
         family, arch, weight_fp4.shape[0], weight_fp4.shape[1] * 2, m_tok)
     if tuned is not None:
         mode, tiler, cluster, ab = _t._norm_tactic(tuned)
-        from .cute_fold.host import mext_fold_gemm_sm103
+        from .cute_fold.host import mext_fold_gemm
 
-        return mext_fold_gemm_sm103(
+        return mext_fold_gemm(
             weight_fp4, act_fp4_rowpair, weight_sf, act_sf, alpha, out_dtype,
             mma_tiler_mn=tiler, cluster_shape_mn=cluster, store_mode=mode,
             kernel_arch=arch, ab_stage_override=ab,

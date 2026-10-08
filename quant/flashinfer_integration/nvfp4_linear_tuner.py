@@ -37,12 +37,12 @@ class NVFP4Policy(NamedTuple):
 
 def _route(m, policy):
     """Choose the numerical path for both synthesized and serving M."""
-    fold = policy.fold_eligible and policy.arch is not None and (
+    fold = policy.fold_eligible and policy.arch in ("sm100", "sm120") and (
         policy.ratio1 or policy.force_fold or m <= policy.fold_max_m)
     if fold:
         if policy.ratio1 and m > policy.ratio1_fold_max_m:
             return "ratio1_prefill"
-        return "sm10x_fold" if policy.arch in ("sm100", "sm103") else "sm120_fold"
+        return "sm10x_fold" if policy.arch == "sm100" else "sm120_fold"
     if policy.ratio1:
         return "invalid_mext"
     return "plain" if policy.num_salient == 0 else "k_ext"
@@ -55,7 +55,7 @@ def _fold_inputs(inputs, policy):
     if packed_k > weight.shape[1]:
         raise ValueError("base K exceeds packed weight width")
     view = weight if packed_k == weight.shape[1] else weight[:, :packed_k]
-    return [x, view, scale_inv, base_sf, alpha]
+    return (x, view, scale_inv, base_sf, alpha)
 
 
 def _valid(inputs, policy, tuning):
@@ -119,8 +119,8 @@ def tuned_nvfp4_linear(inputs, policy):
     buckets = tuple(sorted({b for b in (*_BUCKETS, *boundaries)
                             if 0 < b <= max(_BUCKETS)}))
     # All candidate families share this call and its cold-L2 measurement.
-    fold_tuner = policy.sm10x_tuner if policy.arch in ("sm100", "sm103") else policy.sm120_tuner
-    enabled = (policy.fold_eligible and policy.arch is not None
+    fold_tuner = policy.sm10x_tuner if policy.arch == "sm100" else policy.sm120_tuner
+    enabled = (policy.fold_eligible and policy.arch in ("sm100", "sm120")
                and (fold_tuner or (policy.ratio1 and policy.prefill == "auto")))
     if not enabled:
         return _fallback(inputs, policy)

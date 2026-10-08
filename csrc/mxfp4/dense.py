@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from ..cute_fold.host import _compile_fold_gemm, mext_fold_gemm_sm103
+from ..cute_fold.host import _compile_fold_gemm, mext_fold_gemm
 
 
 def _validate(a, b, sa, sb, out_dtype):
@@ -45,7 +45,7 @@ def gemm(a, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
             mode="plain_mn",kernel_arch=arch,fp4_format="mxfp4")
         out = torch.empty((m,n),device=a.device,dtype=out_dtype)
         compiled(a,b,out,(m+127)//128,(n+127)//128,(k+127)//128,
-                 a_scale.data_ptr(),b_scale.data_ptr(),None,0,0)
+                 a_scale.data_ptr(),b_scale.data_ptr(),None)
         return out
 
 
@@ -59,7 +59,7 @@ def fold_gemm(a_rowpair, b, a_scale, b_scale, *, out_dtype=torch.bfloat16,
     if store_mode not in ("tma", "tma_mext", "direct_mext"):
         raise ValueError("unsupported MXFP4 Fold store mode")
     with torch.cuda.device(a_rowpair.device):
-        return mext_fold_gemm_sm103(
+        return mext_fold_gemm(
             b, a_rowpair, b_scale, a_scale,
             None,
             out_dtype=out_dtype, mma_tiler_mn=tuple(mma_tiler_mn),
