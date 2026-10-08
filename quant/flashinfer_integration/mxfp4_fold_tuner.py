@@ -41,8 +41,8 @@ def candidates_hash() -> str:
 
 
 def tuner_enabled() -> bool:
-    """Experimental MXFP4 service route; opt in only after a GPU smoke."""
-    value = os.environ.get("RESIDUE_MXFP4_FOLD_TUNER", "0")
+    """Enable FlashInfer selection by default; allow explicit static fallback."""
+    value = os.environ.get("RESIDUE_MXFP4_FOLD_TUNER", "1")
     if value not in ("0", "1"):
         raise ValueError("RESIDUE_MXFP4_FOLD_TUNER must be 0 or 1")
     return value == "1"
@@ -90,13 +90,16 @@ def _fallback(inputs, pdl_mode: str, out_dtype):
     return _run_tactic(inputs, _DEFAULT, pdl_mode, out_dtype)
 
 
-def _valid(inputs, policy, tuning):
+def _valid(inputs, policy, _tuning):
     out_dtype, _pdl_mode, _hash = policy
+    # vLLM eager warmup loads cached winners before capture, even when tuning
+    # is off. Capture itself may only select resident specializations.
+    allow_uncompiled = not torch.cuda.is_current_stream_capturing()
     from nvfp4.cute_fold.host import _compile_fold_gemm, STORE_MODE_TO_MODE
 
     return [i for i, (family, mode, tile, cluster, ab) in enumerate(_candidates())
             if _static_legal(_candidates()[i], int(inputs[0].shape[0]))
-            and (tuning or _compile_fold_gemm(
+            and (allow_uncompiled or _compile_fold_gemm(
                 tile, cluster, out_dtype, mode=STORE_MODE_TO_MODE[mode],
                 kernel_arch="sm100", ab_stage_override=ab,
                 pi_via_layout=family == ("tile8", "pi"), fp4_format="mxfp4",
@@ -137,6 +140,9 @@ def tuned_mxfp4_fold(x, packed_w, flat_ws, *, pdl_mode="early",
     """Tune full MXFP4 quantize + Fold over exact logical token counts."""
     if pdl_mode not in ("off", "tail", "early"):
         raise ValueError(f"invalid MXFP4 PDL mode {pdl_mode!r}")
+    if not tune:
+        _set_source("offline_table")
+        return _fallback([x, packed_w, flat_ws], pdl_mode, out_dtype)
     m = int(x.shape[0])
     buckets = tuple(sorted({*(int(b) for b in (tuning_buckets or ())), m}))
     spec = LinearSpec(
