@@ -18,12 +18,13 @@ def _logger():
 def log_selected_kernel_once(method):
     logger = _logger()
     compatible = isinstance(method.kernel, method._CUTLASS_LAYOUT_KERNELS)
-    logger.info_once(
+    # vLLM owns deduplication; standalone diagnostics use ordinary logging.
+    getattr(logger, "info_once", logger.info)(
         "NVFP4 kernel: %s (residue-compatible layout: %s)",
         type(method.kernel).__name__, compatible,
     )
     if not compatible:
-        logger.warning_once(
+        getattr(logger, "warning_once", logger.warning)(
             "NVFP4 kernel %s cannot provide the residue CUTLASS layout; "
             "residue features may be disabled or rejected. Select cutlass, "
             "flashinfer_cutlass or flashinfer_cutedsl.",

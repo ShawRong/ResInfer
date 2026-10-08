@@ -3,6 +3,8 @@
 """ResAttn decode launches and per-layer reduction workspace ownership."""
 from __future__ import annotations
 
+from typing import Any, cast
+
 import torch
 
 from .runtime import _load_decode_kernel, _qk_residue_for_geometry
@@ -10,6 +12,13 @@ from .runtime import _load_decode_kernel, _qk_residue_for_geometry
 
 class ResAttnDecodeMixin:
     """Requires the head geometry, scale and workspace cache of the adapter."""
+
+    # Initialized by ResAttnFlashInferImpl after the stock FlashInfer base.
+    num_heads: int
+    num_kv_heads: int
+    head_size: int
+    scale: float
+    _decode_reduction_workspaces: dict[tuple[str, int, int, int, str], Any]
 
     def _get_decode_reduction_workspace(
         self,
@@ -144,12 +153,16 @@ class ResAttnDecodeMixin:
             )
             splits, reduction = decode_plan
             if reduction == "kernel":
-                reduction_workspace = self._get_decode_reduction_workspace(
-                    host,
-                    splits,
-                    n,
-                    q_dec.device,
-                    residue_fold=qk_residue,
+                # This branch requests the three-tensor kernel workspace.
+                reduction_workspace = cast(
+                    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                    self._get_decode_reduction_workspace(
+                        host,
+                        splits,
+                        n,
+                        q_dec.device,
+                        residue_fold=qk_residue,
+                    ),
                 )
         host.run_paged_fp4_decode_qmul4_tmem(
             q_dec,

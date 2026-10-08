@@ -5,14 +5,9 @@ from __future__ import annotations
 import torch
 from torch.nn.parameter import Parameter
 
-try:
-    from vllm.model_executor.layers.quantization.utils.quant_utils import (
-        swizzle_blockscale,
-    )
-except ImportError:
-    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-        swizzle_blockscale,
-    )
+from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
+    swizzle_blockscale,
+)
 
 
 def prepare_decode_mext_scale(layer, raw_weight_scale_ext: torch.Tensor) -> None:

@@ -7,7 +7,7 @@ vLLM's newer kernel registry.
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, cast
 
 import torch
 from torch.nn.parameter import Parameter
@@ -41,6 +41,10 @@ from .residue_tp import (
     current_tp_rank,
     plan_from_partition,
 )
+if TYPE_CHECKING:
+    from .residue_tp import ResidueShardPlan
+
+
 # Side-effect import: registers `torch.ops.residue.nvfp4_linear`, the opaque
 # custom_op that wraps the residue NVFP4 GEMM pipeline (both mext-fold and
 # legacy K-ext kernel chains) so torch.compile sees one black-box op call per
@@ -66,9 +70,39 @@ def _is_kernel_instance(kernel: object, kernel_cls: type | None) -> bool:
 class _InputQuantizerState(torch.nn.Module):
     """Receive input_quantizer.* checkpoint tensors during NVFP4 loading."""
 
+    _salient_indices: torch.Tensor
+
     def __init__(self):
         super().__init__()
         self.register_buffer("_salient_indices", torch.empty(0, dtype=torch.int64))
+
+
+class _ResidueLinearLayer(torch.nn.Module):
+    """Static view of fields installed by vLLM and this quantization method."""
+
+    prefix: str
+    weight: torch.nn.Parameter
+    weight_scale: torch.nn.Parameter
+    weight_scale_2: torch.nn.Parameter
+    input_scale: torch.nn.Parameter
+    input_quantizer: _InputQuantizerState
+    input_global_scale: torch.nn.Parameter
+    input_global_scale_inv: torch.nn.Parameter
+    weight_global_scale: torch.nn.Parameter
+    weight_scale_base: torch.nn.Parameter
+    alpha: torch.nn.Parameter
+    channel_mask: torch.Tensor | None
+    _salient_indices: torch.Tensor | None
+    _residue_shard_plan: ResidueShardPlan | None
+    _is_residue_layer: bool
+    _decode_mext_layout_enabled: bool
+    _mext_decode_k_base: int
+    _runtime_mode: str
+    num_salient: int
+    extended_in_features: int
+    original_in_features: int
+    output_size_per_partition: int
+    weights_padding_cols: int
 
 
 class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
@@ -164,6 +198,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         contract. AWQ pre_quant_scale must be folded during export and is not
         registered or applied at runtime.
         """
+        layer = cast(_ResidueLinearLayer, layer)
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
         diagnostics.log_selected_kernel_once(self)
         extended_dim = self._get_extended_dim(layer_name)
@@ -290,6 +325,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
                         super-swizzle, then build the base-K prefix layout via
                         `prepare_decode_mext_scale`.
         """
+        layer = cast(_ResidueLinearLayer, layer)
         layer_name = getattr(layer, "prefix", "") or self.layer_prefix
         runtime_mode = self._get_runtime_mode(layer_name)
 
@@ -349,13 +385,14 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         layer.extended_in_features = extended_in
 
         if layer._is_residue_layer:
+            assert salient_indices is not None
             layer.original_in_features = extended_in - layer.num_salient
             if self._nvfp4 is None:
                 import nvfp4  # noqa: F401
 
                 self._nvfp4 = nvfp4
             layer.channel_mask = self._nvfp4.indices_to_channel_masks(
-                layer._salient_indices,
+                salient_indices,
                 layer.original_in_features,
                 layer_name=layer_name,
             ).to(layer.weight.device)
@@ -398,6 +435,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         `_mext_decode_k_base` and `weight_scale_base = weight_scale` (i.e. the
         whole scale doubles as its own prefix scale).
         """
+        layer = cast(_ResidueLinearLayer, layer)
         if not self._uses_cutlass_compatible_layout():
             raise RuntimeError(
                 "mext_r1 layers need a cutlass-layout NVFP4 kernel; vLLM "
@@ -520,6 +558,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         and `_mext_decode_k_base`. Weight preparation normalizes both into
         that shape so we have a single dispatch condition here.
         """
+        layer = cast(_ResidueLinearLayer, layer)
         # `fold_eligible` is a per-layer constant (does the layer have a
         # base-K scale and a valid prefix k_base?). The op's body uses this
         # *together with* the runtime M of each invocation to decide whether
@@ -597,9 +636,11 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         `_apply_residue_via_op` to avoid that. Backends below are not on the
         hot path and remain on this inline path for now.
         """
+        layer = cast(_ResidueLinearLayer, layer)
         assert self._nvfp4 is not None, (
             "nvfp4 extension must be loaded in process_weights_after_loading()"
         )
+        assert layer.channel_mask is not None
 
         output_size = layer.output_size_per_partition
         output_dtype = x.dtype
@@ -666,6 +707,7 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         *,
         backend: str,
     ) -> torch.Tensor:
+        layer = cast(_ResidueLinearLayer, layer)
         if backend in {"cudnn", "b12x"}:
             x_fp4 = pad_nvfp4_activation_for_cutlass(
                 x_fp4, getattr(layer, "weights_padding_cols", 0)
@@ -689,7 +731,8 @@ class ResidueNvFp4LinearMethodV2(ModelOptNvFp4LinearMethod):
         x_sf_block: torch.Tensor,
         output_dtype: torch.dtype,
     ) -> torch.Tensor:
-        import fbgemm_gpu  # noqa: F401
+        layer = cast(_ResidueLinearLayer, layer)
+        import fbgemm_gpu  # noqa: F401  # pyright: ignore[reportMissingImports]
 
         out = torch.ops.fbgemm.f4f4bf16(
             x_fp4,

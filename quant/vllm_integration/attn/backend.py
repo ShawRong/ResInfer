@@ -171,9 +171,13 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output, output_scale=None, output_block_scale=None):
-        fused_nvfp4 = output_scale is not None
-        if fused_nvfp4 != (output_block_scale is not None):
+        if output_scale is None and output_block_scale is None:
+            scales = None
+        elif output_scale is not None and output_block_scale is not None:
+            scales = (output_scale, output_block_scale)
+        else:
             raise ValueError("NVFP4 attention output requires data and block scales")
+        fused_nvfp4 = scales is not None
         if attn_metadata is None:
             return output.fill_(0)
         _require_separate_phases(attn_metadata)
@@ -185,9 +189,10 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         if md.num_prefill_tokens:
             # vLLM already invoked the inherited stock cache writer exactly
             # once. Only pure prefill can reach the stock execution path.
-            if not fused_nvfp4:
+            if scales is None:
                 return super().forward(layer, query, key, value, kv_cache,
                                        md, output)
+            output_scale, output_block_scale = scales
             stock_output = torch.empty_like(query, dtype=torch.bfloat16)
             super().forward(layer, query, key, value, kv_cache,
                             md, stock_output)
@@ -203,7 +208,8 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         if md.num_decodes:
             decode = _require_trtllm_decode(md)
             pool = self._pool_for(kv_cache, layer)
-            if fused_nvfp4:
+            if scales is not None:
+                output_scale, output_block_scale = scales
                 host = _load_decode_kernel()
                 if host is None:
                     raise RuntimeError("ResAttn NVFP4 decode kernel unavailable")

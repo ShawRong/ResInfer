@@ -4,6 +4,19 @@
 These are in-memory layer descriptions, not a checkpoint format. Quantization
 encoding is owned by ModelOpt; residue sidecars use the common metadata schema.
 """
+from typing import TypedDict
+
+
+class _RequiredLayerSpec(TypedDict):
+    mode: str
+    input_size: int
+    output_size: int
+
+
+class LayerSpec(_RequiredLayerSpec, total=False):
+    indices: list[int]
+
+
 def padded_k(k, selected=0):
     return ((k + selected + 127) // 128) * 128
 
@@ -60,7 +73,7 @@ def runtime_layer_specs(layers, model_type):
     return fused
 
 
-def residue_spec(metadata, input_size, output_size):
+def residue_spec(metadata, input_size: int, output_size: int) -> LayerSpec:
     """Translate common residue metadata to the MXFP4 execution contract."""
     metadata = metadata or {}
     indices = metadata.get("salient_indices", [])
@@ -77,7 +90,7 @@ def residue_spec(metadata, input_size, output_size):
         mode = "standard"
     else:
         raise ValueError(f"invalid residue runtime mode: {runtime_mode}")
-    spec = dict(mode=mode, input_size=input_size, output_size=output_size)
+    spec: LayerSpec = {"mode": mode, "input_size": input_size, "output_size": output_size}
     if indices:
         spec["indices"] = indices
     validate_layer(spec)
