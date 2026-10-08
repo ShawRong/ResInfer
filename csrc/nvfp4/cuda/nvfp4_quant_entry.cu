@@ -193,54 +193,6 @@ void scaled_fp4_quant(torch::Tensor& output, torch::Tensor const& input,
       "No compiled nvfp4 quantization with residue kernel for Blackwell (SM100a/SM120a).");
 }
 
-void scaled_fp4_quant_pack8_r0125_no_swap(
-                      torch::Tensor& output, torch::Tensor const& input,
-                      torch::Tensor& output_sf, torch::Tensor const& input_sf,
-                      torch::Tensor const& channel_indices, int64_t n_ext,
-                      int64_t residue_per_8) {
-#if (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120) || \
-    (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100)
-  return scaled_fp4_quant_with_residue_ext_pack8_r0125_no_swap(
-      output, input, output_sf, input_sf, channel_indices, n_ext,
-      residue_per_8);
-#endif
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      false,
-      "No compiled pack8 r0125 nvfp4 quantization with residue kernel for Blackwell (SM100a/SM120a).");
-}
-
-void scaled_fp4_quant_pack8_r025_no_swap(
-                      torch::Tensor& output, torch::Tensor const& input,
-                      torch::Tensor& output_sf, torch::Tensor const& input_sf,
-                      torch::Tensor const& channel_indices, int64_t n_ext,
-                      int64_t residue_per_8) {
-#if (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120) || \
-    (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100)
-  return scaled_fp4_quant_with_residue_ext_pack8_r025_no_swap(
-      output, input, output_sf, input_sf, channel_indices, n_ext,
-      residue_per_8);
-#endif
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      false,
-      "No compiled pack8 r025 nvfp4 quantization with residue kernel for Blackwell (SM100a/SM120a).");
-}
-
-void scaled_fp4_quant_pack8_r050_no_swap(
-                      torch::Tensor& output, torch::Tensor const& input,
-                      torch::Tensor& output_sf, torch::Tensor const& input_sf,
-                      torch::Tensor const& channel_indices, int64_t n_ext,
-                      int64_t residue_per_8) {
-#if (defined(ENABLE_NVFP4_SM120) && ENABLE_NVFP4_SM120) || \
-    (defined(ENABLE_NVFP4_SM100) && ENABLE_NVFP4_SM100)
-  return scaled_fp4_quant_with_residue_ext_pack8_r050_no_swap(
-      output, input, output_sf, input_sf, channel_indices, n_ext,
-      residue_per_8);
-#endif
-  TORCH_CHECK_NOT_IMPLEMENTED(
-      false,
-      "No compiled pack8 r050 nvfp4 quantization with residue kernel for Blackwell (SM100a/SM120a).");
-}
-
 void scaled_fp4_quant_mext_r1(torch::Tensor& output, torch::Tensor const& input,
                               torch::Tensor& output_sf,
                               torch::Tensor const& input_sf,

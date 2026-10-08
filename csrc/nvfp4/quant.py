@@ -158,92 +158,6 @@ def scaled_fp4_quant(
     return output.view(m, n_ext // 2), output_scale
 
 
-def _scaled_fp4_quant_pack8_no_swap_with_mask(
-    input_tensor: torch.Tensor,
-    input_scale: torch.Tensor,
-    channel_masks: torch.Tensor,
-    num_salient: int,
-    expected_ratio: float,
-    residue_per_8: int,
-    op_name: str,
-):
-    m, k = input_tensor.shape
-    n_ext = k + num_salient
-    ratio = num_salient / k
-    if abs(ratio - expected_ratio) >= 0.001:
-        raise ValueError(
-            f"pack8 r{expected_ratio:g} requires salient ratio {expected_ratio:g}, "
-            f"got {ratio:.4f} ({num_salient}/{k})."
-        )
-
-    output, output_scale = _alloc_residue_quant_outputs(input_tensor, n_ext)
-    ensure_loaded()
-    getattr(torch.ops.nvfp4, op_name)(
-        output,
-        input_tensor,
-        output_scale,
-        input_scale,
-        channel_masks,
-        n_ext,
-        residue_per_8,
-    )
-    return output.view(m, n_ext // 2), output_scale
-
-
-def scaled_fp4_quant_pack8_r025_no_swap_with_mask(
-    input_tensor,
-    input_scale,
-    channel_masks,
-    num_salient,
-):
-    """Experimental pack8 no-swap residue quantization specialized for ratio=0.25."""
-    return _scaled_fp4_quant_pack8_no_swap_with_mask(
-        input_tensor,
-        input_scale,
-        channel_masks,
-        num_salient,
-        0.25,
-        2,
-        "scaled_fp4_quant_pack8_r025_no_swap",
-    )
-
-
-def scaled_fp4_quant_pack8_r0125_no_swap_with_mask(
-    input_tensor,
-    input_scale,
-    channel_masks,
-    num_salient,
-):
-    """Experimental pack8 no-swap residue quantization specialized for ratio=0.125."""
-    return _scaled_fp4_quant_pack8_no_swap_with_mask(
-        input_tensor,
-        input_scale,
-        channel_masks,
-        num_salient,
-        0.125,
-        1,
-        "scaled_fp4_quant_pack8_r0125_no_swap",
-    )
-
-
-def scaled_fp4_quant_pack8_r050_no_swap_with_mask(
-    input_tensor,
-    input_scale,
-    channel_masks,
-    num_salient,
-):
-    """Experimental pack8 no-swap residue quantization specialized for ratio=0.5."""
-    return _scaled_fp4_quant_pack8_no_swap_with_mask(
-        input_tensor,
-        input_scale,
-        channel_masks,
-        num_salient,
-        0.5,
-        4,
-        "scaled_fp4_quant_pack8_r050_no_swap",
-    )
-
-
 def scaled_fp4_quant_with_mask(
     input_tensor: torch.Tensor,
     input_scale: torch.Tensor,
@@ -272,8 +186,5 @@ def scaled_fp4_quant_with_mask(
 __all__ = [
     "indices_to_channel_masks",
     "scaled_fp4_quant",
-    "scaled_fp4_quant_pack8_r0125_no_swap_with_mask",
-    "scaled_fp4_quant_pack8_r025_no_swap_with_mask",
-    "scaled_fp4_quant_pack8_r050_no_swap_with_mask",
     "scaled_fp4_quant_with_mask",
 ]

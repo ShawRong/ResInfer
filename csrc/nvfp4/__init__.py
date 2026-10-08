@@ -5,9 +5,6 @@ from .mext import scaled_fp4_quant_mext_r1
 from .quant import (
     indices_to_channel_masks,
     scaled_fp4_quant,
-    scaled_fp4_quant_pack8_r0125_no_swap_with_mask,
-    scaled_fp4_quant_pack8_r025_no_swap_with_mask,
-    scaled_fp4_quant_pack8_r050_no_swap_with_mask,
     scaled_fp4_quant_with_mask,
 )
 
@@ -16,8 +13,5 @@ __all__ = [
     "indices_to_channel_masks",
     "scaled_fp4_quant",
     "scaled_fp4_quant_mext_r1",
-    "scaled_fp4_quant_pack8_r0125_no_swap_with_mask",
-    "scaled_fp4_quant_pack8_r025_no_swap_with_mask",
-    "scaled_fp4_quant_pack8_r050_no_swap_with_mask",
     "scaled_fp4_quant_with_mask",
 ]
