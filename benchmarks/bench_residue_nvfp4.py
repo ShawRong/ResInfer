@@ -418,7 +418,7 @@ def run(args) -> None:
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
         swizzle_blockscale)
     import quant.vllm_integration.residue_linear_op  # noqa: F401  registers op
-    from nvfp4 import fold as nvfp4_fold
+    from nvfp4 import diagnostics as nvfp4_diagnostics
 
     stock_kernel = init_nvfp4_linear_kernel()
     stock_name = type(stock_kernel).__name__
@@ -679,10 +679,10 @@ def run(args) -> None:
                     warm_equally(f, mext_args)
                     mext_ops = ops_of(f, mext_args)
                     mext_kpc = mext_ops.get("kernels_per_call")
-                    before = nvfp4_fold.compile_stats()
+                    before = nvfp4_diagnostics.compile_stats()
                     t = timed_detail(f, mext_args, iters_within_graph=niw,
                                      repeats=args.repeats)
-                    after = nvfp4_fold.compile_stats()
+                    after = nvfp4_diagnostics.compile_stats()
                     for hit in tw.hits:
                         emit({"kind": "tactic_fallback", "run_id": run_id,
                               "family": "mext", "rep": args.rep, "model": model, "proj": proj,
