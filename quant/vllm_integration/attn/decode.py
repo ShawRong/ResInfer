@@ -7,7 +7,7 @@ from typing import Any, cast
 
 import torch
 
-from .runtime import _load_decode_kernel, _qk_residue_for_geometry
+from .runtime import _load_decode_kernel, _validate_residue_geometry
 
 
 class ResAttnDecodeMixin:
@@ -27,7 +27,6 @@ class ResAttnDecodeMixin:
         batch: int,
         device: torch.device,
         reduction: str = "kernel",
-        residue_fold: bool = True,
     ):
         # The CuTe kernel pads each GQA group to its supported N tile. Mirror
         # that effective head count here; using the model's unpadded HQ would
@@ -69,7 +68,7 @@ class ResAttnDecodeMixin:
         decode = md.decode
         q_dec = q_all if q_all.shape[0] == n else q_all[:n]
         splits, reduction = plan
-        qk_residue = _qk_residue_for_geometry(
+        _validate_residue_geometry(
             self.num_heads, self.num_kv_heads
         )
         reduction_workspace = None
@@ -80,7 +79,6 @@ class ResAttnDecodeMixin:
                 n,
                 q_dec.device,
                 reduction=reduction,
-                residue_fold=qk_residue,
             )
         scale_rows = ((n + 127) // 128) * 128
         host.run_paged_fp4_decode_qmul4_tmem_nvfp4(
@@ -99,7 +97,6 @@ class ResAttnDecodeMixin:
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
             plan=plan,
-            residue_fold=qk_residue,
         )
 
     def _decode_forward(
@@ -132,7 +129,7 @@ class ResAttnDecodeMixin:
             else torch.empty_like(dec_out, dtype=torch.bfloat16)
         )
         reduction_workspace = None
-        qk_residue = _qk_residue_for_geometry(
+        _validate_residue_geometry(
             self.num_heads, self.num_kv_heads
         )
         
@@ -141,7 +138,7 @@ class ResAttnDecodeMixin:
         decode_plan = None
         # With unknown length, leave the original length fallback/selection
         # to the host rather than forwarding a plan chosen for length zero.
-        if decode.max_seq_len and hasattr(host, "plan_qmul4_decode"):
+        if decode.max_seq_len:
             decode_plan = host.plan_qmul4_decode(
                 n,
                 self.num_kv_heads,
@@ -149,7 +146,6 @@ class ResAttnDecodeMixin:
                 q_dec.device,
                 grouped_head_tile=host._residue_padded_group_size(
                     self.num_heads, self.num_kv_heads),
-                residue_fold=qk_residue,
             )
             splits, reduction = decode_plan
             if reduction == "kernel":
@@ -161,7 +157,6 @@ class ResAttnDecodeMixin:
                         splits,
                         n,
                         q_dec.device,
-                        residue_fold=qk_residue,
                     ),
                 )
         host.run_paged_fp4_decode_qmul4_tmem(
@@ -177,9 +172,7 @@ class ResAttnDecodeMixin:
             k_sf_mode="linear",
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
-            direct_output=qk_residue,
             plan=decode_plan,
-            residue_fold=qk_residue,
         )
         if kern_out is not dec_out:
             dec_out.copy_(kern_out)

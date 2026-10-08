@@ -7,7 +7,7 @@ import functools
 import torch
 from vllm.config import get_current_vllm_config_or_none
 
-from .runtime import _load_decode_kernel, _qk_residue_for_geometry
+from .runtime import _load_decode_kernel, _validate_residue_geometry
 
 
 class _DecodeWarmupProvider:
@@ -27,10 +27,10 @@ class _DecodeWarmupProvider:
             return []
         units, seen = [], set()
         for hq, hkv, dim, packed in sorted(self._geometries):
-            residue = _qk_residue_for_geometry(hq, hkv)
+            _validate_residue_geometry(hq, hkv)
             for output_nvfp4 in ((False, True) if packed else (False,)):
                 for spec in host.decode_compile_variants(
-                    hq, hkv, dim, residue_fold=residue, output_nvfp4=output_nvfp4,
+                    hq, hkv, dim, output_nvfp4=output_nvfp4,
                 ):
                     key = ('resattn_decode', spec['args'], tuple(sorted(spec['kwargs'].items())))
                     if key in seen:

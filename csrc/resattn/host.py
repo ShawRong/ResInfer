@@ -594,7 +594,6 @@ def run_paged_fp4_decode_qmul4_tmem(
         raise NotImplementedError("padded output moved to .dev/tools/resattn/experimental")
     B, HQ, D = q.shape
     H = pool.num_kv_heads
-    g = HQ // H
     check_shape_supported(HQ, H, D, prediction=1)
     _check_decode_metadata(block_tables, seq_lens, B, q.device)
     if v_data_hnd.shape != (pool.k_data.shape[0], H, PAGE_SIZE, D // 2):
@@ -612,7 +611,6 @@ def run_paged_fp4_decode_qmul4_tmem(
     if (tuple(out.shape) != (B, HQ, D) or out.dtype != torch.bfloat16
             or out.device != q.device or not out.is_contiguous()):
         raise ValueError("direct_output requires contiguous BF16 [B, H_q, D]")
-    q_eff, out_eff = q, out
 
     # The caller may already have selected this exact plan to size its
     # reduction workspace. Standalone calls retain the original selector.
@@ -630,18 +628,18 @@ def run_paged_fp4_decode_qmul4_tmem(
         k_sf_mode=k_sf_mode, direct_output=direct_output,
         partial_o_dtype=_reduction_workspace_partial_o_dtype(reduction_workspace),
     ))
-    fused = _quantize_q_residue_cuda(q_eff, H)
+    fused = _quantize_q_residue_cuda(q, H)
     if fused is None:
         raise RuntimeError(
             "decode QK residue requires the nvfp4 MExt CUDA extension"
         )
     q_pack, q_sf = fused
     o_partial = l_partial = m_partial = None
-    if direct_output and reduction == "none":
+    if reduction == "none":
         # Empty/inactive rows skip the main kernel's output store. Preserve
         # the zero-row contract of the old padded torch.zeros allocation.
-        # Atomic already clears below; the separate reducer writes zero.
-        out_eff.zero_()
+        # Split reducers write zero for inactive rows.
+        out.zero_()
     if reduction == "kernel":
         if reduction_workspace is None:
             reduction_workspace = allocate_qmul4_reduction_workspace(
@@ -685,7 +683,7 @@ def run_paged_fp4_decode_qmul4_tmem(
         q_sf,
         pool.k_sf,
         v_sf_bthd,
-        out_eff.view(B, 1, HQ if direct_output else H * g_pad, D),
+        out.view(B, 1, HQ, D),
         None, None, None, o_partial, l_partial, m_partial, None,
         Float32(sm_scale),
         Float32(value_scale),
@@ -693,10 +691,6 @@ def run_paged_fp4_decode_qmul4_tmem(
         block_tables,
         False,
     )
-    if out_eff is not out:
-        out.view(B, H, g, D).copy_(
-            out_eff.view(B, H, g_pad, D)[:, :, :g, :]
-        )
     return out
 
 
@@ -880,8 +874,7 @@ def run_paged_fp4_decode_qmul4_tmem_nvfp4(
             )
 
     f = compile_decode_variant(spec)
-    q_eff = q
-    fused_q = _quantize_q_residue_cuda(q_eff, H)
+    fused_q = _quantize_q_residue_cuda(q, H)
     if fused_q is None:
         raise RuntimeError(
             "decode QK residue requires the nvfp4 MExt CUDA extension"
