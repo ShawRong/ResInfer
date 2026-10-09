@@ -36,15 +36,7 @@ def mxfp4_linear(
     if rows == 0:
         return torch.empty(output_shape, device=x.device, dtype=output_dtype)
     source = x.reshape(rows, x.shape[-1])
-    if mode == "selective":
-        activation, activation_scale = quantize_selective(
-            source, indices, masks, recipe=activation_recipe
-        )
-        output = gemm(
-            activation, weight, activation_scale, weight_scale,
-            out_dtype=output_dtype,
-        )
-    elif mode == "mext_r1":
+    if mode == "mext_r1":
         from quant.flashinfer_integration import mxfp4_fold_tuner as fold_tuner
 
         if activation_recipe != "ceil":
@@ -56,7 +48,12 @@ def mxfp4_linear(
             tuning_buckets=tuning_buckets,
         )
     else:
-        activation, activation_scale = quantize(source, recipe=activation_recipe)
+        if mode == "selective":
+            activation, activation_scale = quantize_selective(
+                source, indices, masks, recipe=activation_recipe
+            )
+        else:
+            activation, activation_scale = quantize(source, recipe=activation_recipe)
         output = gemm(
             activation, weight, activation_scale, weight_scale,
             out_dtype=output_dtype,

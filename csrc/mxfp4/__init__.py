@@ -1,6 +1,7 @@
 """SM100 dense MXFP4 quantization and GEMM kernels."""
 
-from .quantization import quantize, quantize_mext, swizzle_scales
+from ..scale_layout import swizzle_scales
+from .quantization import quantize, quantize_mext
 from .dense import gemm, fold_gemm
 from .selective import prepare_indices, quantize_selective
 

@@ -5,8 +5,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from ..scale_layout import swizzle_scales
-
 
 def _ceildiv(value, divisor):
     return (value + divisor - 1) // divisor
@@ -75,7 +73,7 @@ def quantize_mext(source, *, layout="128x4", recipe="ceil",
     off preserves the original launch. tail triggers after stores; early
     triggers at CTA entry. Consumers using PDL must wait before reading.
     """
-    _validate_2d(source, layout, recipe)
+    _check_recipe(recipe)
     from .residue_quant import quantize_residue
 
     return quantize_residue(source, layout=layout,
