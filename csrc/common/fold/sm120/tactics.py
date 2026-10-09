@@ -86,7 +86,7 @@ def run_fold_default(
     # are not on it", which was true on sm10x and FALSE here for two weeks --
     # this table is itself the product of an offline full-tile sweep, and on
     # sm120 it is a legitimate serving path (the fallback under the FlashInfer
-    # tuner in quant/.../sm120_fold_tuner.py, the whole path when that tuner
+    # tuner in quant/.../sm120_fold_candidates.py, the whole path when that tuner
     # is off). Announce once, as information, not as an alarm.
     if (not silence_default_notice()
             and not _TABLE_ANNOUNCED[0]):

@@ -37,7 +37,7 @@ def mxfp4_linear(
         return torch.empty(output_shape, device=x.device, dtype=output_dtype)
     source = x.reshape(rows, x.shape[-1])
     if mode == "mext_r1":
-        from quant.flashinfer_integration import mxfp4_fold_tuner as fold_tuner
+        from quant.flashinfer_integration import mxfp4_linear_adapter as fold_tuner
 
         if activation_recipe != "ceil":
             raise ValueError("MXFP4 uses native ceil quantization")

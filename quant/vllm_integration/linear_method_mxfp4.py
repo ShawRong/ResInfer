@@ -110,8 +110,8 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
         self.extended_dim = extended_dim
         runtime_mode = self.metadata.get("runtime_mode", "standard")
         if runtime_mode == "mext_r1":
-            from ..flashinfer_integration import mxfp4_fold_tuner
-            if mxfp4_fold_tuner.tuner_enabled():
+            from ..flashinfer_integration import mxfp4_linear_adapter
+            if mxfp4_linear_adapter.tuner_enabled():
                 from vllm.config import get_current_vllm_config
 
                 config = get_current_vllm_config()

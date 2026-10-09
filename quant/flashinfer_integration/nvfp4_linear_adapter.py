@@ -67,15 +67,15 @@ def _valid(inputs, policy, tuning):
     if route == "sm10x_fold":
         if not policy.sm10x_tuner:
             return []
-        from .sm10x_fold_tuner import valid_tactics
+        from .sm100_fold_candidates import valid_tactics
         return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, allow_uncompiled)
     if route == "sm120_fold":
         if not policy.sm120_tuner:
             return []
-        from .sm120_fold_tuner import valid_tactics
+        from .sm120_fold_candidates import valid_tactics
         return valid_tactics(_fold_inputs(inputs, policy), inputs[0].dtype, allow_uncompiled)
     if route == "ratio1_prefill" and policy.prefill == "auto":
-        from .ratio1_prefill_tuner import _kloop_valid_tactics
+        from .ratio1_prefill_candidates import _kloop_valid_tactics
         return _kloop_valid_tactics(_fold_inputs(inputs, policy), allow_uncompiled)
     return []
 
@@ -84,13 +84,13 @@ def _run(inputs, policy, tactic):
     route = _route(int(inputs[0].shape[0]), policy)
     args = _fold_inputs(inputs, policy)
     if route == "sm10x_fold":
-        from .sm10x_fold_tuner import _run_tactic
+        from .sm100_fold_candidates import _run_tactic
         return _run_tactic(args, tactic, inputs[0].dtype)
     if route == "sm120_fold":
-        from .sm120_fold_tuner import _run_fold_tile, FOLD_TILES
+        from .sm120_fold_candidates import _run_fold_tile, FOLD_TILES
         return _run_fold_tile(args, FOLD_TILES[tactic], inputs[0].dtype)
     if route == "ratio1_prefill":
-        from .ratio1_prefill_tuner import _run_kloop
+        from .ratio1_prefill_candidates import _run_kloop
         return _run_kloop(args, tactic)
     raise ValueError(f"tactic {tactic} is not valid for {route}")
 
@@ -105,8 +105,8 @@ def _fallback(inputs, policy):
 
 def _record(source):
     # Keep the source available to existing benchmark instrumentation.
-    from .sm10x_fold_tuner import _record_source as record_sm10x
-    from .sm120_fold_tuner import _record_source as record_sm120
+    from .sm100_fold_candidates import _record_source as record_sm10x
+    from .sm120_fold_candidates import _record_source as record_sm120
     record_sm10x(source)
     record_sm120(source)
 
@@ -124,9 +124,9 @@ def tuned_nvfp4_linear(inputs, policy):
                and (fold_tuner or (policy.ratio1 and policy.prefill == "auto")))
     if not enabled:
         return _fallback(inputs, policy)
-    from .sm10x_fold_tuner import candidates_hash
-    from .sm120_fold_tuner import fold_tiles_hash
-    from .ratio1_prefill_tuner import KLOOP_SM100_CFGS, KLOOP_TILES
+    from .sm100_fold_candidates import candidates_hash
+    from .sm120_fold_candidates import fold_tiles_hash
+    from .ratio1_prefill_candidates import KLOOP_SM100_CFGS, KLOOP_TILES
 
     cache_policy = policy._replace(candidates=(
         candidates_hash(), fold_tiles_hash(), KLOOP_SM100_CFGS, KLOOP_TILES))

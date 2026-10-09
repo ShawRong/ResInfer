@@ -292,9 +292,9 @@ def _worker(args: argparse.Namespace) -> int:
     from .mext_trtllm_adapter import prepare_weight as prepare_trtllm_weight
     from .mext_trtllm_adapter import require_dense_ops
     resolved = json.loads(args.resolved.read_text())
-    mxfp4_fold_tuner = None
+    mxfp4_linear_adapter = None
     if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
-        from quant.flashinfer_integration import mxfp4_fold_tuner
+        from quant.flashinfer_integration import mxfp4_linear_adapter
     trtllm_fp4_utils = (require_dense_ops()
                        if "trtllm_nvfp4_fp8_w4a8" in resolved["arms"] else None)
 
@@ -304,14 +304,14 @@ def _worker(args: argparse.Namespace) -> int:
     from benchmarks.bench_residue_nvfp4 import (assert_gpu_exclusive,
                                                  physical_index, provenance)
     from quant.vllm_integration import residue_linear_op  # noqa: F401
-    from quant.flashinfer_integration import sm10x_fold_tuner
+    from quant.flashinfer_integration import sm100_fold_candidates
 
     if torch.cuda.get_device_capability(0) != (10, 0):
         raise RuntimeError("paper suite requires SM100 (B200/Blackwell)")
     for key, value in resolved["required_env"].items():
         if os.environ.get(key) != value:
             raise RuntimeError(f"missing suite environment: {key}={value}")
-    if len({c[0] for c in sm10x_fold_tuner._candidates()}) != 3:
+    if len({c[0] for c in sm100_fold_candidates._candidates()}) != 3:
         raise RuntimeError("A4/A6 are not in the live FlashInfer candidate set")
     torch.manual_seed(20260921 + args.rep)
     device = torch.device("cuda:0")
@@ -323,9 +323,9 @@ def _worker(args: argparse.Namespace) -> int:
                  "pdl": os.environ["NVFP4_MEXT_R1_PDL"],
                  "fold_max_m": os.environ["RESIDUE_MEXT_FOLD_MAX_M"],
                  "fold_mext": os.environ["RESIDUE_FOLD_MEXT"],
-                 "candidate_hash": sm10x_fold_tuner.candidates_hash()})
+                 "candidate_hash": sm100_fold_candidates.candidates_hash()})
     if "resinfer_mxfp4_mext_r1_tuned" in resolved["arms"]:
-        prov["mxfp4_candidate_hash"] = mxfp4_fold_tuner.candidates_hash()
+        prov["mxfp4_candidate_hash"] = mxfp4_linear_adapter.candidates_hash()
         prov["mxfp4_fold_pdl_mode"] = "early"
     if trtllm_fp4_utils is not None:
         prov["trtllm_version"] = importlib.metadata.version("tensorrt-llm")
@@ -416,7 +416,7 @@ def _worker(args: argparse.Namespace) -> int:
                                            out_dtype=torch.bfloat16)
 
                 def res_mxfp4_mext_tuned(a, w, ws):
-                    return mxfp4_fold_tuner.tuned_mxfp4_fold(
+                    return mxfp4_linear_adapter.tuned_mxfp4_fold(
                         a, w, ws, pdl_mode="early",
                         out_dtype=torch.bfloat16)
 
@@ -484,14 +484,14 @@ def _worker(args: argparse.Namespace) -> int:
                             raise RuntimeError(f"BF16 sanity gate failed: relative max={rel:.4f}")
                         row["relmax_bf16"] = rel
                         if arm == "mext_r1":
-                            row["tactic_source"] = sm10x_fold_tuner.last_tactic_source()
-                            row["tactic"] = sm10x_fold_tuner.last_tactic_tile()
+                            row["tactic_source"] = sm100_fold_candidates.last_tactic_source()
+                            row["tactic"] = sm100_fold_candidates.last_tactic_tile()
                             if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
                                 or row["tactic"] is None):
                                 raise RuntimeError("MExt Fold did not serve a profiled tactic")
                         if arm == "resinfer_mxfp4_mext_r1_tuned":
-                            row["tactic_source"] = mxfp4_fold_tuner.last_tactic_source()
-                            row["tactic"] = mxfp4_fold_tuner.last_tactic_tile()
+                            row["tactic_source"] = mxfp4_linear_adapter.last_tactic_source()
+                            row["tactic"] = mxfp4_linear_adapter.last_tactic_tile()
                             if (row["tactic_source"] not in {"autotuned", "autotuned_fallback"}
                                 or row["tactic"] is None):
                                 raise RuntimeError("MXFP4 Fold did not serve a profiled tactic")

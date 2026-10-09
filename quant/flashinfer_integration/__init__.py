@@ -9,8 +9,8 @@ from importlib import import_module
 
 _ENTRIES = {
     "tuned_linear": "linear_tuner",
-    "tuned_nvfp4_linear": "nvfp4_linear_tuner",
-    "tuned_mxfp4_fold": "mxfp4_fold_tuner",
+    "tuned_nvfp4_linear": "nvfp4_linear_adapter",
+    "tuned_mxfp4_fold": "mxfp4_linear_adapter",
 }
 __all__ = list(_ENTRIES)
 

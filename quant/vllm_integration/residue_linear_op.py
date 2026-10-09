@@ -78,7 +78,7 @@ def _run_ratio1_prefill_two_gemm(
 
 def _linear_policy(k_base, num_salient, padding, output_size,
                    fold_eligible, use_swap, ratio1):
-    from ..flashinfer_integration.nvfp4_linear_tuner import NVFP4Policy
+    from ..flashinfer_integration.nvfp4_linear_adapter import NVFP4Policy
 
     cfg = settings()
     sm10x = _sm10x_fold_arch()
@@ -95,7 +95,7 @@ def _linear_policy(k_base, num_salient, padding, output_size,
 
 def _nvfp4_linear_impl(inputs, policy):
     """Execute the static implementation of the shared numerical route."""
-    from ..flashinfer_integration.nvfp4_linear_tuner import (
+    from ..flashinfer_integration.nvfp4_linear_adapter import (
         _fold_inputs, _route,
     )
 
@@ -110,7 +110,7 @@ def _nvfp4_linear_impl(inputs, policy):
         args = _fold_inputs(inputs, policy)
         if route == "ratio1_prefill":
             if policy.prefill == "k_loop":
-                from ..flashinfer_integration.ratio1_prefill_tuner import (
+                from ..flashinfer_integration.ratio1_prefill_candidates import (
                     _kloop_valid_tactics, _run_kloop, prepare_kloop,
                 )
                 ready = _kloop_valid_tactics(args, False)
@@ -121,9 +121,9 @@ def _nvfp4_linear_impl(inputs, policy):
                     return _run_kloop(args, ready[0])
             return _run_ratio1_prefill_two_gemm(*args, x.dtype)
         if route == "sm10x_fold":
-            from ..flashinfer_integration.sm10x_fold_tuner import _run_fallback
+            from ..flashinfer_integration.sm100_fold_candidates import _run_fallback
             return _run_fallback(args, x.dtype)[:m]
-        from ..flashinfer_integration.sm120_fold_tuner import run_fold_table
+        from ..flashinfer_integration.sm120_fold_candidates import run_fold_table
         return run_fold_table(args, x.dtype)[:m]
 
     if route == "plain":
@@ -164,7 +164,7 @@ def nvfp4_linear(
     """Dispatch all NVFP4 Linear sizes through one FlashInfer operation."""
     if x.shape[0] == 0:
         return x.new_empty((0, weight.shape[0]))
-    from ..flashinfer_integration.nvfp4_linear_tuner import tuned_nvfp4_linear
+    from ..flashinfer_integration.nvfp4_linear_adapter import tuned_nvfp4_linear
 
     with torch.cuda.device(x.device):
         policy = _linear_policy(k_base, num_salient, weights_padding_cols,
