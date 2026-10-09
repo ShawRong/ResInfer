@@ -32,7 +32,6 @@ from vllm.v1.attention.backends.flashinfer import (
 from nvfp4.cute_attn.kv_layout import NvFp4PagedKVPool
 
 from .decode import ResAttnDecodeMixin
-from .runtime import _load_decode_kernel, _validate_residue_geometry
 from .warmup import _register_decode_warmup
 
 
@@ -206,24 +205,13 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             )
             return output
         if md.num_decodes:
-            decode = _require_trtllm_decode(md)
+            _require_trtllm_decode(md)
             pool = self._pool_for(kv_cache, layer)
             if scales is not None:
                 output_scale, output_block_scale = scales
-                host = _load_decode_kernel()
-                if host is None:
-                    raise RuntimeError("ResAttn NVFP4 decode kernel unavailable")
-                _validate_residue_geometry(self.num_heads, self.num_kv_heads)
-                plan = host.plan_qmul4_decode_nvfp4(
-                    md.num_decode_tokens,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    decode.max_seq_len,
-                    query.device,
-                )
                 self._decode_forward_nvfp4(
                     query, pool, md, output,
-                    output_scale, output_block_scale, host, plan,
+                    output_scale, output_block_scale,
                 )
             else:
                 self._decode_forward(query, pool, md, output)

@@ -87,9 +87,3 @@ def log_registration_failure(reason, detail=None):
 def log_registration_success(class_path):
     _logger().info("ResAttn registered on CUSTOM (%s); select --attention-backend "
                    "CUSTOM --kv-cache-dtype nvfp4 --block-size 128", class_path)
-
-
-def log_decode_import_failure(exc):
-    _logger().error("ResAttn decode kernel nvfp4.cute_attn.host failed to import "
-                    "(%s: %s); backend will refuse the first decode forward",
-                    type(exc).__name__, exc)

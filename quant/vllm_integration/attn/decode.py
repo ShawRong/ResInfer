@@ -60,17 +60,18 @@ class ResAttnDecodeMixin:
         output: torch.Tensor,
         output_scale: torch.Tensor,
         output_block_scale: torch.Tensor,
-        host,
-        plan: tuple[int, str],
     ) -> None:
         """Decode directly into vLLM's packed activation buffers."""
         n = md.num_decode_tokens
         decode = md.decode
         q_dec = q_all if q_all.shape[0] == n else q_all[:n]
-        splits, reduction = plan
-        _validate_residue_geometry(
-            self.num_heads, self.num_kv_heads
+        host = _load_decode_kernel()
+        _validate_residue_geometry(self.num_heads, self.num_kv_heads)
+        plan = host.plan_qmul4_decode_nvfp4(
+            n, self.num_heads, self.num_kv_heads,
+            decode.max_seq_len, q_dec.device,
         )
+        splits, reduction = plan
         reduction_workspace = None
         if reduction in ("kernel", "gmem_fused"):
             reduction_workspace = self._get_decode_reduction_workspace(
@@ -112,14 +113,6 @@ class ResAttnDecodeMixin:
         q_dec = q_all if q_all.shape[0] == n else q_all[:n]
 
         host = _load_decode_kernel()
-        if host is None:
-            raise RuntimeError(
-                "[residue] ResAttn decode kernel not available: "
-                "`nvfp4.cute_attn.host` could not be imported. Check that "
-                "the kernel wheel from csrc is installed and nvidia-cutlass-dsl is "
-                "installed (Blackwell GPU required)."
-            )
-
         # The kernel is compiled with out_dtype=BFloat16; write straight into
         # the output slice when it already matches, else stage and cast.
         dec_out = out3[:n]

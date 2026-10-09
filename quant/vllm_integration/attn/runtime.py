@@ -3,10 +3,6 @@
 """Lazy kernel loading and the decode residue feature gate."""
 import os
 
-from .. import diagnostics
-
-_DECODE_KERNEL_HOST = None
-_DECODE_KERNEL_CHECKED = False
 _QK_RESIDUE = os.environ.get("RESIDUE_ATTN_DISABLE_QK_RESIDUE", "0") != "1"
 
 
@@ -20,16 +16,9 @@ def _validate_residue_geometry(num_qo_heads: int, num_kv_heads: int) -> None:
 
 
 def _load_decode_kernel():
-    """Return the promoted `nvfp4.cute_attn.host` module, or None (guarded)."""
-    global _DECODE_KERNEL_HOST, _DECODE_KERNEL_CHECKED
-    if _DECODE_KERNEL_CHECKED:
-        return _DECODE_KERNEL_HOST
-    _DECODE_KERNEL_CHECKED = True
+    """Import on first use; Python caches successful imports, failures propagate."""
     try:
-        from nvfp4.cute_attn import host  # type: ignore[attr-defined]
-
-        _DECODE_KERNEL_HOST = host
+        from nvfp4.cute_attn import host
     except Exception as exc:
-        _DECODE_KERNEL_HOST = None
-        diagnostics.log_decode_import_failure(exc)
-    return _DECODE_KERNEL_HOST
+        raise RuntimeError("Failed to load ResAttn kernel host nvfp4.cute_attn.host") from exc
+    return host

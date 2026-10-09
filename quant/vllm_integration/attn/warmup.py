@@ -22,9 +22,9 @@ class _DecodeWarmupProvider:
     def get_cutedsl_warmup_compile_units(self):
         from vllm.model_executor.warmup.cutedsl_warmup import CuTeDSLCompileUnit
 
-        host = _load_decode_kernel()
-        if host is None or not torch.cuda.is_available():
+        if not torch.cuda.is_available():
             return []
+        host = _load_decode_kernel()
         units, seen = [], set()
         for hq, hkv, dim, packed in sorted(self._geometries):
             _validate_residue_geometry(hq, hkv)
