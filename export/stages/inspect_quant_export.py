@@ -9,15 +9,15 @@ from typing import Any, Dict
 
 import torch
 
-
-
-
-
-
-
-
-
-
+# ModelOpt is imported LAZILY, and that is load-bearing rather than tidy.
+# This module is what a pod-side task probes to answer "does this checkout
+# carry the tensor-opening export guard?" -- and it probes from the RUNTIME
+# venv, which deliberately has no ModelOpt (that lives in environments/export). With a
+# module-level import the probe died on ModuleNotFoundError and the task
+# reported "stale export guard, sync the pod", so a dependency problem read as
+# a version problem and no amount of syncing could fix it. The width check
+# itself needs only json + safetensors; only _collect_quantized_linears needs
+# ModelOpt, and it asks for it when it runs.
 
 
 def print_rank_0(*args, **kwargs):

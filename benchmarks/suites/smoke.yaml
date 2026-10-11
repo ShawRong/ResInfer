@@ -1,6 +1,6 @@
 # Acceptance smoke for the kit itself, not for any model.
 #
-#   python -m benchmarks.evalkit suite \
+#   python -m benchmarks.quality.evalkit suite \
 #       --manifest benchmarks/suites/smoke.yaml \
 #       --models-root <exports> --data-dir data --out smoke_out
 #

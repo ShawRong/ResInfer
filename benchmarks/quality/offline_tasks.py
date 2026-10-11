@@ -12,7 +12,7 @@ from lighteval.tasks.requests import Doc
 from lighteval.tasks.tasks.aime import aime24_avg, aime25_avg
 from lighteval.tasks.tasks.gpqa import gpqa_diamond_instruct
 
-from benchmarks.gpqa_deterministic import ordered_answers
+from benchmarks.quality.gpqa_deterministic import ordered_answers
 
 
 def _data_root() -> Path:

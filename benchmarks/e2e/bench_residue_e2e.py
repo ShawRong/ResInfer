@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """End-to-end serving sweep across a residue budget ladder.
 
-    python benchmarks/bench_residue_e2e.py --gpu 0 \
+    python benchmarks/e2e/bench_residue_e2e.py --gpu 0 \
         --manifest benchmarks/suites/speed_dense.yaml \
         --models-root <dir holding the exports> --outdir results_speed
 
@@ -48,14 +48,8 @@ SERVER HYGIENE
     NVFP4 with a residue label; refuse the arm instead of measuring it.
 
 AUTOTUNE
-  RESIDUE_SHARE_AUTOTUNE_CACHE=1 for residue arms + an offline prewarm
-  beforehand (benchmarks/prewarm_autotune_cache.py) means arms start warm; the
-  per-arm ready_s in the summary is the live measurement of that machinery.
-  The plain arm cannot share (no residue plugin -> no patch) and tunes its
-  own 4 shapes once.
-
-  NOT an eval. mnbt stays at vLLM's default per eval-determinism.md's scope
-  note: benchmarks run each arm at its own best, only evals pin the knob.
+  vLLM owns FlashInfer tuning and cache persistence. Startup time is recorded
+  separately from request timing.
 
 ARMS
 Named by the manifest, located by `--models-root`: each arm's `path` is
@@ -74,13 +68,13 @@ bytes by (1+r), and on a fixed GPU that comes out of the KV cache. Every arm
 records `weights_gib`, `kv_cache_gib` and `kv_cache_tokens`, all read off
 vLLM's own startup log.
 
-Resumable: an (arm, concurrency) whose result JSON already parses is skipped,
-so a crashed sweep continues where it stopped.
+Each sweep requires a new output directory; failed runs are never reused.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import re
@@ -91,18 +85,12 @@ import shutil
 import sys
 import urllib.request
 
-try:                          # `python -m benchmarks.bench_residue_e2e`
-    from benchmarks import manifest as spec_mod
-except ImportError:           # `python benchmarks/bench_residue_e2e.py`
-    # Both invocations must work. Under `-m` the package parent is on
-    # sys.path, so a bare `import manifest` is not found; run as a plain file
-    # the script's own directory is sys.path[0], so the package name is not
-    # found. Neither form can be dropped: the README advertises the module
-    # form and the suites are driven as files.
-    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-    import manifest as spec_mod
+if __package__ in (None, ""):
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
-REPO = pathlib.Path(__file__).resolve().parents[1]
+from benchmarks import manifest as spec_mod
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
 
 
 def _vllm_cli() -> str:
@@ -270,14 +258,14 @@ def assert_gpu_free(gpu: int, need_gib: float = 20.0,
         if pid_s.isdigit() and int(pid_s) not in mine:
             others.append((int(pid_s), mem_s))
     if others and exclusive:
-        # Name the neighbour while it still exists (see _common.pid_identity):
+        # Name the neighbour while it still exists (see _runtime.pid_identity):
         # a refusal that says only "pid 12345" cannot answer "whose job?"
         # ten seconds later.
         def _ident(q):
             try:
-                from benchmarks._common import pid_identity
+                from benchmarks._runtime import pid_identity
             except ImportError:
-                from _common import pid_identity
+                from _runtime import pid_identity
             d = pid_identity(q)
             extra = ""
             if d.get("cmdline"):
@@ -481,6 +469,8 @@ def _shutdown(proc: subprocess.Popen, gpu: int, settle_s: int = 90) -> None:
 
 
 def _bench(model: str, port: int, conc: int, out_json: str, env: dict) -> dict:
+    if pathlib.Path(out_json).exists():
+        raise FileExistsError(f"Refusing to reuse benchmark result: {out_json}")
     cmd = [
         _vllm_cli(), "bench", "serve",
         "--backend", "vllm", "--model", model,
@@ -497,13 +487,26 @@ def _bench(model: str, port: int, conc: int, out_json: str, env: dict) -> dict:
     try:
         p = subprocess.run(cmd, env=env, capture_output=True, text=True,
                            timeout=1800)
-        tail = (p.stdout or "")[-500:]
+        tail = ((p.stdout or "") + (p.stderr or ""))[-2000:]
+        if p.returncode:
+            return {"error": f"bench exited {p.returncode}", "tail": tail}
     except subprocess.TimeoutExpired:
         return {"error": "bench timed out"}
     try:
-        return json.load(open(out_json))
-    except Exception:
-        return {"error": "no result json", "tail": tail}
+        with open(out_json) as f:
+            result = json.load(f)
+        if result.get("completed") != _num_prompts(conc) or result.get("failed", 0):
+            raise ValueError("not all requests completed")
+        for key in _KEEP:
+            value = result[key]
+            if (isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                raise ValueError(f"invalid metric: {key}")
+        if result["output_throughput"] <= 0:
+            raise ValueError("no output throughput")
+        return result
+    except (OSError, ValueError, KeyError, AttributeError, TypeError) as exc:
+        return {"error": f"invalid result: {exc}", "tail": tail}
 
 
 _KEEP = ("mean_ttft_ms", "median_ttft_ms", "p99_ttft_ms",
@@ -537,26 +540,9 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
     if quant == "residue_nvfp4":
         env["RESIDUE_NVFP4"] = "1"
         env["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
-        env["RESIDUE_SHARE_AUTOTUNE_CACHE"] = "1"
-        # RESIDUE_PATCH_MODE is left unset, and this changes NOTHING about
-        # what runs -- it is worth saying so, because the variable's name
-        # suggests otherwise and at least one comment elsewhere in the tree
-        # still describes its pre-merge behaviour.
-        #
-        # V2 and MExtR1 are one class now (`_choose_linear_method_cls`: "the
-        # class returned is always V2"), so the variable resolves to a log
-        # label and selects no code path. What actually decides is per LAYER:
-        # `runtime_mode` in residue_kernel_metadata.json, defaulting to
-        # extended_k where a layer has no entry. Decode takes the fold because
-        # a mext_r1 layer enables it unconditionally and everything else
-        # enables it under RESIDUE_ENABLE_DECODE_MEXT=1, which is set above.
+        env.pop("RESIDUE_SHARE_AUTOTUNE_CACHE", None)
         env.pop("RESIDUE_PATCH_MODE", None)
-        
-        
-        
-        
-        
-        
+        # Read checkpoint metadata before vLLM allocates merged weights.
         env["RESIDUE_VLLM_MODEL_DIR"] = model
     else:
         for k in ("RESIDUE_NVFP4", "RESIDUE_PATCH_MODE",
@@ -568,26 +554,13 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
     rec = {"tag": tag, "ratio": ratio, "quant": quant, "gpu": gpu,
            "model": model, "runs": {}}
 
-    # Resume: if every concurrency already has a parsed result, skip the arm
-    # without starting a server.
-    pending = []
-    for conc in CONCURRENCIES:
-        rj = outdir / f"{tag}_c{conc}.json"
-        try:
-            rec["runs"][str(conc)] = {
-                k: json.load(open(rj)).get(k) for k in _KEEP}
-        except Exception:
-            pending.append(conc)
-    if not pending:
-        rec["resumed"] = True
-        return rec
-
     log_path = outdir / f"serve_{tag}.log"
     cmd = [
         _vllm_cli(), "serve", model,
         # Omitted entirely for an unquantised reference arm -- vLLM then reads
         # the checkpoint's own config, which is what a bf16 ceiling needs.
-        *(["--quantization", quant] if quant else []),
+        *(["--quantization", "modelopt_fp4" if quant == "residue_nvfp4" else quant]
+          if quant else []),
         "--dtype", "bfloat16",
         "--max-model-len", "4096",
         "--gpu-memory-utilization", "0.85",
@@ -595,7 +568,7 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
         "--trust-remote-code",
     ]
     print(f"[{tag}] gpu{gpu} port{port} launching ({quant}, budget={ratio}), "
-          f"pending conc={pending}", flush=True)
+          f"conc={CONCURRENCIES}", flush=True)
     with open(log_path, "wb") as logf:
         
         
@@ -620,11 +593,14 @@ def run_arm(tag: str, ratio: float, quant: str, model: str, gpu: int,
                 rec["error"] = eng["engagement_error"]
                 return rec
             print(f"[{tag}] ready in {ready_s:.0f}s", flush=True)
-            for conc in pending:
+            for conc in CONCURRENCIES:
                 rj = outdir / f"{tag}_c{conc}.json"
                 r = _bench(model, port, conc, str(rj), env)
                 rec["runs"][str(conc)] = (
                     {k: r.get(k) for k in _KEEP} if "error" not in r else r)
+                if "error" in r:
+                    rec["error"] = f"c={conc}: {r['error']}"
+                    return rec
                 got = rec["runs"][str(conc)]
                 print(f"[{tag}] c={conc:<3} "
                       f"ttft={got.get('mean_ttft_ms')} "
@@ -691,7 +667,7 @@ def main() -> None:
     outdir = pathlib.Path(a.outdir or
                           f"runs/residue_e2e_"
                           f"{time.strftime('%Y%m%d_%H%M%S')}")
-    outdir.mkdir(parents=True, exist_ok=True)
+    outdir.mkdir(parents=True, exist_ok=False)
     neighbors = assert_gpu_free(a.gpu, exclusive=not a.allow_shared_gpu)
 
     rounds = int(e.get("rounds", 1) or 1)
@@ -730,7 +706,7 @@ def main() -> None:
             with open(summary, "a") as f:
                 f.write(json.dumps(rec) + "\n")
             if "error" in rec:
-                print(f"[{tag}] ERROR: {rec['error']}", flush=True)
+                raise RuntimeError(f"[{tag}] {rec['error']}")
 
     print(f"\ndone -> {summary}  ({rounds} round(s))", flush=True)
 

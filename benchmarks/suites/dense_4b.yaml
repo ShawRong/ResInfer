@@ -1,6 +1,6 @@
 # The official dense-4B table. One command:
 #
-#   python -m benchmarks.evalkit suite \
+#   python -m benchmarks.quality.evalkit suite \
 #       --manifest benchmarks/suites/dense_4b.yaml \
 #       --models-root <dir holding the exports> \
 #       --data-dir data --out results_dense_4b

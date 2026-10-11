@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """One-command, five-process SM100 MExt paper kernel sweep.
 
-Run ``python -m benchmarks.mext_paper_sweep --outdir RUN --gpu 3
+Run ``python -m benchmarks.kernel.mext_paper_sweep --outdir RUN --gpu 3
 --model-config custom_model=/path/to/config.json``.  ``--dry-run`` resolves and
 prints the physical shapes without importing CUDA packages or writing files.
 """
@@ -13,16 +13,19 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import pathlib
 import subprocess
 import sys
 import uuid
 
+from .timing import TIMING_METHOD
 from .mext_paper_aggregate import aggregate, write_outputs
-from .mext_paper_shapes import load_suite, parse_config_overrides, parse_tp_overrides, resolve
+from .json_config import load_suite, parse_config_overrides, parse_tp_overrides
+from .mext_paper_shapes import resolve
 
-SUITE = pathlib.Path(__file__).with_name("suites") / "mext_paper_sm100.json"
+SUITE = pathlib.Path(__file__).resolve().parents[1] / "suites" / "mext_paper_sm100.json"
 REQUIRED_ENV = {
     "RESIDUE_FOLD_MEXT": "1",
     "RESIDUE_SM10X_FOLD_TUNER": "1",
@@ -92,7 +95,7 @@ def _prepare(args: argparse.Namespace) -> dict:
     canonical = not (args.models or args.shape_id or args.m_values or args.arms
                      or args.reps is not None)
     source_commit = args.source_commit
-    source_root = pathlib.Path(__file__).resolve().parents[1]
+    source_root = pathlib.Path(__file__).resolve().parents[2]
     git = subprocess.run(["git", "rev-parse", "HEAD"], cwd=source_root,
                          capture_output=True, text=True, check=False)
     if git.returncode == 0:
@@ -106,7 +109,7 @@ def _prepare(args: argparse.Namespace) -> dict:
                      if arm in arms]
     if len(set(required_arms)) != len(required_arms) or set(required_arms) - set(suite["arms"]):
         raise ValueError("required_arms must be a unique subset of suite arms")
-    return {"schema": 1, "run_id": uuid.uuid4().hex, "suite": suite["name"],
+    return {"schema": 1, "timing_method": TIMING_METHOD, "run_id": uuid.uuid4().hex, "suite": suite["name"],
             "suite_path": str(args.suite.resolve()),
             "suite_sha256": hashlib.sha256(args.suite.read_bytes()).hexdigest(),
             "source_commit": source_commit, "canonical_matrix": canonical,
@@ -174,14 +177,14 @@ def _driver(args: argparse.Namespace) -> int:
                 break
             if selected is None:
                 stem = shape_dir / f"attempt{max(attempts, default=-1) + 1}"
-                command = [sys.executable, "-m", "benchmarks.mext_paper_sweep",
+                command = [sys.executable, "-m", "benchmarks.kernel.mext_paper_sweep",
                            "--worker", "--resolved", str(frozen), "--outdir", str(output),
                            "--rep", str(rep), "--shape-id", shape["shape_id"],
                            "--shard-stem", str(stem)]
                 with pathlib.Path(f"{stem}.log").open("x") as log:
                     result = subprocess.run(
                         command, env=env, stdout=log, stderr=subprocess.STDOUT,
-                        cwd=pathlib.Path(__file__).resolve().parents[1], check=False)
+                        cwd=pathlib.Path(__file__).resolve().parents[2], check=False)
                 if result.returncode:
                     (output / "status.json").write_text(json.dumps(
                         {"status": "incomplete", "failed_rep": rep,
@@ -248,7 +251,9 @@ def _validate_shard(stem: pathlib.Path, resolved: dict, rep: int,
     if (prov.get("run_id") != resolved["run_id"] or prov.get("rep") != rep or
         prov.get("source_commit") != resolved["source_commit"] or
         prov.get("suite_sha256") != resolved["suite_sha256"] or
-        not prov.get("loaded_nvfp4_so_sha256")):
+        not prov.get("loaded_nvfp4_so_sha256") or
+        ("resinfer_mxfp4_mext_r1_tuned" in resolved["arms"] and
+         not prov.get("mxfp4_candidate_hash"))):
         raise ValueError(f"shard provenance mismatch: {stem}")
     expected = {(m, arm) for m in resolved["m_values"] for arm in resolved["arms"]}
     try:
@@ -263,9 +268,10 @@ def _validate_shard(stem: pathlib.Path, resolved: dict, rep: int,
             row.get("shape_id") != shape["shape_id"] or
             row.get("n") != shape["n"] or row.get("k") != shape["k"] or
             row.get("aliases") != shape["aliases"] or
-            row.get("cold_l2_effective") is not True or
+            row.get("rotation_covered") is not True or
             row.get("status") != "passed" or
-            not isinstance(row.get("us"), (int, float)) or row["us"] <= 0):
+            type(row.get("us")) not in (int, float) or
+            not math.isfinite(row["us"]) or row["us"] <= 0):
             raise ValueError(f"invalid shard cell: {stem}")
 
 
@@ -280,9 +286,6 @@ def _worker(args: argparse.Namespace) -> int:
                             nvfp4_quantize)
     from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
 
-    # The legacy provenance module prepends its own source-tree csrc to
-    # sys.path. Load the explicitly selected nvfp4 build first, so that
-    # bookkeeping cannot shadow the compiled extension used for measurement.
     import nvfp4
     nvfp4.ensure_loaded()
     from nvfp4.mxfp4 import fold_gemm as mxfp4_fold_gemm
@@ -298,10 +301,10 @@ def _worker(args: argparse.Namespace) -> int:
     trtllm_fp4_utils = (require_dense_ops()
                        if "trtllm_nvfp4_fp8_w4a8" in resolved["arms"] else None)
 
-    from benchmarks._common import (assert_args_consumed, fi_autotuned,
+    from benchmarks.kernel.timing import (check_output, fi_autotuned,
                                     iters_for_cold_l2, l2_accounting,
                                     timed_detail, warm_equally)
-    from benchmarks.bench_residue_nvfp4 import (assert_gpu_exclusive,
+    from benchmarks._runtime import (assert_gpu_exclusive,
                                                  physical_index, provenance)
     from quant.vllm_integration import residue_linear_op  # noqa: F401
     from quant.flashinfer_integration import sm100_fold_candidates
@@ -452,37 +455,27 @@ def _worker(args: argparse.Namespace) -> int:
                 if trtllm_fp4_utils is not None:
                     runners["trtllm_nvfp4_fp8_w4a8"] = (
                         trtllm_w4a8, (x, w_trt, ws_trt, x_scale_trt, alpha_trt))
-                niw = iters_for_cold_l2(runners["fi_nvfp4_cutlass"][1], device)
-                l2 = l2_accounting(runners["fi_nvfp4_cutlass"][1], device, niw)
-                if l2.get("cold_l2_effective") is not True:
-                    raise RuntimeError(f"cold-L2 ineffective for {shape['shape_id']} M={m}: {l2}")
+                active = [a for a in resolved["arms"] if a in runners]
+                niw = max(iters_for_cold_l2(runners[a][1], device) for a in active)
                 base = {"schema": 1, "kind": "measure", "run_id": resolved["run_id"],
                         "rep": args.rep, "shape_id": shape["shape_id"],
                         "n": n, "k": k, "m": m, "aliases": shape["aliases"],
-                        "niw": niw, **l2}
+                        "niw": niw}
                 # Interleave arm order between M points and process reps.
-                active = [a for a in resolved["arms"] if a in runners]
                 shift = (args.rep + resolved["m_values"].index(m)) % len(active)
                 active = active[shift:] + active[:shift]
                 for arm in active:
                     fn, fn_args = runners[arm]
                     fmt_w, fmt_a, provider = ARM_FORMAT[arm]
-                    row = dict(base, arm=arm, weight_format=fmt_w,
+                    row = dict(base, **l2_accounting(fn_args, device, niw), arm=arm, weight_format=fmt_w,
                                activation_format=fmt_a, provider=provider,
                                physical_m=padded_m if arm == "fi_mxfp4_mxfp8_w4a8" else m)
                     try:
-                        assert_args_consumed(fn, fn_args, label=arm)
                         fi_autotuned(fn, fn_args, m_bucket=m)
                         warm_equally(fn, fn_args, calls=20)
                         actual = fn(*fn_args)
                         torch.cuda.synchronize()
-                        if actual.shape != reference.shape or not bool(torch.isfinite(actual).all()):
-                            raise RuntimeError("wrong output shape or non-finite values")
-                        rel = float((actual.float() - reference.float()).abs().max()) / (
-                            float(reference.float().abs().max()) + 1e-9)
-                        if rel > 0.25:
-                            raise RuntimeError(f"BF16 sanity gate failed: relative max={rel:.4f}")
-                        row["relmax_bf16"] = rel
+                        row["relmax_bf16"] = check_output(actual, reference)
                         if arm == "mext_r1":
                             row["tactic_source"] = sm100_fold_candidates.last_tactic_source()
                             row["tactic"] = sm100_fold_candidates.last_tactic_tile()
