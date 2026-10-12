@@ -51,38 +51,25 @@ class MaterializeRequest:
     mode: str = "tokens"             # "jsonl" or "tokens"
 
 
-# 全局缓存
-_DATASET_REGISTRY: Optional[Dict[str, Any]] = None
-
-
 def load_dataset_registry(registry_path: Optional[Path] = None) -> Dict[str, Any]:
     """
     加载数据集注册表。
 
     Args:
-        registry_path: 注册表路径，默认 configs/datasets.yaml
+        registry_path: 注册表路径，默认包内 datasets.yaml；默认本地覆盖为当前目录 configs/datasets.local.yaml
 
     Returns:
         注册表字典
     """
-    global _DATASET_REGISTRY
-
-    if _DATASET_REGISTRY is not None:
-        return _DATASET_REGISTRY
-
     if registry_path is None:
-        # __file__ is export/core/dataset_manager.py.
-        project_root = Path(__file__).parent.parent.parent
-        registry_path = project_root / "configs" / "datasets.yaml"
-
-    if not registry_path.exists():
-        print(f"Warning: Dataset registry not found at {registry_path}")
-        return {"datasets": {}, "cache": {"root": "/tmp/hf_cache"}}
-
-    with open(registry_path) as f:
+        registry_path = Path(__file__).with_name("datasets.yaml")
+        local_path = Path("configs/datasets.local.yaml")
+    else:
+        registry_path = Path(registry_path)
+        local_path = registry_path.with_name("datasets.local.yaml")
+    with registry_path.open() as f:
         registry = yaml.safe_load(f) or {}
 
-    local_path = registry_path.with_name("datasets.local.yaml")
     if local_path.exists():
         with open(local_path) as f:
             local_registry = yaml.safe_load(f) or {}
@@ -99,9 +86,7 @@ def load_dataset_registry(registry_path: Optional[Path] = None) -> Dict[str, Any
             },
         }
 
-    _DATASET_REGISTRY = registry
-
-    return _DATASET_REGISTRY
+    return registry
 
 
 class DatasetManager:

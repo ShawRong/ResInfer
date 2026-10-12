@@ -1449,8 +1449,8 @@ def _argv_external(name):
         raise NotImplementedError(
             f"venue '{name}' is not scored by this kit -- it needs lighteval, "
             f"which cannot co-install with vLLM and lives in "
-            f".dev/envs/lighteval/. USE THE DRIVER THAT DOES:\n"
-            f"    python -m benchmarks.lcb_driver --manifest <this manifest> "
+            f"an external lighteval environment. USE THE DRIVER THAT DOES:\n"
+            f"    python -m benchmarks.quality.lcb_driver --manifest <this manifest> "
             f"--models-root <dir> --arms <a,b> --out <dir>\n"
             f"It launches one server per arm through the production "
             f"attachment chain and refuses to score a cache replay. See the "
@@ -1491,8 +1491,11 @@ def cmd_suite(a) -> int:
     """
     import subprocess
     import time
-    man = json.loads(pathlib.Path(a.manifest).read_text()) \
-        if a.manifest.endswith(".json") else _load_yamlish(a.manifest)
+    if a.manifest.endswith(".json"):
+        man = json.loads(pathlib.Path(a.manifest).read_text())
+    else:
+        import yaml
+        man = yaml.safe_load(pathlib.Path(a.manifest).read_text())
     root = pathlib.Path(a.models_root).resolve()
     out = pathlib.Path(a.out); out.mkdir(parents=True, exist_ok=True)
     arms = man["arms"]
@@ -1626,77 +1629,6 @@ def cmd_suite(a) -> int:
     print("[kit] SUITE COMPLETE -- gate passed, every arm ran, one code "
           "version, one environment.")
     return 0
-
-
-def _load_yamlish(path):
-    """Manifest loader with no PyYAML dependency.
-
-    The kit's whole point is that it installs nowhere and imports nothing of
-    ours; taking a yaml dependency for a forty-line manifest would undo that
-    on the one machine (the pod) that cannot pip install. Supports exactly the
-    subset the shipped manifests use.
-    """
-    try:
-        import yaml
-        return yaml.safe_load(pathlib.Path(path).read_text())
-    except ImportError:
-        pass
-    doc, cur = {}, None
-    for raw in pathlib.Path(path).read_text().splitlines():
-        line = raw.split(" #")[0].rstrip()
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        ind = len(line) - len(line.lstrip())
-        s = line.strip()
-        if s.startswith("- "):                       # list item -> dict entry
-            item, s = {}, s[2:]
-            doc.setdefault(cur, []).append(item)
-            for part in _split_inline(s):
-                k, v = part.split(":", 1)
-                item[k.strip()] = _scalar(v.strip())
-        elif ind == 0 and s.endswith(":"):
-            cur = s[:-1]
-            doc.setdefault(cur, {} if cur != "arms" else [])
-        elif ind == 0:
-            k, v = s.split(":", 1)
-            doc[k.strip()] = _scalar(v.strip())
-        else:
-            k, v = s.split(":", 1)
-            if isinstance(doc.get(cur), dict):
-                doc[cur][k.strip()] = _scalar(v.strip())
-            elif isinstance(doc.get(cur), list) and doc[cur]:
-                doc[cur][-1][k.strip()] = _scalar(v.strip())
-    return doc
-
-
-def _split_inline(s):
-    """Split `a: 1, b: [x, y]` on commas that are not inside brackets."""
-    out, depth, buf = [], 0, ""
-    for ch in s:
-        if ch in "[{":
-            depth += 1
-        elif ch in "]}":
-            depth -= 1
-        if ch == "," and depth == 0:
-            out.append(buf); buf = ""
-        else:
-            buf += ch
-    if buf.strip():
-        out.append(buf)
-    return out
-
-
-def _scalar(v):
-    if v.startswith("[") and v.endswith("]"):
-        return [x.strip().strip("'\"") for x in v[1:-1].split(",") if x.strip()]
-    if v.lower() in ("true", "false"):
-        return v.lower() == "true"
-    for cast in (int, float):
-        try:
-            return cast(v)
-        except ValueError:
-            pass
-    return v.strip("'\"")
 
 
 def main() -> int:

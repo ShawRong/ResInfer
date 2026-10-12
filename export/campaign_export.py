@@ -443,7 +443,7 @@ def build_arm(spec: dict, out_root: Path, gpu: str | None) -> dict:
         # branch hands the value to ModelOpt's own dataloader, and a path
         # is what worked before the recipe split identity from location.
         # The id would be a behaviour change with a silent failure mode --
-        # DatasetManager.get_spec() looks refs up in configs/datasets.yaml,
+        # DatasetManager.get_spec() looks refs up in export/core/datasets.yaml,
         # so an unregistered id resolves to something else or raises, and
         # "calibrated on the wrong data" does not announce itself.
         "dataset_ref": DATASET_PATH,

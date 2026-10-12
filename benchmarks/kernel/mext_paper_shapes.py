@@ -8,59 +8,9 @@ model/projection/TP aliases; time it once, then retain every alias for analysis.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from pathlib import Path
 
-
-def canonical_json(value: object) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-
-
-def load_suite(path: str | Path) -> dict:
-    suite = json.loads(Path(path).read_text())
-    if not suite.get("name") or not suite.get("models"):
-        raise ValueError("suite needs name and models")
-    for model, spec in suite["models"].items():
-        tp_values = spec.get("tp_values")
-        if tp_values is None:
-            if not spec.get("tp_required"):
-                raise ValueError(f"{model} needs tp_values or tp_required")
-        elif (not tp_values or any(type(tp) is not int or tp < 1 for tp in tp_values)
-              or len(set(tp_values)) != len(tp_values)):
-            raise ValueError(f"{model} tp_values must be positive and unique")
-    if sorted(set(suite["m_values"])) != sorted(suite["m_values"]):
-        raise ValueError("m_values must be unique")
-    return suite
-
-
-def parse_config_overrides(values: list[str]) -> dict[str, Path]:
-    out: dict[str, Path] = {}
-    for value in values:
-        if "=" not in value:
-            raise ValueError(f"--model-config expects MODEL=PATH: {value}")
-        model, raw_path = value.split("=", 1)
-        if not model or not raw_path or model in out:
-            raise ValueError(f"bad or duplicate --model-config: {value}")
-        out[model] = Path(raw_path).expanduser().resolve()
-    return out
-
-
-def parse_tp_overrides(values: list[str]) -> dict[str, list[int]]:
-    out: dict[str, list[int]] = {}
-    for value in values:
-        if "=" not in value:
-            raise ValueError(f"--model-tp expects MODEL=TP[,TP]: {value}")
-        model, raw = value.split("=", 1)
-        try:
-            tps = [int(tp) for tp in raw.split(",")]
-        except ValueError as exc:
-            raise ValueError(f"bad --model-tp: {value}") from exc
-        if (not model or model in out or not tps or
-            any(tp < 1 for tp in tps) or len(set(tps)) != len(tps)):
-            raise ValueError(f"bad or duplicate --model-tp: {value}")
-        out[model] = tps
-    return out
+from .json_config import load_model_config
 
 
 def _text_config(config: dict) -> dict:
@@ -113,22 +63,10 @@ def resolve(suite: dict, overrides: dict[str, Path],
             raise ValueError(f"{model} needs --model-tp {model}=<deployment TP>")
         if any(type(tp) is not int or tp < 1 for tp in tp_values) or len(set(tp_values)) != len(tp_values):
             raise ValueError(f"{model} TP values must be positive and unique")
-        if model in overrides:
-            path = overrides[model]
-            raw = path.read_bytes()
-            config = json.loads(raw)
-            origin = str(path)
-            source_hash = hashlib.sha256(raw).hexdigest()
-        elif "config" in model_spec:
-            config = model_spec["config"]
-            origin = "suite:inline"
-            source_hash = hashlib.sha256(canonical_json(config)).hexdigest()
-        else:
-            raise ValueError(
-                f"{model} needs --model-config {model}=<checkpoint/config.json>; "
-                "formal results must not guess dimensions")
+        config, source = load_model_config(model, model_spec, overrides.get(model))
+        source_hash = source["sha256"]
         text = _text_config(config)
-        sources[model] = {"source": origin, "sha256": source_hash,
+        sources[model] = {**source,
                           "model_type": text.get("model_type", config.get("model_type")),
                           "tp_values": tp_values}
         for projection, (n_full, k_full) in projection_shapes(
