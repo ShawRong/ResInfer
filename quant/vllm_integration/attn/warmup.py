@@ -52,7 +52,7 @@ def _register_decode_warmup(num_qo_heads, num_kv_heads, head_dim) -> None:
     from vllm.model_executor.warmup.cutedsl_warmup import register_cutedsl_warmup_provider
 
     cfg = get_current_vllm_config_or_none()
-    packed = bool(cfg is not None and cfg.compilation_config is not None
+    packed = bool(head_dim == 128 and cfg is not None and cfg.compilation_config is not None
                   and cfg.compilation_config.pass_config.fuse_attn_quant)
     if _DECODE_WARMUP_PROVIDER is None:
         _DECODE_WARMUP_PROVIDER = _DecodeWarmupProvider()

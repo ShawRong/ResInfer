@@ -122,11 +122,11 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         )
         if (
             not self.is_kvcache_nvfp4
-            or self.head_size != 128
+            or self.head_size not in (128, 256)
             or gqa not in (4, 6, 8)
         ):
             raise NotImplementedError(
-                "ResAttn candidate requires NVFP4, D128, and GQA4/6/8"
+                "ResAttn candidate requires NVFP4, D128/D256, and GQA4/6/8"
             )
         if (self.alibi_slopes is not None or self.window_left != -1
                 or self.logits_soft_cap not in (None, 0.0)
@@ -145,7 +145,8 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             self.num_heads, self.num_kv_heads, self.head_size)
 
     def fused_output_quant_supported(self, quant_key):
-        return bool(self.is_kvcache_nvfp4 and quant_key == kNvfp4Dynamic)
+        return bool(self.is_kvcache_nvfp4 and self.head_size == 128
+                    and quant_key == kNvfp4Dynamic)
 
     def _pool_for(self, kv_cache, layer):
         key = (kv_cache.data_ptr(), tuple(kv_cache.shape), kv_cache.stride(),
@@ -157,8 +158,8 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
             v = canonicalize_singleton_dim_strides(v.permute(*order))
             kd, ks = nvfp4_split_data_scale(k)
             vd, vs = nvfp4_split_data_scale(v)
-            if tuple(kd.shape[1:]) != (self.num_kv_heads, 128, 64):
-                raise ValueError("ResAttn requires stock HND, page128, D128 cache")
+            if tuple(kd.shape[1:]) != (self.num_kv_heads, 128, self.head_size // 2):
+                raise ValueError("ResAttn requires stock HND, page128, matching head-dimension cache")
             self._residue_pool = NvFp4PagedKVPool(
                 num_kv_heads=self.num_kv_heads, head_dim=self.head_size,
                 k_data=kd, v_data=vd, k_sf=ks, v_sf=vs,
@@ -235,9 +236,14 @@ class ResAttnFlashInferBackend(FlashInferBackend):
     def get_builder_cls():
         return ResAttnFlashInferMetadataBuilder
 
+    @staticmethod
+    def get_supported_kernel_block_sizes():
+        # vLLM splits larger hybrid-cache allocation blocks into kernel pages.
+        return [128]
+
     @classmethod
     def get_supported_head_sizes(cls):
-        return [128]
+        return [128, 256]
 
     @classmethod
     def supports_sink(cls):

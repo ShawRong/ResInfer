@@ -11,22 +11,30 @@ def _reduction_policy(value=None):
     return value
 
 
+def _check_output_dimension(head_dim, output_nvfp4):
+    if head_dim not in (128, 256):
+        raise NotImplementedError("ResAttn supports head_dim=128 or 256")
+    if head_dim == 256 and output_nvfp4:
+        raise NotImplementedError("D256 supports BF16 output only")
+
+
 def select_decode_plan(batch, num_kv_heads, max_kv_len, sm_count, *,
                        output_nvfp4=False, grouped_head_tile=16,
-                       residue_fold=True, reduction_policy=None):
+                       residue_fold=True, reduction_policy=None, head_dim=128):
     """Select the static split/reducer, then apply the caller's reduction policy."""
+    _check_output_dimension(head_dim, output_nvfp4)
     policy = _reduction_policy(reduction_policy)
     if not residue_fold or grouped_head_tile not in (8, 16):
         raise NotImplementedError("production ResAttn requires residue Q8/Q16")
     splits, reducer = _select_decode_plan(
         batch, num_kv_heads, max_kv_len, sm_count, output_nvfp4)
-    if policy == "deterministic" and reducer not in ("none", "kernel"):
+    if (policy == "deterministic" or head_dim == 256) and reducer not in ("none", "kernel"):
         reducer = "kernel"
     return splits, reducer
 
 
 def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
-                         residue_fold=True):
+                         residue_fold=True, head_dim=128):
     """Represent every static compiler variant, not a sampled input grid.
 
     Batch, KV length and split count are runtime arguments. Only reducer and
@@ -35,7 +43,10 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
     """
     if not residue_fold or grouped_head_tile not in (8, 16):
         raise NotImplementedError("production ResAttn requires residue Q8/Q16")
+    _check_output_dimension(head_dim, output_nvfp4)
     plans = [(1, "none"), (2, "kernel")]
+    if head_dim == 256:
+        return tuple(plans)
     if output_nvfp4:
         plans.extend(((4, "gmem_fused"), (16, "gmem_fused")))
     else:
@@ -43,9 +54,12 @@ def static_compile_plans(*, output_nvfp4=False, grouped_head_tile=16,
     return tuple(plans)
 
 
-def validate_decode_plan(plan, *, output_nvfp4=False):
+def validate_decode_plan(plan, *, output_nvfp4=False, head_dim=128):
     """Check launch constraints before compilation or workspace allocation."""
+    _check_output_dimension(head_dim, output_nvfp4)
     splits, reducer = plan
+    if head_dim == 256 and reducer not in ("none", "kernel"):
+        raise NotImplementedError("D256 supports none/kernel reduction only")
     if type(splits) is not int or splits < 1:
         raise ValueError(f"decode plan splits must be a positive integer, got {splits!r}")
     if reducer not in ("none", "kernel", "cga_sharded", "gmem_fused"):

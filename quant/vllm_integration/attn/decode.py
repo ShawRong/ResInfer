@@ -113,14 +113,9 @@ class ResAttnDecodeMixin:
         q_dec = q_all if q_all.shape[0] == n else q_all[:n]
 
         host = _load_decode_kernel()
-        # The kernel is compiled with out_dtype=BFloat16; write straight into
-        # the output slice when it already matches, else stage and cast.
+        # vLLM allocates contiguous output; the backend requires BF16.
+        # The host validates this contract before launching.
         dec_out = out3[:n]
-        kern_out = (
-            dec_out
-            if dec_out.dtype is torch.bfloat16 and dec_out.is_contiguous()
-            else torch.empty_like(dec_out, dtype=torch.bfloat16)
-        )
         reduction_workspace = None
         _validate_residue_geometry(
             self.num_heads, self.num_kv_heads
@@ -137,6 +132,7 @@ class ResAttnDecodeMixin:
                 self.num_kv_heads,
                 decode.max_seq_len,
                 q_dec.device,
+                head_dim=self.head_size,
                 grouped_head_tile=host._residue_padded_group_size(
                     self.num_heads, self.num_kv_heads),
             )
@@ -160,12 +156,10 @@ class ResAttnDecodeMixin:
             decode.block_tables,
             decode.seq_lens,
             self.scale * pool.k_global_scale,
-            out=kern_out,
+            out=dec_out,
             max_seq_len=decode.max_seq_len,
             k_sf_mode="linear",
             value_scale=pool.v_global_scale,
             reduction_workspace=reduction_workspace,
             plan=decode_plan,
         )
-        if kern_out is not dec_out:
-            dec_out.copy_(kern_out)

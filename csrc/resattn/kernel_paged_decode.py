@@ -68,7 +68,7 @@ smem_fmax = partial(cute.arch.atomic_fmax, sem="relaxed", scope="cta")
 class GroupedQueryAttentionDecodePagedFp4:
     """分页 nvfp4 变体(MMA-native KV 池,page_size=128)。
 
-    Single-token residue decode: physical Q8/Q16, D128, linear K scales.
+    Single-token residue decode: physical Q8/Q16, D128/D256, linear K scales.
     Derived from dense ``GroupedQueryAttentionDecode``; paged addressing and
     compact logical-head output are local extensions.
 
@@ -114,10 +114,12 @@ class GroupedQueryAttentionDecodePagedFp4:
               - ``"none"``: no split-K, flash decoding disabled.
         """
         if (grouped_head_tile not in (8, 16)
-                or prediction_tile != 1 or headdim != 128):
-            raise NotImplementedError("production ResAttn requires residue Q8/Q16, D128, decode")
+                or prediction_tile != 1 or headdim not in (128, 256)):
+            raise NotImplementedError("production ResAttn requires residue Q8/Q16, D128/D256, decode")
         if reduction_mode not in ("none", "kernel", "gmem_fused", "cga_sharded"):
             raise ValueError(f"unsupported production reducer: {reduction_mode}")
+        if headdim == 256 and reduction_mode not in ("none", "kernel"):
+            raise NotImplementedError("D256 supports BF16 none/kernel reduction only")
         self.headdim = headdim
         self.grouped_head_tile = grouped_head_tile
         self.prediction_tile = prediction_tile
@@ -305,6 +307,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             o_bshd.dtype == cutlass.Float4E2M1FN
         )
         if cutlass.const_expr(quantize_o):
+            assert self.headdim == 128, "D256 NVFP4 output is not supported"
             assert (
                 self.do_none_red
                 or self.do_kernel_red
@@ -463,7 +466,9 @@ class GroupedQueryAttentionDecodePagedFp4:
         mn_stage_bits = mma_tile_m * mma_tile_n * mma_dtype.width
         # SF stage 尺寸(仅 nvfp4):SFK 每 stage M×(K/16);SFQ 一次性 N_pad×(K/16)
         sfk_stage_bits = mma_tile_m * (mma_tile_k // sf_vec_size) * sf_dtype.width
-        sfk_stage_bits *= 2
+        # TMA requires at least 16 contiguous bytes. D256 loads a full
+        # 16-byte scale row per K stage, then selects its 8-byte D128 half.
+        sfk_stage_bits += mma_tile_m * (self.headdim // sf_vec_size) * sf_dtype.width
         sfq_total_bits = (
             mma_tile_n_sfb * (mma_tile_k // sf_vec_size) * sf_dtype.width * tiles_dk
         )
@@ -577,16 +582,15 @@ class GroupedQueryAttentionDecodePagedFp4:
         _sf_blocks = mma_tile_m_vp // 16
         _tile_sf = _sf_blocks * mma_tile_k_vp
         smem_layout_v_sf_d = cute.make_layout(
-            (16, _tile_sf // 16, kv_stages),
-            stride=(1, 16, _tile_sf),
+            (4 * _sf_blocks, mma_tile_k_vp // 4, kv_stages),
+            stride=(1, 4 * _sf_blocks, _tile_sf),
         )
         # SF smem 布局(仅 nvfp4;SFQ 单份、SFK 随 K stage)
         smem_layout_sfk_raw = None
         smem_layout_sfk = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma_kq, mma_tile_mnk, sf_vec_size, kv_stages
         )
-        assert self.headdim == 128
-        _ksf_stage_bytes = mma_tile_m * (mma_tile_k // sf_vec_size)
+        _ksf_stage_bytes = mma_tile_m * (self.headdim // sf_vec_size)
         smem_layout_sfk_raw = cute.make_layout(
             (16, _ksf_stage_bytes // 16, kv_stages),
             stride=(1, 16, _ksf_stage_bytes),
@@ -646,15 +650,15 @@ class GroupedQueryAttentionDecodePagedFp4:
             internal_type=cutlass.Int8,
         )
 
-        _tsf = (self.headdim // 16) * self.page_size
         _hkv = v_sf.shape[1]
         mVSF_d = cute.make_tensor(
             v_sf.iterator,
             cute.make_layout(
-                (16, _tsf // 16, (_hkv, v_sf.shape[0])),
+                (4 * (self.headdim // 16), self.page_size // 4,
+                 (_hkv, v_sf.shape[0])),
                 stride=(
                     1,
-                    16,
+                    4 * (self.headdim // 16),
                     (v_sf.stride[1], v_sf.stride[0]),
                 ),
             ),
@@ -664,7 +668,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                 tma_load_op,
                 mVSF_d,
                 cute.slice_(smem_layout_v_sf_d, (None, None, 0)),
-                (16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
+                (4 * (mma_tile_m_vp // 16), mma_tile_k_vp // 4),
             )
         )
         # SF gmem 视图 + TMA(仅 nvfp4)。k_sf/q_sf 为平铺 e4m3 缓冲,按 SF-atom 布局解释:
@@ -1206,7 +1210,7 @@ class GroupedQueryAttentionDecodePagedFp4:
         kv_stages = smem_layout_k.shape[-1]
         k_stage_bytes = mma_tile_m * mma_tile_k * k_dtype.width // 8
         k_stage_bytes += cute.size_in_bytes(
-            sf_dtype, cute.select(smem_layout_sfk, mma_modes)
+            sf_dtype, cute.slice_(smem_layout_sfk_raw, (None, None, 0))
         )
         k_producer = k_consumer = None
         v_raw_producer = v_raw_consumer = None
@@ -1353,8 +1357,8 @@ class GroupedQueryAttentionDecodePagedFp4:
                 _tAsSFKRawBytes.iterator, dtype=cutlass.Uint64
             ),
             cute.make_layout(
-                (mma_tile_m, kv_stages),
-                stride=(1, mma_tile_m),
+                (mma_tile_m * tiles_dk, kv_stages),
+                stride=(1, mma_tile_m * tiles_dk),
             ),
         )
 
@@ -1630,7 +1634,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             )
             gVSFD = cute.local_tile(
                 mVSF_d,
-                tiler=(16, ((mma_tile_m_vp // 16) * mma_tile_k_vp) // 16),
+                tiler=(4 * (mma_tile_m_vp // 16), mma_tile_k_vp // 4),
                 coord=(None, None, (coord_hk, None)),
             )
             tGSsVSFD, tGSgVSFD = cute.nvgpu.cpasync.tma_partition(
@@ -2046,13 +2050,12 @@ class GroupedQueryAttentionDecodePagedFp4:
             # Wait for Q
             cute.arch.mbarrier_wait(q_load_mbar, phase=0)
 
-            # SFQ → TMEM(一次;独立 mbar 正确同步)
             cute.arch.mbarrier_wait(sfq_mbar, phase=0)
-            cute.copy(
-                copy_sfq,
-                tCsSFQ_s2t[None, None, None, None, 0],
-                tCtSFQ_s2t,
-            )
+            if cutlass.const_expr(tiles_dk == 1):
+                # D128 reuses the same Q scales throughout the sequence.
+                cute.copy(
+                    copy_sfq, tCsSFQ_s2t[None, None, None, None, 0], tCtSFQ_s2t,
+                )
 
             # Sequence loop
             for s in cutlass.range(iters_s):
@@ -2065,13 +2068,17 @@ class GroupedQueryAttentionDecodePagedFp4:
                     tiled_mma_kq.set(tcgen05.Field.ACCUMULATE, False)
                     for dk in cutlass.range_constexpr(tiles_dk):
                         k_handle = k_consumer.wait_and_advance(k_token)
+                        if cutlass.const_expr(tiles_dk > 1):
+                            cute.copy(
+                                copy_sfq, tCsSFQ_s2t[None, None, None, None, dk], tCtSFQ_s2t,
+                            )
                         # SFK → TMEM(每 K stage)
                         sf_stage = k_handle.index
                         for _i in cutlass.range_constexpr(
                             mma_tile_m // warp_threads
                         ):
                             _row = lane_idx + _i * warp_threads
-                            _value = tAsSFKRawU64[_row, sf_stage]
+                            _value = tAsSFKRawU64[_row * tiles_dk + dk, sf_stage]
                             _atom_lo = (
                                 (_row % 32) * 16
                                 + (_row // 32) * 4
@@ -2701,7 +2708,7 @@ class GroupedQueryAttentionDecodePagedFp4:
             # Correct and accumulate output
             output_prev = tOrO_prev.reshape((blk_tile_n, tiles_dm))
             output_final = tOrO_final.reshape((blk_tile_n, tiles_dm))
-            output_final += correction * output_prev
+            output_final += correction.reshape((blk_tile_n, 1)) * output_prev
 
             if cutlass.const_expr(do_cga_red):
                 partial_o.store(output_final.reshape((blk_tile_n,)))
@@ -2710,7 +2717,7 @@ class GroupedQueryAttentionDecodePagedFp4:
                 if cutlass.const_expr(do_none_red):
                     sM_final_nbar.arrive_and_wait()
                     normalization = sM.load()
-                    output_final *= normalization
+                    output_final *= normalization.reshape((blk_tile_n, 1))
 
                 # Store O to smem and notify the TMA warp.
                 tOsO.store(output_final.to(o_dtype).reshape(tOsO.shape))

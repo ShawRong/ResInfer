@@ -700,7 +700,8 @@ void scaled_fp4_quant_mext_r1_grouped_q(torch::Tensor const& q,
   const int physical_rows = rows == 4 ? 8 : 16;
   TORCH_CHECK(rows == 4 || rows == 6 || rows == 8,
               "grouped residue Q supports GQA4/6/8");
-  TORCH_CHECK(head_dim == 128, "grouped residue Q requires head_dim=128");
+  TORCH_CHECK(head_dim == 128 || head_dim == 256,
+              "grouped residue Q requires head_dim=128 or 256");
   TORCH_CHECK(q_pack.dim() == 4 && q_pack.size(0) == batch &&
                   q_pack.size(1) == heads &&
                   q_pack.size(2) == physical_rows &&

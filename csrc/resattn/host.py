@@ -73,16 +73,8 @@ def check_shape_supported(num_qo_heads: int, num_kv_heads: int, head_dim: int,
         raise ValueError(
             f"num_qo_heads({num_qo_heads}) 必须是 num_kv_heads({num_kv_heads}) 的倍数"
         )
-    # The linear K-scale TMA path stages one 128-D slice. D=256 needs a
-    # tiled scale transfer and the direct gmem reducer also needs two output
-    # blocks per correction thread. Neither has landed yet, so reject it at
-    # the public boundary instead of failing deep inside CuTe compilation.
-    if head_dim != 128:
-        raise NotImplementedError(
-            f"ResAttn fp4 decode currently supports head_dim=128 only; "
-            f"got {head_dim}. D=256 requires tiled linear K-scale loads and "
-            "a wider direct-output reducer."
-        )
+    if head_dim not in (128, 256):
+        raise NotImplementedError(f"ResAttn supports head_dim=128 or 256, got {head_dim}")
     _residue_padded_group_size(num_qo_heads, num_kv_heads)
     if prediction != 1:
         raise NotImplementedError("production ResAttn supports single-token decode only")
@@ -94,13 +86,13 @@ def _sm_count(device_str: str) -> int:
 
 
 def plan_qmul4_decode(batch, num_kv_heads, max_kv_len, device, *,
-                       grouped_head_tile=16, residue_fold=True):
+                       grouped_head_tile=16, residue_fold=True, head_dim=128):
     """BF16 output wrapper over the shared split/reduction policy."""
     if not residue_fold:
         raise NotImplementedError("ordinary QK moved to .dev/tools/resattn/experimental")
     return select_decode_plan(
         batch, num_kv_heads, max_kv_len, _sm_count(str(device)),
-        grouped_head_tile=grouped_head_tile, residue_fold=residue_fold,
+        grouped_head_tile=grouped_head_tile, residue_fold=residue_fold, head_dim=head_dim,
     )
 
 
@@ -583,7 +575,8 @@ def run_paged_fp4_decode_qmul4_tmem(
       4-token interleave 排布(``append.quantize_paged_trtllm_format`` 产出)。
 
     The decode kernel converts V to E4M3 in TMEM using QMUL4, then runs the
-    ordinary FP8 VP MMA.
+    ordinary FP8 VP MMA. Output rows with zero sequence length are unspecified;
+    callers must ignore them (as vLLM does for graph padding).
     """
     if not residue_fold:
         raise NotImplementedError("ordinary QK moved to .dev/tools/resattn/experimental")
@@ -616,7 +609,7 @@ def run_paged_fp4_decode_qmul4_tmem(
     if plan is None:
         max_len = max_seq_len or int(seq_lens.max().item())
         splits, reduction = plan_qmul4_decode(
-            B, H, max_len, q.device, grouped_head_tile=g_pad,
+            B, H, max_len, q.device, grouped_head_tile=g_pad, head_dim=D,
             residue_fold=residue_fold,
         )
     else:
@@ -634,11 +627,6 @@ def run_paged_fp4_decode_qmul4_tmem(
         )
     q_pack, q_sf = fused
     o_partial = l_partial = m_partial = None
-    if reduction == "none":
-        # Empty/inactive rows skip the main kernel's output store. Preserve
-        # the zero-row contract of the old padded torch.zeros allocation.
-        # Split reducers write zero for inactive rows.
-        out.zero_()
     if reduction == "kernel":
         if reduction_workspace is None:
             reduction_workspace = allocate_qmul4_reduction_workspace(
@@ -708,7 +696,7 @@ def decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan, *,
         raise NotImplementedError("production ResAttn uses linear K scales")
     if direct_output is False:
         raise NotImplementedError("padded output moved to .dev/tools/resattn/experimental")
-    validate_decode_plan(plan, output_nvfp4=output_nvfp4)
+    validate_decode_plan(plan, output_nvfp4=output_nvfp4, head_dim=head_dim)
     splits, reduction = plan
     tile = _residue_padded_group_size(num_qo_heads, num_kv_heads)
     ssw = _use_single_softmax_scheduler(tile, reduction, "qmul4_tmem", splits)
@@ -731,7 +719,8 @@ def decode_compile_variants(num_qo_heads, num_kv_heads, head_dim, *,
     tile = _residue_padded_group_size(num_qo_heads, num_kv_heads)
     specs, seen = [], set()
     for plan in static_compile_plans(output_nvfp4=output_nvfp4,
-                                     grouped_head_tile=tile, residue_fold=residue_fold):
+                                     grouped_head_tile=tile, residue_fold=residue_fold,
+                                     head_dim=head_dim):
         spec = decode_compile_spec(num_qo_heads, num_kv_heads, head_dim, plan,
                                     output_nvfp4=output_nvfp4, residue_fold=residue_fold)
         key = (spec["args"], tuple(sorted(spec["kwargs"].items())))
