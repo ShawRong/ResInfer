@@ -20,6 +20,7 @@ import sys
 import uuid
 
 from .timing import TIMING_METHOD
+from .inputs import prepare_mext_weights
 from .mext_paper_aggregate import aggregate, write_outputs
 from .json_config import load_suite, parse_config_overrides, parse_tp_overrides
 from .mext_paper_shapes import resolve
@@ -159,30 +160,6 @@ def _driver(args: argparse.Namespace) -> int:
     return 0
 
 
-def _prepare_weights(n, k, device, arms):
-    import torch
-    from flashinfer import SfLayout, mxfp4_quantize, nvfp4_quantize
-    from .mext_trtllm_adapter import prepare_weight as prepare_trtllm_weight, require_dense_ops
-
-    weight = torch.randn(n, k, device=device, dtype=torch.bfloat16) / (k ** 0.5)
-    wgs = (448.0 * 6.0 / weight.float().abs().max()).reshape(())
-    w_nv, ws_nv = nvfp4_quantize(weight, wgs, sfLayout=SfLayout.layout_128x4)
-    ws_mext = ws_nv.view(torch.float8_e4m3fn)
-    # FlashInfer quantizers already return SM100-interleaved scale
-    # factors. Re-interleaving them silently corrupts W4A8 output.
-    w_mx, ws_mx = mxfp4_quantize(weight)
-    ws_mx_flat = ws_mx.flatten().contiguous()
-    w_mx_batch = w_mx.unsqueeze(0)
-    ws_mx_batch = ws_mx.unsqueeze(0)
-    if "trtllm_nvfp4_fp8_w4a8" in arms:
-        trtllm_fp4_utils = require_dense_ops()
-        w_trt, ws_trt, wgs_trt = prepare_trtllm_weight(weight, trtllm_fp4_utils)
-    return {"reference": weight, "nvfp4": (w_nv, ws_nv, ws_mext, wgs),
-            "mxfp4": (w_mx, ws_mx, ws_mx_flat, w_mx_batch, ws_mx_batch),
-            "trtllm": (w_trt, ws_trt, wgs_trt)
-            if "trtllm_nvfp4_fp8_w4a8" in arms else None}
-
-
 def _make_runners(x, weights, arms):
     import torch
     from flashinfer import SfLayout, mm_fp4, mxfp4_quantize, mxfp8_quantize, nvfp4_quantize
@@ -294,7 +271,7 @@ def _measure_shape(shape, resolved, rep, emit):
         from quant.flashinfer_integration import mxfp4_linear_adapter
     device = torch.device("cuda:0")
     n, k = shape["n"], shape["k"]
-    weights = _prepare_weights(n, k, device, resolved["arms"])
+    weights = prepare_mext_weights(n, k, device, resolved["arms"])
     for m in resolved["m_values"]:
         assert_gpu_exclusive(0)
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
