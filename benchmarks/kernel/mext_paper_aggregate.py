@@ -34,8 +34,9 @@ def _rows(path: Path) -> list[dict]:
 
 
 def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
-              arms: list[str], required_arms: list[str] | None = None) -> dict:
-    """Check sample completeness and summarize; the sweep validates run identity.
+              arms: list[str], required_arms: list[str] | None = None, *,
+              run_id: str | None = None) -> dict:
+    """Validate one run and summarize its complete measurement matrix.
 
     All requested arms are required unless required_arms is supplied. An optional
     arm can be skipped in every repetition; partial samples cannot form a median.
@@ -48,6 +49,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
     expected = {(rep, shape["shape_id"], m, arm)
                 for rep in range(len(files)) for shape in shapes
                 for m in m_values for arm in arms}
+    shape_by_id = {shape["shape_id"]: shape for shape in shapes}
     observed = {}
     for rep, path in enumerate(files):
         for row in _rows(path):
@@ -56,6 +58,13 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                 raise ValueError(f"unexpected cell in {path}: {key}")
             if key in observed:
                 raise ValueError(f"duplicate cell: {key}")
+            if run_id is None:
+                run_id = row.get("run_id")
+            if not run_id or row.get("run_id") != run_id:
+                raise ValueError(f"mixed or missing run identity: {key}")
+            shape = shape_by_id[key[1]]
+            if any(row.get(field) != shape[field] for field in ("n", "k", "aliases")):
+                raise ValueError(f"shape metadata mismatch: {key}")
             status = row.get("status")
             if key[3] in required and status != "passed":
                 raise ValueError(f"required arm did not pass: {key}")
@@ -92,7 +101,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
             points.append({**shape, "m": m, "latency_us": latency,
                            "process_range_us": process_range, "ratios": ratios})
     summary = {"schema": 1, "status": "complete",
-               "run_id": next(iter(observed.values())).get("run_id"),
+               "run_id": run_id,
                "process_reps": len(files), "unique_shapes": len(shapes), "points": points}
     for field, groups in macro.items():
         summary[field] = [

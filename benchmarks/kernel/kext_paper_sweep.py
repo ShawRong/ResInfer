@@ -52,11 +52,6 @@ SHAPES: dict[str, dict[str, tuple[int, int]]] = {
 
 SUPPORTED_RATIOS = (0.125, 0.25, 0.5)
 
-# Fallback for callers without a manifest; the CLI uses per-family grids.
-M_GRID = (1, 2, 4, 8, 16, 24, 32, 48, 64, 80, 96, 112, 128,
-          160, 192, 256, 320, 384, 448, 512)
-
-
 # ------------------------------------------------------------------ setup
 def global_scale(t: torch.Tensor) -> torch.Tensor:
     """vLLM/CUTLASS FP4 convention: 448*6/amax, passed into the quantiser."""
@@ -154,11 +149,46 @@ def selected_fold_tactic(route, policy):
             'fold_tactic_tile': candidates.last_tactic_tile()}
 
 
-def run(args) -> None:
+def make_extended_weights(w_ref, k, ratios):
     import nvfp4
     from vllm._custom_ops import scaled_fp4_quant
-    from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import swizzle_blockscale
+
+    extended = {}
+    for ratio in ratios:
+        idx = salient_indices(k, ratio, w_ref.device)
+        w_ext = torch.cat([w_ref, w_ref.index_select(-1, idx)], dim=-1)
+        gs = global_scale(w_ext)
+        packed, scales = scaled_fp4_quant(w_ext, gs, is_sf_swizzled_layout=False)
+        extended[ratio] = (packed, swizzle_blockscale(scales),
+            swizzle_blockscale(scales[:, :k // 16].contiguous()), gs,
+            nvfp4.indices_to_channel_masks(idx, k), idx.numel())
+    return extended
+
+
+def measure_arms(arms, reference, args):
+    device, m = reference.device, reference.shape[0]
+    niw = max(iters_for_cold_l2(inputs, device) for _, _, _, inputs, _, _ in arms)
+    stock_us = None
+    for family, ratio, fn, inputs, route, policy in arms:
+        if args.autotune:
+            fi_autotuned(fn, inputs, m_bucket=m)
+        error = check_output(fn(*inputs), reference)
+        warm_equally(fn, inputs)
+        measured = timed_detail(fn, inputs, iters_within_graph=niw,
+                                repeats=args.repeats)
+        if family == 'stock':
+            stock_us = measured['us']
+        yield {'kind': 'measure', 'family': family, 'ratio': ratio,
+              'route': route,
+              'autotune_requested': args.autotune, 'relmax_bf16': error,
+              'vs_stock': measured['us'] / stock_us,
+              **(selected_fold_tactic(route, policy) if policy else {}),
+              **l2_accounting(inputs, device, niw), **measured}
+
+
+def run(args) -> None:
+    from vllm.model_executor.kernels.linear import init_nvfp4_linear_kernel
     from quant.vllm_integration import residue_linear_op  # registers the op
 
     if not 0 <= args.gpu < torch.cuda.device_count():
@@ -170,8 +200,8 @@ def run(args) -> None:
     stock_name = type(stock_kernel).__name__
     major, minor = torch.cuda.get_device_capability(device)
     sm = f'sm{major}{minor}'
-    doc = args.manifest_doc or {}
-    grids = {family: spec_mod.m_grid_for(doc, family, sm) if doc else list(M_GRID)
+    doc = args.manifest_doc
+    grids = {family: spec_mod.m_grid_for(doc, family, sm)
              for family in ('mext', 'kext')}
     for family in grids:
         if args.family not in ('both', family):
@@ -205,15 +235,7 @@ def run(args) -> None:
                 n, k = SHAPES[model][proj]
                 w_ref, w_base, sf_base, wgs = make_weight(n, k, device, torch.bfloat16)
                 layer = FakeLayer(w_base, sf_base, None, None, n, weight_gs=wgs)
-                extended = {}
-                for ratio in ratios if grids['kext'] else ():
-                    idx = salient_indices(k, ratio, device)
-                    w_ext = torch.cat([w_ref, w_ref.index_select(-1, idx)], dim=-1)
-                    gs = global_scale(w_ext)
-                    packed, scales = scaled_fp4_quant(w_ext, gs, is_sf_swizzled_layout=False)
-                    extended[ratio] = (packed, swizzle_blockscale(scales),
-                        swizzle_blockscale(scales[:, :k // 16].contiguous()), gs,
-                        nvfp4.indices_to_channel_masks(idx, k), idx.numel())
+                extended = make_extended_weights(w_ref, k, ratios if grids['kext'] else ())
                 for m in m_grid:
                     assert_gpu_exclusive(args.gpu, exclusive=not args.allow_shared_gpu)
                     x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
@@ -239,24 +261,9 @@ def run(args) -> None:
                                 x, w, sf, bsf, xgs, (1 / (xgs * gs)).reshape(()),
                                 mask, k, n, salient, False)
                             arms.append(('kext', ratio, fn, inputs, route, policy))
-                    niw = max(iters_for_cold_l2(inputs, device) for _, _, _, inputs, _, _ in arms)
-                    stock_us = None
-                    for family, ratio, fn, inputs, route, policy in arms:
-                        if args.autotune:
-                            fi_autotuned(fn, inputs, m_bucket=m)
-                        error = check_output(fn(*inputs), reference)
-                        warm_equally(fn, inputs)
-                        measured = timed_detail(fn, inputs, iters_within_graph=niw,
-                                                repeats=args.repeats)
-                        if family == 'stock':
-                            stock_us = measured['us']
-                        emit({'kind': 'measure', 'model': model, 'proj': proj,
-                              'n': n, 'k': k, 'm': m, 'family': family, 'ratio': ratio,
-                              'route': route, 'stock_kernel_class': stock_name,
-                              'autotune_requested': args.autotune, 'relmax_bf16': error,
-                              'vs_stock': measured['us'] / stock_us,
-                              **(selected_fold_tactic(route, policy) if policy else {}),
-                              **l2_accounting(inputs, device, niw), **measured})
+                    for row in measure_arms(arms, reference, args):
+                        emit(dict(row, model=model, proj=proj, n=n, k=k, m=m,
+                                  stock_kernel_class=stock_name))
                     layer.weight, layer.weight_scale = w_base, sf_base
                 print(f'[bench] done {model}/{proj}', flush=True)
         emit({'kind': 'run_summary', 'status': 'complete',
@@ -274,13 +281,13 @@ def main() -> None:
                         "defaults; an explicit flag still wins, and the "
                         "override is recorded in provenance.")
     p.add_argument("--gpu", type=int, default=0)
-    p.add_argument("--models", default="qwen3_4b,qwen3_8b,qwen3_32b",
+    p.add_argument("--models",
                    help=f"comma-separated: {', '.join(SHAPES)}")
     p.add_argument("--family", default="both", choices=["mext", "kext", "both"])
-    p.add_argument("--ratios", default="0.125,0.25,0.5")
+    p.add_argument("--ratios")
     p.add_argument("--m-max", type=int, default=None,
                    help="optional upper bound on each family's manifest M grid")
-    p.add_argument("--repeats", type=int, default=5, help="timing repeats per point")
+    p.add_argument("--repeats", type=int, help="timing repeats per point")
     p.add_argument("--rep", type=int, default=0, help="whole-process repetition index")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run-id", default=None)
@@ -295,23 +302,18 @@ def main() -> None:
     p.add_argument("--out", default="residue_kernel_bench.jsonl")
     a = p.parse_args()
 
-    # Spec supplies defaults; an explicit flag still wins. Which values came
-    # from where is recorded, so a run that deviated from its spec says so
-    # rather than looking like a spec-conformant run.
     a.manifest_doc = spec_mod.load(a.manifest)
-    a.manifest_overrides = []
-    k = dict(a.manifest_doc.get("kernel", {}))
-    k.setdefault("ratios", spec_mod.ratios_for(a.manifest_doc, "kext") or list(SUPPORTED_RATIOS))
-    supplied = {arg.split("=", 1)[0] for arg in sys.argv[1:]}
-    for flag, key, conv in (("models", "models", lambda v: ",".join(v)),
-                            ("ratios", "ratios", lambda v: ",".join(map(str, v))),
-                            ("repeats", "repeats", int)):
-        if key in k and f"--{flag.replace('_', '-')}" not in supplied:
-            setattr(a, flag, conv(k[key]))
-        elif key in k:
-            a.manifest_overrides.append(flag)
-    a.models = [m.strip() for m in a.models.split(",") if m.strip()]
-    a.ratios = [float(r) for r in a.ratios.split(",") if r.strip()]
+    kernel = a.manifest_doc["kernel"]
+    a.manifest_overrides = [name for name in ("models", "ratios", "repeats")
+                            if getattr(a, name) is not None]
+    a.models = ([m.strip() for m in a.models.split(",") if m.strip()]
+                if a.models is not None else kernel["models"])
+    a.ratios = ([float(r) for r in a.ratios.split(",") if r.strip()]
+                if a.ratios is not None else
+                kernel.get("ratios", spec_mod.ratios_for(a.manifest_doc, "kext")))
+    a.repeats = a.repeats if a.repeats is not None else kernel.get("repeats", 5)
+    if not a.models or (a.family != "mext" and not a.ratios):
+        p.error("models and selective ratios must not be empty")
     for r in a.ratios:
         if not any(abs(r - s) < 1e-9 for s in SUPPORTED_RATIOS):
             raise SystemExit(f"unsupported ratio {r}; expected one of "
