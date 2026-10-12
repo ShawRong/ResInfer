@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NVFP4 ratio sweep: stock, full-residue Fold and selective K-extension.
 
-Run `python -m benchmarks.kernel.bench_residue_nvfp4 --help` for options.
+Run `python -m benchmarks.kernel.kext_paper_sweep --help` for options.
 Measures online activation quantization plus GEMM, using FlashInfer CUDA Graph
 cold-L2 timing. Selective ratios are 0.125/0.25/0.5; full residue is a separate
 Fold arm. This is a kernel pipeline benchmark, not full-model throughput.
