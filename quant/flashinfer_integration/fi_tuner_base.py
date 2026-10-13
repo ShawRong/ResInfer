@@ -14,6 +14,11 @@ _ANNOUNCED: set[str] = set()
 _DEGRADED: set[str] = set()
 
 
+def tile8_pad_multiple(mode: str, tiler: tuple) -> int:
+    """A6 direct stores need a full MMA tile; A4 TMA stores clamp M tails."""
+    return max(8, tiler[0] // 2) if mode == "direct_mext" else 8
+
+
 def weight_geometry(weight: torch.Tensor) -> tuple[int, int, int | None]:
     """Packed weight's output width, logical K, and optional stored row pitch."""
     n_w, packed_k = map(int, weight.shape)

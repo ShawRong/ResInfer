@@ -7,6 +7,14 @@ encoding is owned by ModelOpt; residue sidecars use the common metadata schema.
 from typing import TypedDict
 
 
+FUSED_PROJECTIONS = {
+    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
+    "gate_up_proj": ("gate_proj", "up_proj"),
+    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
+    "in_proj_ba": ("in_proj_b", "in_proj_a"),
+}
+
+
 class _RequiredLayerSpec(TypedDict):
     mode: str
     input_size: int
@@ -42,9 +50,7 @@ def validate_layer(spec):
 def fuse_projection_specs(layers):
     """Fused HF projections must share one activation-residue contract."""
     result = dict(layers)
-    for suffixes, target in ((("q_proj", "k_proj", "v_proj"), "qkv_proj"),
-                             (("gate_proj", "up_proj"), "gate_up_proj"),
-                             (("in_proj_qkv", "in_proj_z"), "in_proj_qkvz")):
+    for target, suffixes in FUSED_PROJECTIONS.items():
         parents = {name.rsplit(".", 1)[0] for name in layers if name.rsplit(".", 1)[-1] in suffixes}
         for parent in sorted(parents):
             names = [f"{parent}.{suffix}" for suffix in suffixes]

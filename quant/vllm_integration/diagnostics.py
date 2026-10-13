@@ -87,3 +87,11 @@ def log_registration_failure(reason, detail=None):
 def log_registration_success(class_path):
     _logger().info("ResAttn registered on CUSTOM (%s); select --attention-backend "
                    "CUSTOM --kv-cache-dtype nvfp4 --block-size 128", class_path)
+
+
+def log_mxfp4_weights_ready(mode):
+    logger = _logger()
+    getattr(logger, "info_once", logger.info)(
+        "MXFP4 weights ready: ResidueMxfp4LinearMethod mode=%s pid=%s",
+        mode, os.getpid(),
+    )

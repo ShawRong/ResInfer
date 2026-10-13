@@ -1,11 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""SM100 Fold candidate tables, ranking and static fallback.
+"""SM100 Fold candidate tables, legality and static fallback.
 
 FlashInfer owns measurement and tactic caching. These tables are also shared
 by MXFP4; preserve candidate order because cached tactic IDs refer to it.
 """
 from __future__ import annotations
+
+from functools import lru_cache
 
 import torch
 
@@ -133,32 +135,31 @@ def _token_axis(family: tuple[str, str]) -> int:
     return 0 if family[0] == "tile8" else 1
 
 
-def _rank_tactics(family: tuple[str, str], m_tok: int, kernel_arch: str):
-    'Order candidates best-first, cheapest-to-verify-first.'
-    prob = 2 * m_tok
+@lru_cache(maxsize=None)
+def expand_tactics(families: tuple) -> list[tuple]:
+    """Stable candidate IDs shared by NVFP4 and MXFP4 adapters."""
+    return [(family, *_norm_tactic(raw)) for family in families
+            for raw in FAMILY_TACTICS[family]]
+
+
+def legal_tactics(family: tuple[str, str], m_tok: int):
+    """Keep NVFP4's existing direct-store constraint and narrow-tile policy.
+
+    FlashInfer measures the surviving candidates; table order defines IDs.
+    MXFP4 applies its own direct-store rule after producer padding.
+    """
+    tokens = 2 * m_tok
     axis = _token_axis(family)
-    scored = []
+    result = []
     for raw in FAMILY_TACTICS[family]:
-        mode, tiler, cluster, ab = _norm_tactic(raw)
-        if mode == "direct_mext" and 2 * m_tok < tiler[0]:
-            continue  # A6 full-tile constraint (raw STG has no TMA clamping)
-        tile = tiler[axis]
-        # Narrow tiles must cover the token extent outright: splitting the
-        # token axis re-streams the whole weight tile per extra tile, and the
-        # weight is the decode bottleneck. Wide tiles may over-cover; they only
-        # waste MMA, which this regime has spare. Same guard as FlashInfer's
-        # `tile_n < 64 and prob_n > tile_n` -- but only meaningful on the token
-        # axis. (Inert for M-ext today: its tile_M is always 128 or 256.)
-        if tile < 64 and prob > tile:
+        tactic = _norm_tactic(raw)
+        mode, tiler, _cluster, _ab = tactic
+        if mode == "direct_mext" and tokens < tiler[0]:
             continue
-        n_tiles = (prob + tile - 1) // tile
-        waste = n_tiles * tile - prob
-        # exact fit first, then least waste, then deepest pipeline (ab=None
-        # means the kernel picks, which is the deepest that its solve allows)
-        scored.append(((waste, n_tiles, 0 if ab is None else 1),
-                       (mode, tiler, cluster, ab)))
-    scored.sort(key=lambda kv: kv[0])
-    return [t for _, t in scored]
+        if tiler[axis] < 64 and tokens > tiler[axis]:
+            continue
+        result.append(tactic)
+    return result
 
 
 def _needs_pi_layout(family) -> bool:

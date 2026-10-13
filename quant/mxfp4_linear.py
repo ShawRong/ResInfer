@@ -15,8 +15,6 @@ def mxfp4_linear(
     mode: str,
     output_dtype: torch.dtype,
     bias: torch.Tensor | None = None,
-    activation_recipe: str = "ceil",
-    tuning_buckets: list[int] | None = None,
 ) -> torch.Tensor:
     from nvfp4.mxfp4 import (
         gemm,
@@ -39,21 +37,18 @@ def mxfp4_linear(
     if mode == "mext_r1":
         from quant.flashinfer_integration import mxfp4_linear_adapter as fold_tuner
 
-        if activation_recipe != "ceil":
-            raise ValueError("MXFP4 uses native ceil quantization")
         tune = fold_tuner.tuner_enabled()
         output = fold_tuner.tuned_mxfp4_fold(
             source, weight, weight_scale, out_dtype=output_dtype,
-            pdl_mode="early" if tune else "off", tune=tune,
-            tuning_buckets=tuning_buckets,
+            pdl_mode="early", tune=tune,
         )
     else:
         if mode == "selective":
             activation, activation_scale = quantize_selective(
-                source, indices, masks, recipe=activation_recipe
+                source, indices, masks
             )
         else:
-            activation, activation_scale = quantize(source, recipe=activation_recipe)
+            activation, activation_scale = quantize(source)
         output = gemm(
             activation, weight, activation_scale, weight_scale,
             out_dtype=output_dtype,
@@ -73,10 +68,8 @@ def _fake_mxfp4_linear(
     mode,
     output_dtype,
     bias=None,
-    activation_recipe="ceil",
-    tuning_buckets=None,
 ):
-    del weight_scale, indices, masks, mode, bias, activation_recipe, tuning_buckets
+    del weight_scale, indices, masks, mode, bias
     return torch.empty(
         (*x.shape[:-1], weight.shape[0]), device=x.device, dtype=output_dtype
     )

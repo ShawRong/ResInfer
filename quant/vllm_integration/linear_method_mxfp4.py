@@ -104,26 +104,9 @@ class ModelOptMxfp4Config(ModelOptQuantConfigBase):
 class ResidueMxfp4LinearMethod(LinearMethodBase):
     """Load packed uint8 weights/scales and dispatch the opaque MXFP4 op."""
 
-    def __init__(self, metadata=None, *, extended_dim=None, activation_recipe="ceil"):
-        self.activation_recipe = activation_recipe
+    def __init__(self, metadata=None, *, extended_dim=None):
         self.metadata = metadata or {}
         self.extended_dim = extended_dim
-        runtime_mode = self.metadata.get("runtime_mode", "standard")
-        if runtime_mode == "mext_r1":
-            from ..flashinfer_integration import mxfp4_linear_adapter
-            if mxfp4_linear_adapter.tuner_enabled():
-                from vllm.config import get_current_vllm_config
-
-                config = get_current_vllm_config()
-                limit = int(config.scheduler_config.max_num_batched_tokens)
-                sizes = {1, limit, 2, 4, 8, 16, 32, 64, 128, 192, 256,
-                         384, 512}
-                sizes.update(config.compilation_config.cudagraph_capture_sizes or [])
-                self.tuning_buckets = sorted(m for m in sizes if 0 < m <= limit)
-            else:
-                self.tuning_buckets = None
-        else:
-            self.tuning_buckets = None
 
     def create_weights(
         self,
@@ -271,6 +254,10 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             layer.register_buffer("salient_masks", masks)
             layer._mxfp4_prepared = True
 
+        from .diagnostics import log_mxfp4_weights_ready
+
+        log_mxfp4_weights_ready(self.mode)
+
     def apply(self, layer, x, bias=None):
         if not layer._mxfp4_prepared:
             raise RuntimeError("call process_weights_after_loading before MXFP4 apply")
@@ -285,6 +272,4 @@ class ResidueMxfp4LinearMethod(LinearMethodBase):
             self.mode,
             layer._mxfp4_output_dtype,
             bias,
-            self.activation_recipe,
-            self.tuning_buckets,
         )

@@ -15,6 +15,10 @@ import torch
 from .fi_tuner_base import make_runner_pair, make_tuning_config, tuned_call
 
 
+LINEAR_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512,
+                  1024, 2048)
+
+
 @dataclass(frozen=True)
 class LinearSpec:
     format: str
@@ -57,8 +61,7 @@ def _config(spec: LinearSpec):
         # buckets and its actual large M, even when M exceeds 2048.
         return tuple(sorted({*spec.buckets, int(m)}))
 
-    generated = profile_buckets if spec.format == "nvfp4" else spec.buckets
-    return make_tuning_config(generated, map_bucket,
+    return make_tuning_config(profile_buckets, map_bucket,
                               use_cold_l2_cache=True)
 
 

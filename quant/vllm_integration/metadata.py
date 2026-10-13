@@ -9,12 +9,7 @@ import json
 import os
 from pathlib import Path
 
-_FUSED_PROJECTIONS = {
-    "qkv_proj": ("q_proj", "k_proj", "v_proj"),
-    "gate_up_proj": ("gate_proj", "up_proj"),
-    "in_proj_qkvz": ("in_proj_qkv", "in_proj_z"),
-    "in_proj_ba": ("in_proj_b", "in_proj_a"),
-}
+from quant.kernel_metadata import FUSED_PROJECTIONS
 
 
 def read_residue_metadata_json(metadata_path: str | Path) -> dict:
@@ -72,8 +67,8 @@ def get_fused_hf_candidates(layer_name: str) -> list[list[str]]:
     groups = []
     for candidate in _layer_aliases(layer_name):
         parent, separator, leaf = candidate.rpartition(".")
-        if leaf in _FUSED_PROJECTIONS:
-            groups.append([parent + separator + name for name in _FUSED_PROJECTIONS[leaf]])
+        if leaf in FUSED_PROJECTIONS:
+            groups.append([parent + separator + name for name in FUSED_PROJECTIONS[leaf]])
     return groups
 
 

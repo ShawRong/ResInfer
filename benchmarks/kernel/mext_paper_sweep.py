@@ -107,7 +107,7 @@ def _prepare(args: argparse.Namespace) -> dict:
                      if arm in arms]
     if len(set(required_arms)) != len(required_arms) or set(required_arms) - set(suite["arms"]):
         raise ValueError("required_arms must be a unique subset of suite arms")
-    return {"schema": 1, "timing_method": TIMING_METHOD, "run_id": uuid.uuid4().hex, "suite": suite["name"],
+    return {"schema": 1, "mxfp4_fold_protocol": "shared_buckets_pdl_early_v2", "timing_method": TIMING_METHOD, "run_id": uuid.uuid4().hex, "suite": suite["name"],
             "suite_path": str(args.suite.resolve()),
             "suite_sha256": hashlib.sha256(args.suite.read_bytes()).hexdigest(),
             "source_commit": source_commit,
@@ -164,10 +164,9 @@ def _make_runners(x, weights, arms):
     import torch
     from flashinfer import SfLayout, mm_fp4, mxfp4_quantize, mxfp8_quantize, nvfp4_quantize
     from flashinfer.gemm import group_gemm_mxfp8_mxfp4_nt_groupwise
-    from nvfp4.mxfp4 import fold_gemm as mxfp4_fold_gemm, quantize_mext as mxfp4_quantize_mext
     from .mext_trtllm_adapter import linear as trtllm_w4a8_linear
 
-    if "resinfer_mxfp4_mext_r1_tuned" in arms:
+    if {"resinfer_mxfp4_mext_r1", "resinfer_mxfp4_mext_r1_tuned"} & set(arms):
         from quant.flashinfer_integration import mxfp4_linear_adapter
     m, k = x.shape
     n, device = weights["reference"].shape[0], x.device
@@ -216,9 +215,9 @@ def _make_runners(x, weights, arms):
             out_dtype=torch.bfloat16)[:m]
 
     def res_mxfp4_mext(a, w, ws):
-        aq, asc = mxfp4_quantize_mext(a)
-        return mxfp4_fold_gemm(aq, w, asc, ws,
-                               out_dtype=torch.bfloat16)
+        return mxfp4_linear_adapter.tuned_mxfp4_fold(
+            a, w, ws, pdl_mode="early", tune=False,
+            out_dtype=torch.bfloat16)
 
     def res_mxfp4_mext_tuned(a, w, ws):
         return mxfp4_linear_adapter.tuned_mxfp4_fold(
@@ -351,7 +350,8 @@ def _worker(args: argparse.Namespace) -> int:
         from importlib.metadata import version
         prov["trtllm_version"] = version("tensorrt-llm")
     prov.update(rep=args.rep, shape_id=shape["shape_id"],
-                source_commit=resolved["source_commit"], required_env=resolved["required_env"])
+                source_commit=resolved["source_commit"], required_env=resolved["required_env"],
+                mxfp4_fold_protocol=resolved["mxfp4_fold_protocol"])
     stem.with_suffix(".provenance.json").write_text(json.dumps(prov, indent=2) + "\n")
     with stem.with_suffix(".jsonl").open("x") as stream:
         def emit(row):

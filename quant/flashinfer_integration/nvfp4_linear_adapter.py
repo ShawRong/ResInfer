@@ -11,10 +11,7 @@ from typing import NamedTuple
 
 import torch
 
-from .linear_tuner import LinearSpec, tuned_linear
-
-_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 192, 256, 384, 512,
-            1024, 2048)
+from .linear_tuner import LINEAR_BUCKETS, LinearSpec, tuned_linear
 
 
 class NVFP4Policy(NamedTuple):
@@ -116,8 +113,8 @@ def tuned_nvfp4_linear(inputs, policy):
         raise RuntimeError("M-extension requires a prepared Fold path")
     boundaries = {policy.fold_max_m, policy.fold_max_m + 1,
                   policy.ratio1_fold_max_m, policy.ratio1_fold_max_m + 1}
-    buckets = tuple(sorted({b for b in (*_BUCKETS, *boundaries)
-                            if 0 < b <= max(_BUCKETS)}))
+    buckets = tuple(sorted({b for b in (*LINEAR_BUCKETS, *boundaries)
+                            if 0 < b <= max(LINEAR_BUCKETS)}))
     # All candidate families share this call and its cold-L2 measurement.
     fold_tuner = policy.sm10x_tuner if policy.arch == "sm100" else policy.sm120_tuner
     enabled = (policy.fold_eligible and policy.arch in ("sm100", "sm120")

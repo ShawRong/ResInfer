@@ -4,11 +4,9 @@
 
 from __future__ import annotations
 
-from functools import lru_cache
-
 import torch
 
-from .fi_tuner_base import weight_geometry
+from .fi_tuner_base import tile8_pad_multiple, weight_geometry
 
 _FAMILY = ("row_pair", "std")
 _LAYOUT_ROW_PAIR = 1
@@ -39,16 +37,10 @@ def _families() -> tuple:
     return tuple(candidate_families())
 
 
-@lru_cache(maxsize=None)
-def _candidate_table(families):
-    from nvfp4.cute_fold.tactics import FAMILY_TACTICS, _norm_tactic
-
-    return [(family, *_norm_tactic(tactic)) for family in families
-            for tactic in FAMILY_TACTICS[family]]
-
-
 def _candidates():
-    return _candidate_table(_families())
+    from nvfp4.cute_fold.tactics import expand_tactics
+
+    return expand_tactics(_families())
 
 
 def candidates_hash() -> str:
@@ -66,24 +58,16 @@ def _arch() -> str | None:
 
 def _legal_indices(m_tok: int) -> list[int]:
     """Filter the shared tactic table by logical M and known output restrictions."""
-    from nvfp4.cute_fold.tactics import _rank_tactics
+    from nvfp4.cute_fold.tactics import legal_tactics
 
     arch = _arch()
     if arch != "sm100":
         return []
     legal = {(family, tactic) for family in _families()
-             for tactic in _rank_tactics(family, m_tok, arch)
+             for tactic in legal_tactics(family, m_tok)
              # A4 (128,32) returned incomplete output at N1152/K8192.
              if not (family == ("tile8", "std") and tactic[1] == (128, 32))}
     return [i for i, c in enumerate(_candidates()) if (c[0], c[1:]) in legal]
-
-
-def tile8_pad_multiple(mode: str, tiler: tuple) -> int:
-    # A6's direct store has no partial-tile clamp. Make real M legal even
-    # when its autotune bucket is a different multiple of tile_M / 2.
-    if mode == "direct_mext":
-        return max(_M_PAD_MULTIPLE, tiler[0] // 2)
-    return _M_PAD_MULTIPLE
 
 
 def _quant_for_family(inputs, family, pad_multiple: int = _M_PAD_MULTIPLE):
