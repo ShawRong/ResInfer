@@ -33,8 +33,11 @@ def validate(report, expected, details, aggregations):
         for row in details.get(task, []):
             doc, response = row['doc'], row['model_response']
             n = doc['num_samples']
-            if not isinstance(n, int) or n <= 0 or len(response['text']) != n:
+            texts = response['text']
+            if not isinstance(texts, list) or not isinstance(n, int) or n <= 0 or len(texts) != n:
                 raise ValueError(f'{task}: incomplete generations')
+            if any(not isinstance(text, str) or not text.strip() for text in texts):
+                raise ValueError(f'{task}: empty or invalid generation; check the API/scorer logs')
             scores = row.get('metric') or {}
             for key in values:
                 value = scores.get(key)
