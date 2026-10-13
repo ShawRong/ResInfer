@@ -1,20 +1,23 @@
-# The official dense-4B table. One command:
-#
-#   python -m benchmarks.quality.evalkit suite \
-#       --manifest benchmarks/suites/dense_4b.yaml \
-#       --models-root <dir holding the exports> \
-#       --data-dir data --out results_dense_4b
-#
-# `path` is relative to --models-root, so this file carries no machine-specific
-# absolute path and can be committed as the spec itself.
-#
-# Every arm comes off ONE shared gptq_clean base. That is the constraint the
-# whole ladder rests on: re-run GPTQ per ratio and "how much residue helped"
-# becomes inseparable from "how differently GPTQ landed this time". Verify it
-# (md5 of the base slice, base width from config.json) before trusting any
-# row -- see benchmarks/README.md.
-name: dense_4b
-tasks: passage_retrieval_en,2wikimqa,musique,hotpotqa
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+name: dense_4b_lmeval
+tasks: longbench_passage_retrieval_en,longbench_2wikimqa,longbench_musique,longbench_hotpotqa
+apply_chat_template: false
+truncation_side: middle
 max_model_len: 32768
 max_num_seqs: 8
 
@@ -68,7 +71,7 @@ compare: uniform_r0125 vs uniform_r0125_off; uniform_r025 vs uniform_r025_off; a
 gate:
   model_a: anchor
   model_b: uniform_r0125
-  task: 2wikimqa
+  task: longbench_2wikimqa
   limit: 100
 
 arms:

@@ -38,9 +38,7 @@ dependencies = [
     "nvfp4",                              # local kernel wheel (csrc)
 
     # ── HF / data stack ──────────────────────────────────────────────────
-    # vLLM nightly requires Transformers 5.x.  Some lm-eval imports still
-    # reference removed 4.x VLM auto classes; an internal eval harness
-    # installs a small compatibility shim for non-VLM evaluations.
+    # lm-eval 0.4.13 uses lazy model discovery compatible with Transformers 5.
     "transformers>=5.5.3",
     "accelerate>=0.21.0",
     "datasets>=2.0.0",
@@ -59,7 +57,7 @@ dependencies = [
     "mistral-common[image]>=1.11.3",      # vllm tokenizer / multimodal dep
     "ray>=2.53.0",
     "cloudpickle>=2.0.0",
-    "lm-eval[longbench,ruler,math]>=0.4.9.2",
+    "lm-eval[longbench,ruler,math]==0.4.13",
     "rouge>=1.0.1",
 
     
