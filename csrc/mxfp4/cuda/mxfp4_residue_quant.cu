@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
+#include "dispatch_utils.h"
 #include "nvfp4_utils.cuh"
 
 namespace {
@@ -81,11 +82,11 @@ __device__ __forceinline__ uint2 quantize_fp32_vec16(
 
 // RESIDUE_PER_8=8: full-R1 row pairs,
 // RESIDUE_PER_8=1/2/4: fixed selection per 8.
-template <class Type, int RESIDUE_PER_8>
+template <class Type, int RESIDUE_PER_8, bool SPLIT_K = false>
 __global__ void cvt_to_mxfp4_residue(Type const* input, int64_t rowStride,
     int64_t colStride, uint8_t const* masks, uint8_t* output, uint8_t* outputSF,
     int numRows, int numCols, int numTotalCols, int outputRows, int paddedRows,
-    bool swizzle, bool tile8, int pdlMode) {
+    bool swizzle, bool tile8, int pdlMode, int splitLog2 = 0) {
   // Trigger every CTA, including padding CTAs. The consumer must wait before
   // reading our outputs; this permits only its independent setup to overlap.
   if (pdlMode == 2 && threadIdx.x == 0) {
@@ -93,7 +94,14 @@ __global__ void cvt_to_mxfp4_residue(Type const* input, int64_t rowStride,
   }
   constexpr bool SELECTIVE = RESIDUE_PER_8 < 8;
   constexpr int FACTOR = RESIDUE_PER_8 == 8 ? 2 : 1;
-  int row = blockIdx.x;
+  int row = blockIdx.x, blockK = 0, kTiles = 1;
+  if constexpr (SPLIT_K) {
+    kTiles = 1 << splitLog2;
+    int validBlocks = numRows << splitLog2;
+    row = blockIdx.x < validBlocks ? blockIdx.x >> splitLog2
+                                  : numRows + blockIdx.x - validBlocks;
+    blockK = blockIdx.x < validBlocks ? blockIdx.x & (kTiles - 1) : 0;
+  }
   int laneId = threadIdx.x % 32;
   int layoutMode = tile8 ? 2 : 1;
   int outputRow = RESIDUE_PER_8 == 8
@@ -108,7 +116,7 @@ __global__ void cvt_to_mxfp4_residue(Type const* input, int64_t rowStride,
   int numOutputSfGroups = swizzle ? (numSfGroups + 3) / 4 * 4 : numSfGroups;
   // Clear only padding/invalid rows, never overwrite valid producer stores.
   for (int g = threadIdx.x; g < numOutputSfGroups; g += blockDim.x) {
-    if ((!valid || g >= numWrittenSfGroups) &&
+    if (blockK == 0 && (!valid || g >= numWrittenSfGroups) &&
         outputRow < (swizzle ? paddedRows : outputRows)) {
       outputSF[compute_tiled_sf_offset<uint8_t, 32>(
           outputRow, g, numTotalCols, swizzle)] = 0;
@@ -137,8 +145,8 @@ __global__ void cvt_to_mxfp4_residue(Type const* input, int64_t rowStride,
     }
     return;
   }
-  for (int tile = 0; tile < (numCols + blockDim.x * 16 - 1) / (blockDim.x * 16);
-      ++tile) {
+  for (int tile = blockK; tile < (numCols + blockDim.x * 16 - 1) / (blockDim.x * 16);
+      tile += kTiles) {
     int g = tile * blockDim.x + threadIdx.x;
     bool hasInput = g < numCols / 16;
     float original[16] = {}, v[16];
@@ -260,7 +268,7 @@ __global__ void cvt_to_mxfp4_residue(Type const* input, int64_t rowStride,
 template <class Type>
 void invokeMxfp4Quantization(torch::Tensor input, torch::Tensor output,
     torch::Tensor outputSF, uint8_t const* masks, int residuePer8,
-    bool swizzle, bool tile8, int pdlMode, cudaStream_t stream) {
+    bool swizzle, bool tile8, int pdlMode, int smCount, cudaStream_t stream) {
   int numRows = input.size(0), numCols = input.size(1),
       numTotalCols = output.size(1) * 2, outputRows = output.size(0);
   int paddedRows = swizzle ? (outputRows + 127) / 128 * 128 : outputRows;
@@ -272,26 +280,41 @@ void invokeMxfp4Quantization(torch::Tensor input, torch::Tensor output,
                     (numCols == 4096 || numCols == 8192))
                     ? numCols / 16
                     : 128;
+  // Fill two waves of SMs when rows alone leave the GPU underoccupied.
+  // Split only full residue; padding rows keep one CTA each. Powers of two
+  // make the valid-row/K mapping a shift and mask instead of integer division.
+  int splitLog2 = 0;
+  int kIterations = (numCols + threads * 16 - 1) / (threads * 16);
+  if (!masks) {
+    while ((numRows << splitLog2) < 2 * smCount &&
+           (1 << splitLog2) < kIterations) {
+      ++splitLog2;
+    }
+  }
+  grid.x += numRows * ((1 << splitLog2) - 1);
   auto p = reinterpret_cast<Type const*>(input.data_ptr());
-#define LAUNCH(RESIDUE_PER_8)                                                \
-  cvt_to_mxfp4_residue<Type, RESIDUE_PER_8><<<grid, threads, 0, stream>>>(p, \
-      input.stride(0), input.stride(1), masks, output.data_ptr<uint8_t>(),   \
-      outputSF.data_ptr<uint8_t>(), numRows, numCols, numTotalCols,          \
-      outputRows, paddedRows, swizzle, tile8, pdlMode)
+#define LAUNCH(RESIDUE_PER_8, SPLIT_K)                                      \
+  cvt_to_mxfp4_residue<Type, RESIDUE_PER_8, SPLIT_K>                        \
+      <<<grid, threads, 0, stream>>>(p,                                     \
+      input.stride(0), input.stride(1), masks, output.data_ptr<uint8_t>(),  \
+      outputSF.data_ptr<uint8_t>(), numRows, numCols, numTotalCols,         \
+      outputRows, paddedRows, swizzle, tile8, pdlMode, splitLog2)
   if (masks) {
     switch (residuePer8) {
       case 1:
-        LAUNCH(1);
+        LAUNCH(1, false);
         break;
       case 2:
-        LAUNCH(2);
+        LAUNCH(2, false);
         break;
       case 4:
-        LAUNCH(4);
+        LAUNCH(4, false);
         break;
     }
+  } else if (splitLog2) {
+    LAUNCH(8, true);
   } else {
-    LAUNCH(8);
+    LAUNCH(8, false);
   }
 #undef LAUNCH
 }
@@ -352,14 +375,10 @@ void mxfp4_residue_quant(torch::Tensor input, torch::Tensor output,
   }
   auto stream = at::cuda::getCurrentCUDAStream();
   auto maskPtr = masks ? masks->data_ptr<uint8_t>() : nullptr;
-#define DTYPE(Type)                                                            \
-  invokeMxfp4Quantization<Type>(input, output, outputSF, maskPtr, residuePer8, \
-      swizzle, tile8, pdlMode, stream)
-  if (input.scalar_type() == at::kHalf) {
-    DTYPE(half);
-  } else {
-    DTYPE(__nv_bfloat16);
-  }
-#undef DTYPE
+  VLLM_DISPATCH_HALF_TYPES(input.scalar_type(), "mxfp4_residue_quant", [&] {
+    using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
+    invokeMxfp4Quantization<cuda_type>(input, output, outputSF, maskPtr,
+        residuePer8, swizzle, tile8, pdlMode, prop->multiProcessorCount, stream);
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
