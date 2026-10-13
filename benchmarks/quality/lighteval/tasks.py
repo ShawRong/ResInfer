@@ -7,12 +7,13 @@ import os
 from pathlib import Path
 from string import ascii_uppercase
 
-from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.requests import Doc
-from lighteval.tasks.tasks.aime import aime24_avg, aime25_avg
+from benchmarks.quality.lighteval.aime import (
+    aime24_avg, aime25_avg, aime24_avg8, aime25_avg8,
+)
 from lighteval.tasks.tasks.gpqa import gpqa_diamond_instruct
 
-from benchmarks.quality.gpqa_deterministic import ordered_answers
+from benchmarks.quality.lighteval.gpqa import ordered_answers
 
 
 def _data_root() -> Path:
@@ -64,15 +65,9 @@ aime24_avg_local = replace(
 aime25_avg_local = replace(
     aime25_avg, name="aime25_avg_local", hf_repo=str(DATA_ROOT / "aime25"))
 aime24_avg8_local = replace(
-    aime24_avg_local,
-    name="aime24_avg8_local",
-    metrics=[Metrics.avg_at_n_math(sample_params={"n": 8})],
-)
+    aime24_avg8, name="aime24_avg8_local", hf_repo=str(DATA_ROOT / "aime24"))
 aime25_avg8_local = replace(
-    aime25_avg_local,
-    name="aime25_avg8_local",
-    metrics=[Metrics.avg_at_n_math(sample_params={"n": 8})],
-)
+    aime25_avg8, name="aime25_avg8_local", hf_repo=str(DATA_ROOT / "aime25"))
 gpqa_diamond_local = replace(
     gpqa_diamond_instruct,
     name="gpqa_diamond_local",

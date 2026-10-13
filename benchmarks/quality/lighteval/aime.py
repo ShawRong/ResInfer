@@ -1,7 +1,4 @@
-# Copied verbatim from the paper tree:
-#   the paper tree's archived eval helpers (internal)
-# lighteval 0.13.0 ships avg@n only at the upstream n=64; there is no native avg@8 variant.
-'Custom lighteval tasks: aime24_avg8 / aime25_avg8 (n=8 variant).'
+"""Upstream AIME tasks plus explicit avg@8 variants (upstream uses avg@64)."""
 from dataclasses import replace
 
 from lighteval.metrics.metrics import Metrics

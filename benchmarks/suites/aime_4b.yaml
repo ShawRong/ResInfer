@@ -58,6 +58,13 @@ n_problems: 60
 # has been probing trace stability with a mean-only metric.
 stability_tasks: "lighteval|aime24_gpassk|0,lighteval|aime25_gpassk|0"
 
+# Explicit Qwen3 protocol; do not reuse this manifest for Qwen3.5.
+model_type: qwen3
+protocol_source: https://huggingface.co/Qwen/Qwen3-4B#best-practices
+enable_thinking: true
+min_p: 0.0
+presence_penalty: 0.0
+repetition_penalty: 1.0
 temperature: 0.6          # Qwen3 defaults; identical across every arm
 top_p: 0.95
 top_k: 20
