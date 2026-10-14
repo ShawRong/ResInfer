@@ -1,0 +1,31 @@
+{
+  "commit": "28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24",
+  "patch": "stdio-comparator-and-prompt-paths-v1",
+  "files": {
+    "lcb_runner/benchmarks/__init__.py": "0837c4a42b027fe479d12165affe91214b6b180c90245129d0ac0822c74dbfea",
+    "lcb_runner/benchmarks/code_execution.py": "b891e798b34b40c32fcfbaedf683c714937f5e10014864e5fd7f3b9c9f6b077f",
+    "lcb_runner/benchmarks/code_generation.py": "0bc93f5a650b55d6a1b54d3db852d80ae64891ece4ff085b2e6b469eb89f8846",
+    "lcb_runner/benchmarks/test_output_prediction.py": "2493f00ae1841d0997f5a35632c3d447a189c68641d636bdaa4e91d16bd30d05",
+    "lcb_runner/evaluation/__init__.py": "828043d1f71e4120ac51be23f90001fd850bf6ef186a420979d76828ec909057",
+    "lcb_runner/evaluation/compute_code_execution_metrics.py": "e63b6d29f12cc5206fd146b616312f305b8903b6459014d7bc6d51dfd6335980",
+    "lcb_runner/evaluation/compute_code_generation_metrics.py": "073f388cc78bf0eb0ad35eaeb8bb509c0a3664963e5305d2be13d6b6eb6f3d21",
+    "lcb_runner/evaluation/compute_scores.py": "b6272b78588f0cafc8abe3529a8aa7a6e9eed282eef5ea20da4e4187a4918531",
+    "lcb_runner/evaluation/compute_test_output_prediction_metrics.py": "ec415d3207d8fbc04e8280ef091437d3a22e895b362e5557929f003e543a4653",
+    "lcb_runner/evaluation/old_results_check.py": "ce0e22ab130888d8d286e499a7b4dbf3df453afd8b8df85183bd3a4ef455abb0",
+    "lcb_runner/evaluation/pass_k_utils.py": "6af3ee55d40f96fa06fa511bd5e43d94b19604750e82454b4b3c1f45c5199010",
+    "lcb_runner/evaluation/testing_util.py": "e5947728dccf9b80e950c5a64da4b7247b35fd87c93173c8ab11e7d05cc61805",
+    "lcb_runner/evaluation/utils_execute.py": "fb86e4c0834ccedd3f057006410909aeb79d9970db54838a9bed79d7039624fa",
+    "lcb_runner/lm_styles.py": "57d645b09852d2030d389cf9a14ea818396b7b0510b3e2f3f22e3d3e6792b783",
+    "lcb_runner/prompts/__init__.py": "a43744d5d0cf8da78b7a3fab35e33e0967f03125bd607be2f24a09e3e5c1ff00",
+    "lcb_runner/prompts/code_execution.py": "5e4a1095ce393c3e298f25bcd2f2b6caa6cd5e2bf3e9b6dda91d689669ce830e",
+    "lcb_runner/prompts/code_generation.py": "37d56ee9deb3e6ef194a831c1ecf50d05d927c60a5bb9cdee97c4797f5decd95",
+    "lcb_runner/prompts/self_repair.py": "4a677c7f54469a3ea920c95c6fe00aeb639693a25d8d79dc5864a9b043424cb0",
+    "lcb_runner/prompts/test_output_prediction.py": "3b0d2274a50f1f7bbd186c2945b0d4a8571bcf48469462b166fcfdce1273888e",
+    "lcb_runner/utils/extraction_utils.py": "1267d1724c6d4ea6d237b907dd6b53dfc6f1787a04b1616b85c3bc8377446879",
+    "lcb_runner/utils/multiprocess.py": "13ad73a5b547acb41fc47192d34e836fc83e45abec6dde66b7744142638026b8",
+    "lcb_runner/utils/path_utils.py": "48206191fef7c52e8e3d6343863642a89d265488b2e3475efce7e597f5ab08ca",
+    "lcb_runner/utils/scenarios.py": "3ff5d147fa6f56fde85e881a5ca359f502f983e8023f9a42cf87ff5043e263fc",
+    "lcb_runner/prompts/few_shot_examples/generation/func.json": "75b50ffef185c71aa702499b015da50b03d7732195332186c759dfa0304bf1aa",
+    "lcb_runner/prompts/few_shot_examples/generation/stdin.json": "28a3a50b79869aa9cc5cc2e3c611c8b39e1ab2d192f6b2b9ce0f6a4b014ee726"
+  }
+}

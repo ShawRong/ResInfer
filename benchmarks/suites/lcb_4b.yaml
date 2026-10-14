@@ -1,83 +1,29 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-name: lcb_4b
+# Official audited LiveCodeBench release_v6; new protocol, historical scores unchanged.
+# Qwen3-4B weight comparison. Validate batching and the full generation budget first.
+# The reference is the original model; deltas include GPTQ + NVFP4 effects.
+# orig_bf16 and gptq_bf16 are distinct checkpoints. Plain uses a separate export.
+name: lcb_4b_official_v6
 venue: lcb
-
-task: "lighteval|lcb:codegeneration_release_v6|0"
+benchmark: lcb
+release_version: release_v6
 n_prompts: 1055
-metric: pass@1:16
-temperature: 0.6          # Qwen3 defaults; identical across every arm
+metric: pass@1
+num_samples: 16
+model_type: qwen3
+protocol_source: https://huggingface.co/Qwen/Qwen3-4B#best-practices
+enable_thinking: true
+min_p: 0.0
+presence_penalty: 0.0
+repetition_penalty: 1.0
+temperature: 0.6
 top_p: 0.95
 top_k: 20
 max_new_tokens: 32768
 max_model_len: 40960
 seed: 42
-# Run-scoped, always. A cache hit REPLAYS an older run's generations: both
-# stages start, zero tokens generate, and the case "finishes" in minutes with
-# nothing in the json to say so. The key sees only an HTTP endpoint, so arms
-# differing purely in server-side RESIDUE_* env collide.
-cache_dir: per-run
-
-reference: orig_bf16   
-                       
-                       
-                       
-                       
-                       
-                       
-                       
-                       
+reference: orig_bf16
 baseline: plain
-
 arms:
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
   - id: gptq_bf16
     path: base_gptq_bf16
     kind: fp16
@@ -87,8 +33,6 @@ arms:
   - id: plain
     path: plain
     kind: modelopt_fp4
-  # Kept, renamed, and demoted to what it actually is: mechanism isolation on
-  # one checkpoint, never the floor.
   - id: plain_runtime_off
     path: uniform_r0125
     kind: residue
@@ -109,11 +53,6 @@ arms:
     path: uniform_r10
     kind: residue
     mext: "on"
-  # The solver's allocations at the SAME budgets as the uniform ladder above.
-  # Equal budget verified by pricing the EXPORTED checkpoints with one cost
-  # model (auto_search.cost), not by trusting the labels: the four pairs came
-  # out within 0.003 effective bits of each other, with the solver side
-  # slightly LOWER -- so a solver win cannot be bought with extra budget.
   - id: solver_b4p5
     path: solver_b4p5
     kind: residue
@@ -130,12 +69,5 @@ arms:
     path: solver_b8
     kind: residue
     mext: "on"
-
-
-
-
-
-
-
 calibration_recipe: nemotron_sft_n1024_seq2048_seed42_activation_max
-recipe_fingerprint: 7bf7ffff68af72b8   # analyze refuses arms that disagree
+recipe_fingerprint: 7bf7ffff68af72b8

@@ -1,0 +1,51 @@
+--- a/lcb_runner/evaluation/testing_util.py
++++ b/lcb_runner/evaluation/testing_util.py
+@@ -307,6 +307,9 @@
+     return all_results, {"execution time": total_execution}
+ 
+ 
++OUTPUT_COMPARATOR = None  # Optional task-scoped audited comparator.
++
++
+ def grade_stdio(
+     code: str,
+     all_inputs: list,
+@@ -369,6 +372,17 @@
+ 
+         prediction = captured_output[0]
+ 
++        if OUTPUT_COMPARATOR is not None:
++            ok, reason = OUTPUT_COMPARATOR(gt_inp, prediction, gt_out)
++            all_results.append(True if ok else -2)
++            if not ok:
++                return all_results, {
++                    "error_code": -2, "error_message": "Semantic: " + reason,
++                    "test_index": idx, "output": truncatefn(prediction),
++                    "inputs": truncatefn(gt_inp), "expected": truncatefn(gt_out),
++                }
++            continue
++
+         stripped_prediction_lines = get_stripped_lines(prediction)
+         stripped_gt_out_lines = get_stripped_lines(gt_out)
+ 
+--- a/lcb_runner/prompts/code_generation.py
++++ b/lcb_runner/prompts/code_generation.py
+@@ -1,4 +1,5 @@
+ import json
++from pathlib import Path
+ 
+ try:
+     from anthropic import HUMAN_PROMPT, AI_PROMPT
+@@ -166,10 +167,10 @@
+     return prompt
+ 
+ 
+-with open("lcb_runner/prompts/few_shot_examples/generation/func.json") as f:
++with open(Path(__file__).parent / "few_shot_examples/generation/func.json") as f:
+     func = json.load(f)
+ 
+-with open("lcb_runner/prompts/few_shot_examples/generation/stdin.json") as f:
++with open(Path(__file__).parent / "few_shot_examples/generation/stdin.json") as f:
+     stdin = json.load(f)
+ 
+ 
