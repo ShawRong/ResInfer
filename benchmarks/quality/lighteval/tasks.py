@@ -21,13 +21,7 @@ def _data_root() -> Path:
     if not value:
         raise RuntimeError(
             "RESINFER_EVAL_DATA_ROOT must point to the staged AIME/GPQA bundle")
-    root = Path(value).expanduser().resolve()
-    missing = [name for name in ("aime24", "aime25", "gpqa")
-               if not (root / name).is_dir()]
-    if missing:
-        raise RuntimeError(
-            f"offline dataset root {root} is missing: {', '.join(missing)}")
-    return root
+    return Path(value).expanduser().resolve()
 
 
 def gpqa_instruct_prompt_deterministic(line, task_name=None):

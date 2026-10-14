@@ -6,7 +6,7 @@ import os
 import pathlib
 import sys
 
-from benchmarks.engine_config import accuracy_engine_config, load_engine_config, merge_engine_config
+from benchmarks.engine_config import accuracy_engine_config, load_engine_config
 
 
 def install_env(a):
@@ -27,7 +27,7 @@ def install_env(a):
         raise ValueError("--bf16 cannot be combined with --quantization")
     mxfp4 = quantization == "modelopt_mxfp4"
     if mxfp4 and any(getattr(a, key, False) for key in (
-            "prefill_residue_off", "residue_off", "decode_mext_off", "prefill_only")):
+            "prefill_residue_off", "residue_off", "prefill_only")):
         raise ValueError("MXFP4 phase ablations have not been validated by this runner")
     os.environ["RESIDUE_MXFP4"] = "1" if mxfp4 else "0"
     if mxfp4:
@@ -52,11 +52,6 @@ def install_env(a):
         for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
             if os.environ.pop(var, None) is not None:
                 print(f"[kit] dropped {var}: incompatible with a residue arm")
-    if getattr(a, "decode_mext_off", False):
-        raise SystemExit(
-            "--decode-mext-off is not implementable today. RESIDUE_ENABLE_DECODE_MEXT=0\n"
-            "breaks weight loading (KeyError 'weight_scale_base', vLLM 0.26) and\n"
-            "RESIDUE_DECODE_MEXT_MAX_M=0 silently keeps residue on. See install_env().")
     if getattr(a, "prefill_residue_off", False) or getattr(a, "residue_off", False):
         if a.plain:
             raise SystemExit("--prefill-residue-off is meaningless with --plain/--bf16")
@@ -115,7 +110,7 @@ def quality_quantization(a):
 
 
 def pinned_engine_kwargs(a, max_model_len: int) -> dict:
-    """Legacy defaults < shared JSON < explicit compilation diagnostics."""
+    """Apply shared engine JSON over the runner's defaults."""
     short = getattr(a, "cmd", None) == "task" or getattr(a, "_venue", "") == "task"
     base = dict(
         enforce_eager=bool(getattr(a, "enforce_eager", False)),
@@ -126,18 +121,7 @@ def pinned_engine_kwargs(a, max_model_len: int) -> dict:
         seed=a.seed, max_model_len=max_model_len,
         gpu_memory_utilization=a.gpu_mem_util, max_num_seqs=a.max_num_seqs,
     )
-    config = accuracy_engine_config(base, load_engine_config(getattr(a, "engine_config", None)))
-    compilation = {}
-    if getattr(a, "cudagraph_mode", ""):
-        compilation["cudagraph_mode"] = a.cudagraph_mode
-    if getattr(a, "compile_mode", ""):
-        compilation["mode"] = a.compile_mode
-    if getattr(a, "inductor_config", ""):
-        value = json.loads(a.inductor_config)
-        if not isinstance(value, dict):
-            raise ValueError("--inductor-config must be a JSON object")
-        compilation["inductor_compile_config"] = value
-    return merge_engine_config(config, {"compilation_config": compilation})
+    return accuracy_engine_config(base, load_engine_config(getattr(a, "engine_config", None)))
 
 
 def write_effective_engine_config(llm, a):
@@ -219,8 +203,6 @@ def add_runtime_arguments(parser):
     parser.add_argument("--mext-max-m", type=int, default=64)
     for flag in ("bf16", "plain", "prefill-residue-off", "residue-off"):
         parser.add_argument("--" + flag, action="store_true")
-    parser.add_argument("--decode-mext-off", action="store_true",
-                        help="unsupported: disabling the extended-K loader prevents weight loading")
     parser.add_argument("--flashinfer-autotune", action="store_true",
                         help="enable FlashInfer autotuning (default: disabled)")
     parser.add_argument("--engine-config", help="JSON vLLM kwargs; overrides legacy engine flags")

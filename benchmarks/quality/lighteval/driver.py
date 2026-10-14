@@ -29,7 +29,6 @@ SERVING_PYTHON = REPO / ".venv" / "bin" / "python"
 _SERVERS: list[subprocess.Popen] = []
 
 
-# ----------------------------------------------------------- process plumbing
 def teardown() -> None:
     for proc in _SERVERS:
         if proc.poll() is None:
@@ -85,7 +84,6 @@ def write_json(path: pathlib.Path, payload) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
-# ------------------------------------------------------------- server side
 def build_server_env(arm: dict, a, case_out: pathlib.Path) -> dict:
     env = os.environ.copy()
     strip_proxies(env)
@@ -148,14 +146,12 @@ def build_server_cmd(arm: dict, man: dict, a, port: int) -> list[str]:
            "--generation-config", "vllm",
            "--compilation-config", json.dumps(accuracy_engine_config({}, {})["compilation_config"]),
            "--default-chat-template-kwargs", json.dumps(template_kwargs),
-           # enforce_eager stays False (knob 1: non-eager is the standard).
-           "--seed", str(man["seed"]),                          # knob 4
-           "--max-model-len", str(man["max_model_len"]),        # knob 6
-           # Match batching across comparison arms.
+           "--seed", str(man["seed"]),
+           "--max-model-len", str(man["max_model_len"]),
            "--max-num-batched-tokens", str(a.max_num_batched_tokens),
-           "--max-num-seqs", str(a.max_num_seqs),               # knob 10
-           "--gpu-memory-utilization", str(a.gpu_mem_util),     # knob 7
-           "--no-enable-flashinfer-autotune"]                   # knob 3
+           "--max-num-seqs", str(a.max_num_seqs),
+           "--gpu-memory-utilization", str(a.gpu_mem_util),
+           "--no-enable-flashinfer-autotune"]
     if arm["kind"] in ("residue", "modelopt_fp4"):
         cmd += ["--quantization", "modelopt_fp4"]
     return cmd
@@ -231,11 +227,8 @@ print("RESINFER_PREFLIGHT_JSON=" + json.dumps(payload, sort_keys=True))
     return payload
 
 
-# ---------------------------------------------------------------- the gates
 def mext_resolved_gate(server_log: pathlib.Path, arm: dict) -> str | None:
-    """Delta 4: confirm the RESOLVED mode in the server log after the server
-    is up and BEFORE the first prompt. Returns an error string naming
-    expected vs found, or None when confirmed."""
+    """Check the resolved residue mode before sending the first prompt."""
     text = server_log.read_text(errors="ignore") if server_log.is_file() else ""
     resolved = [ln for ln in text.splitlines()
                 if "[residue:env]" in ln and "mode=" in ln
@@ -281,10 +274,6 @@ def generation_provenance(server_log: pathlib.Path, server_env: dict) -> dict:
             "decode_throughput_lines": served, "runtime_env": env_fp}
 
 
-# ------------------------------------------------------------- scorer side
-
-
-
 def sampling_parameters(man: dict) -> dict:
     """One explicit protocol for scorer requests and provenance."""
     return {key: man[key] for key in SAMPLING_FIELDS}
@@ -292,7 +281,7 @@ def sampling_parameters(man: dict) -> dict:
 
 def write_lighteval_config(arm: dict, man: dict, a, port: int,
                            case_out: pathlib.Path,
-                           cache_dir: pathlib.Path | None) -> pathlib.Path:
+                           cache_dir: pathlib.Path) -> pathlib.Path:
     import yaml
 
     # model_name='openai/<path>': litellm sends everything after 'openai/' as
@@ -308,14 +297,9 @@ def write_lighteval_config(arm: dict, man: dict, a, port: int,
         "generation_parameters": sampling_parameters(man),
     }
 
-    if cache_dir is not None:
-        # Delta 2: run-scoped, per case. Per CASE and not per run because this
-        # manifest's floor arm shares a model path with a method arm -- with
-        # one shared dir the second of the two would replay the first
-        # (lighteval-cache.md rule 1: per-arm is REQUIRED when arms share a
-        # model path).
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        model_parameters["cache_dir"] = str(cache_dir)
+    # Arms sharing a checkpoint still need separate generation caches.
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    model_parameters["cache_dir"] = str(cache_dir)
     cfg_path = case_out / "lighteval_model_args.yaml"
     cfg_path.write_text(yaml.safe_dump({"model_parameters": model_parameters},
                                        sort_keys=False))
@@ -441,7 +425,6 @@ print("lighteval offline preflight passed")
             f"lighteval offline preflight exited {result.returncode}; see {log_path}")
 
 
-# ------------------------------------------------------------------ one case
 def git_head() -> str | None:
     try:
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(REPO),
@@ -453,8 +436,6 @@ def git_head() -> str | None:
 
 def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict]:
     """One arm end to end. Returns (status, results)."""
-    if a.global_cache:
-        raise ValueError("Shared generation caches are unsupported; use a fresh per-arm cache")
     case_out = out_root / arm["id"]
     if case_out.exists() and any(case_out.iterdir()):
         raise ValueError(f"Nonempty experiment directory: {case_out}; choose a new --out")
@@ -474,7 +455,6 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     try:
         server_preflight = preflight_server(arm, env, case_out)
         launch_server(cmd, env, case_out, port, a.ready_timeout_sec)
-        # Delta 4: the pre-gate runs after health and before the first prompt.
         if arm["kind"] == "residue":
             problem = mext_resolved_gate(server_log, arm)
             if problem:
@@ -502,7 +482,7 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
         "server_preflight": server_preflight,
         "resolved_mode": resolved_line,
         "runtime_env": prov["runtime_env"],
-        "cache_dir": str(cache_dir) if cache_dir else "GLOBAL (opted out)",
+        "cache_dir": str(cache_dir),
         "decode_throughput_lines": prov["decode_throughput_lines"],
         "generated": prov["generated"], "cache_replay": prov["cache_replay"],
         "wall_time_sec": round(wall, 1),
@@ -537,7 +517,6 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     return status, results
 
 
-# ----------------------------------------------------------------------- main
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
         description="Single-server AIME/GPQA driver; see benchmarks/quality/lighteval/README.md.")
@@ -566,17 +545,12 @@ def parse_args() -> argparse.Namespace:
                          "benchmarks/quality/lighteval/tasks.py")
     ap.add_argument("--nltk-data", default=os.environ.get("NLTK_DATA"),
                     help="pre-staged NLTK data directory for offline scoring")
-    ap.add_argument("--global-cache", action="store_true",
-                    help="OPT OUT of the run-scoped lighteval cache (hazard!)")
     ap.add_argument("--max-samples", type=int, default=None,
                     help="debug only: score the first N samples")
-    ap.add_argument("--save-details", action="store_true")
-    # Determinism knobs -- pinned defaults; identical across every arm of a
-    # table by construction, since one driver invocation runs the whole table.
     ap.add_argument("--max-num-batched-tokens", type=int, default=2048,
-                    help="knob 2, pinned (historical short-prompt value)")
+                    help="vLLM scheduler token budget per iteration")
     ap.add_argument("--max-num-seqs", type=int, default=64,
-                    help="knob 10, pinned (the paper LCB harness value)")
+                    help="maximum concurrent sequences in vLLM")
     ap.add_argument("--gpu-mem-util", type=float, default=0.85)
     ap.add_argument("--concurrent-requests", type=int, default=64)
     ap.add_argument("--request-timeout", type=float, default=6000.0)
@@ -593,8 +567,6 @@ def main() -> int:
     out_root = pathlib.Path(a.out).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
 
-    if a.global_cache:
-        raise ValueError("--global-cache is unsupported; use fresh per-arm outputs")
     signal.signal(signal.SIGTERM, on_signal)
     signal.signal(signal.SIGINT, on_signal)
 

@@ -35,8 +35,7 @@ def scored_rows(result, task):
                               'arguments': sample['arguments'],
                               'protocol': f'lm-eval-{VERSION}:{metric}:{selected_filter}'})
         rows.append({'item_id': item_id, 'score': value, 'metric': metric,
-                     'filter': selected_filter, 'protocol': f'lm-eval-{VERSION}',
-                     'sample': sample})
+                     'filter': selected_filter, 'protocol': f'lm-eval-{VERSION}'})
     if not math.isfinite(aggregate) or not math.isclose(
             aggregate, sum(r['score'] for r in rows) / expected, abs_tol=1e-8):
         raise ValueError(f'{task}: aggregate disagrees with saved samples')
