@@ -1,0 +1,13 @@
+{
+  "url": "https://github.com/THUDM/LongBench.git",
+  "commit": "2e00731f8d0bff23dc4325161044d0ed8af94c1e",
+  "files": {
+    "pred.py": "ab63f77866a1c0dc770582bc3fe6b014c3b4be4667399b0ee267075780c6a138",
+    "result.py": "b6675c1c0b72090c01e12c94d3b176c4991fe38ceed9a301d24d22b1997465bd",
+    "prompts/0shot.txt": "68a162252bc9ff71d5d7abca3d69bb31aac3c35f832d657a2866f2018b8a6950",
+    "prompts/0shot_cot.txt": "6cc33d92fd8f611662b756c1f10f302c541ca005b58c46d5f3188ac3a939bfe8",
+    "prompts/0shot_cot_ans.txt": "85ec59df4ac0e27aabbc619a7ca5cf3ae1787dd5a76cf51a18944eb52c91955f",
+    "prompts/0shot_rag.txt": "5c50ce4fa24d297b8c72eb048599681ee01ced5d24a6636464386d6d3c72c4c9",
+    "prompts/0shot_no_context.txt": "125fb44183af01ffc623df19392b80a287db62af3e2a2805e5b2ff9c7b2bee30"
+  }
+}

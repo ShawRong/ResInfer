@@ -1,0 +1,168 @@
+--- a/pred.py
++++ b/pred.py
+@@ -2,18 +2,18 @@
+ import argparse
+ import time
+ from tqdm import tqdm
+-from datasets import load_dataset
+ import re
+ from openai import OpenAI
+ from transformers import AutoTokenizer
+ import tiktoken
+-import torch.multiprocessing as mp
++import multiprocessing as mp
+ 
+-model_map = json.loads(open('config/model2path.json', encoding='utf-8').read())
+-maxlen_map = json.loads(open('config/model2maxlen.json', encoding='utf-8').read())
+-
+-URL = "http://127.0.0.1:8000/v1"
+-API_KEY = "token-abc123"
++settings = json.loads(open(os.environ["LONGBENCH_CONFIG"], encoding="utf-8").read())
++model_map = {"eval": settings["tokenizer"]}
++maxlen_map = {"eval": settings["max_input_tokens"]}
++URL = os.environ["OPENAI_BASE_URL"]
++API_KEY = os.environ.get("OPENAI_API_KEY", "EMPTY")
++request_records = []
+ template_rag = open('prompts/0shot_rag.txt', encoding='utf-8').read()
+ template_no_context = open('prompts/0shot_no_context.txt', encoding='utf-8').read()
+ template_0shot = open('prompts/0shot.txt', encoding='utf-8').read()
+@@ -39,21 +39,23 @@
+     while tries < 5:
+         tries += 1
+         try:
+-            completion = client.chat.completions.create(
+-                model=model,
++            request = dict(
++                model=settings["served_model"],
+                 messages=[{"role": "user", "content": prompt}],
+                 temperature=temperature,
+                 max_tokens=max_new_tokens,
++                extra_body=settings["request_body"],
+             )
++            completion = client.chat.completions.create(**request)
++            request_records.append({"request": request, "response": completion.model_dump()})
+             return completion.choices[0].message.content
+         except KeyboardInterrupt as e:
+             raise e
+         except Exception as e:
+-            print("Error Occurs: \"%s\"        Retry ..."%(str(e)))
++            print("Request failed:", type(e).__name__, "Retry ...")
+             time.sleep(1)
+     else:
+-        print("Max tries. Failed.")
+-        return ''
++        raise RuntimeError("Request failed after five attempts")
+ 
+ def extract_answer(response):
+     response = response.replace('*', '')
+@@ -67,7 +69,7 @@
+         else:
+             return None
+ 
+-def get_pred(data, args, fout):
++def get_pred(data, args, fout, lock):
+     model = args.model
+     if "gpt" in model or "o1" in model:
+         tokenizer = tiktoken.encoding_for_model("gpt-4o-2024-08-06")
+@@ -75,9 +77,10 @@
+         tokenizer = AutoTokenizer.from_pretrained(model_map[model], trust_remote_code=True)
+     client = OpenAI(
+         base_url=URL,
+-        api_key=API_KEY
++        api_key=API_KEY, timeout=600, max_retries=0,
+     )
+     for item in tqdm(data):
++        request_records.clear()
+         context = item['context']
+         if args.rag > 0:
+             template = template_rag
+@@ -95,22 +98,23 @@
+             output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=1024)
+         else:
+             output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+-        if output == '':
+-            continue
++        if not output:
++            raise RuntimeError(f"Empty response for {item['_id']}")
+         if args.cot: # extract answer
+             response = output.strip()
+             item['response_cot'] = response
+             prompt = template_0shot_cot_ans.replace('$DOC$', context.strip()).replace('$Q$', item['question'].strip()).replace('$C_A$', item['choice_A'].strip()).replace('$C_B$', item['choice_B'].strip()).replace('$C_C$', item['choice_C'].strip()).replace('$C_D$', item['choice_D'].strip()).replace('$COT$', response)
+             output = query_llm(prompt, model, tokenizer, client, temperature=0.1, max_new_tokens=128)
+-            if output == '':
+-                continue
++            if not output:
++                raise RuntimeError(f"Empty answer extraction for {item['_id']}")
+         response = output.strip()
+         item['response'] = response
+         item['pred'] = extract_answer(response)
+         item['judge'] = item['pred'] == item['answer']
+         item['context'] = context[:1000]
+-        fout.write(json.dumps(item, ensure_ascii=False) + '\n')
+-        fout.flush()
++        item['requests'] = list(request_records)
++        with lock, open(fout, 'a', encoding='utf-8') as stream:
++            stream.write(json.dumps(item, ensure_ascii=False) + '\n')
+ 
+ def main():
+     os.makedirs(args.save_dir, exist_ok=True)
+@@ -124,7 +128,7 @@
+     else:
+         out_file = os.path.join(args.save_dir, args.model.split("/")[-1] + ".jsonl")
+ 
+-    dataset = load_dataset('THUDM/LongBench-v2', split='train') # dataset = json.load(open('data.json', 'r', encoding='utf-8'))
++    dataset = json.load(open(os.environ['LONGBENCH_DATA'], encoding='utf-8'))
+     data_all = [{"_id": item["_id"], "domain": item["domain"], "sub_domain": item["sub_domain"], "difficulty": item["difficulty"], "length": item["length"], "question": item["question"], "choice_A": item["choice_A"], "choice_B": item["choice_B"], "choice_C": item["choice_C"], "choice_D": item["choice_D"], "answer": item["answer"], "context": item["context"]} for item in dataset]
+ 
+     # cache
+@@ -132,7 +136,8 @@
+     if os.path.exists(out_file):
+         with open(out_file, encoding='utf-8') as f:
+             has_data = {json.loads(line)["_id"]: 0 for line in f}
+-    fout = open(out_file, 'a', encoding='utf-8')
++    fout = out_file
++    lock = mp.Lock()
+     data = []
+     for item in data_all:
+         if item["_id"] not in has_data:
+@@ -141,11 +146,13 @@
+     data_subsets = [data[i::args.n_proc] for i in range(args.n_proc)]
+     processes = []
+     for rank in range(args.n_proc):
+-        p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout))
++        p = mp.Process(target=get_pred, args=(data_subsets[rank], args, fout, lock))
+         p.start()
+         processes.append(p)
+     for p in processes:
+         p.join()
++    if any(p.exitcode != 0 for p in processes):
++        raise RuntimeError("LongBench generation worker failed")
+ 
+ if __name__ == "__main__":
+     parser = argparse.ArgumentParser()
+--- a/result.py
++++ b/result.py
+@@ -4,10 +4,15 @@
+ output = ["Model\tOverall\tEasy\tHard\tShort\tMedium\tLong"]
+ compensated = False
+ 
++def percent(correct, total):
++    return str(round(100 * correct / total, 1)) if total else "NA"
++
+ for file in files:
+     filename = os.path.join('results', file)
+     try:
+         pred_data = json.load(open(filename, encoding='utf-8'))
++        if isinstance(pred_data, dict):
++            pred_data = [pred_data]
+     except Exception as e:
+         pred_data = [json.loads(line) for line in open(filename, encoding='utf-8')]
+     easy, hard, short, medium, long = 0, 0, 0, 0, 0
+@@ -34,6 +39,6 @@
+             long_acc += acc
+ 
+     name = '.'.join(file.split('.')[:-1])
+-    output.append(name+'\t'+str(round(100*(easy_acc+hard_acc)/len(pred_data), 1))+'\t'+str(round(100*easy_acc/easy, 1))+'\t'+str(round(100*hard_acc/hard, 1))+'\t'+str(round(100*short_acc/short, 1))+'\t'+str(round(100*medium_acc/medium, 1))+'\t'+str(round(100*long_acc/long, 1)))
++    output.append(name+'\t'+percent((easy_acc+hard_acc), len(pred_data))+'\t'+percent(easy_acc, easy)+'\t'+percent(hard_acc, hard)+'\t'+percent(short_acc, short)+'\t'+percent(medium_acc, medium)+'\t'+percent(long_acc, long))
+ 
+ open('result.txt', 'w', encoding='utf-8').write('\n'.join(output))

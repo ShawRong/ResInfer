@@ -1,0 +1,17 @@
+{
+  "served_model": "resinfer-eval",
+  "tokenizer": "/local/checkpoints/model",
+  "max_input_tokens": 30000,
+  "concurrency": 4,
+  "cot": false,
+  "request_body": {
+    "seed": 42,
+    "top_p": 1.0,
+    "top_k": -1,
+    "min_p": 0.0,
+    "presence_penalty": 0.0,
+    "frequency_penalty": 0.0,
+    "repetition_penalty": 1.0,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }
+}
