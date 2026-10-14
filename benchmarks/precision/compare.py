@@ -47,7 +47,9 @@ def compare_attention(
     ref = attention(q, k, v, self.scale)
     full = attention(q, rawk, rawv, self.scale)
     ref64 = attention(q, k, v, self.scale, torch.float64)
-    assert metrics(ref, ref64)["nmse"] < 1e-9
+    reference_metrics = metrics(ref, ref64)
+    nmse = reference_metrics["nmse"]
+    assert nmse is not None and nmse < 1e-9
     ids = md.decode.block_tables[0, : (length + 127) // 128].long()
     buffers = [pool.k_data, pool.k_sf, pool.v_data, pool.v_sf]
     before = [x[ids].clone() for x in buffers]
@@ -86,7 +88,7 @@ def compare_attention(
         "repeat_equal": True,
         "cache_unchanged": True,
         "operator_graph_equal": graph_check,
-        "fp32_vs_fp64": metrics(ref, ref64),
+        "fp32_vs_fp64": reference_metrics,
     }
     for arm, y in [("resattn", output[:1]), ("stock", stock[:1])]:
         rows.append(
@@ -158,7 +160,8 @@ def compare_linear(
             reference = x.float() @ w.float().T
             # Validate FP32 reference on a fixed output slice using FP64.
             ref64 = x.double() @ w[:128].double().T
-            assert metrics(reference[:, :128], ref64)["nmse"] < 1e-9
+            nmse = metrics(reference[:, :128], ref64)["nmse"]
+            assert nmse is not None and nmse < 1e-9
             snapshot = (
                 {
                     "x": x.cpu(),
