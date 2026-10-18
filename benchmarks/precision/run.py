@@ -1,4 +1,4 @@
-"""Compare real decode operator outputs against high-precision references.
+"""Compare real decode and optional prefill operator outputs against FP32 references.
 
 Run with python -m benchmarks.precision.run --help.
 """
@@ -11,8 +11,8 @@ from functools import partial
 from pathlib import Path
 
 from .compare import (LINEAR_ARMS, LINEAR_SCOPE, check_linear_coverage,
-                      compare_attention, compare_linear, summarize)
-from .prepare import load_protocol
+                      compare_attention, compare_linear, compare_prefill, summarize)
+from .prepare import load_protocol, load_kext_metadata
 
 
 def parse_args():
@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument(
         "--timing", action="store_true", help="Also record isolated linear Graph timing"
     )
+    parser.add_argument("--kext-metadata", action="append", default=[], metavar="RATIO=PATH",
+                        help="Capture prefill and compare KEXT using calibrated export masks; repeat per ratio")
     args = parser.parse_args()
     if args.max_model_len < 2:
         parser.error("--max-model-len must be at least 2")
@@ -76,8 +78,16 @@ def load_model(model_path, max_model_len):
     return llm
 
 
-def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
-    """Replay frozen tokens and capture selected decode inputs; restore all hooks."""
+def prefill_span(counts, layer, prompt_tokens, rows):
+    """B1 eager replay visits prompt tokens once, possibly in multiple chunks."""
+    start = counts.get(layer, 0)
+    count = min(rows, prompt_tokens - start)
+    counts[layer] = start + count
+    return start, count
+
+
+def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save, prefill_inputs=None, kext_metadata=None):
+    """Replay tokens, capture decode/prefill inputs and restore all hooks."""
     import torch
     from vllm import SamplingParams
     from vllm.model_executor.layers.linear import LinearBase
@@ -88,6 +98,7 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
     generated = 0
     names, history, activations, weights = {}, {}, {}, {}
     hooks = []
+    prefill_counts = {}
     original = ResAttnFlashInferImpl.forward
 
     @torch.inference_mode()
@@ -170,8 +181,18 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
                     and getattr(module, "bias", None) is None
                 )
                 weights[name] = module.weight.detach()
+                if kext_metadata:
+                    from benchmarks.kernel.inputs import calibrated_indices
+                    for ratio, data in kext_metadata.items():
+                        calibrated_indices(data, name, module.weight.shape[1], ratio)
 
                 def capture(mod, args, label=name):
+                    if case is not None:
+                        start, count = prefill_span(prefill_counts, label, len(case["prompt_ids"]),
+                                                    args[0].shape[0])
+                        if count and prefill_inputs is not None:
+                            prefill_inputs[(case["index"], start, label)] = (
+                                args[0][:count].detach().to("cpu", copy=True))
                     if (
                         case is not None
                         and generated in protocol["steps"]
@@ -191,7 +212,9 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
         def force_logits(*a, **kw):
             nonlocal generated
             logits = original_logits(*a, **kw)
-            if case is not None:
+            # vLLM also computes discarded logits for intermediate prefill chunks.
+            if case is not None and all(
+                    prefill_counts.get(name, 0) == len(case["prompt_ids"]) for name in weights):
                 assert logits.shape[0] == 1
                 logits.fill_(-torch.inf)
                 logits[0, case["tokens"][generated]] = 0
@@ -203,6 +226,7 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
         for selected in protocol["cases"]:
             case = selected
             generated = 0
+            prefill_counts.clear()
             history = {name: ([], []) for name in names.values()}
             t = time.time()
             result = llm.generate(
@@ -216,6 +240,9 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
                 use_tqdm=False,
             )[0].outputs[0]
             assert list(result.token_ids) == case["tokens"]
+            if prefill_inputs is not None and any(
+                    prefill_counts.get(name) != len(case["prompt_ids"]) for name in weights):
+                raise ValueError("Incomplete prefill activation capture")
             duration = time.time() - t
             costs.append(
                 {
@@ -289,6 +316,7 @@ def configure_runtime():
         VLLM_USE_V2_MODEL_RUNNER="0",
         VLLM_ENABLE_V1_MULTIPROCESSING="0",
         RESIDUE_SM10X_FOLD_TUNER="1",
+        RESIDUE_RATIO1_PREFILL_PATH="auto",
     )
     # Registers torch.ops.residue.nvfp4_linear used by the linear runners.
     from quant.vllm_integration import residue_linear_op  # noqa: F401
@@ -307,6 +335,7 @@ def write_results(root, protocol, started, rows, costs, state):
         "scope": protocol["scope"],
         "mext_scope": LINEAR_SCOPE,
         "linear_arms": LINEAR_ARMS,
+        "kext_arms": sorted({r["arm"] for r in rows if r["kind"] == "kext"}),
         "elapsed": time.time() - started,
         "rows": rows,
         "summary": summarize(rows) if state == "completed" else [],
@@ -325,6 +354,7 @@ def write_results(root, protocol, started, rows, costs, state):
 def main():
     args = parse_args()
     protocol = load_protocol(args.protocol)
+    metadata, sources = load_kext_metadata(args.kext_metadata)
     model_path = str(args.model.resolve(strict=True))
     if any(
         len(c["prompt_ids"]) + len(c["tokens"]) > args.max_model_len
@@ -333,10 +363,15 @@ def main():
         raise ValueError("Frozen replay exceeds --max-model-len")
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=False)
+    if metadata:
+        for ratio, data in metadata.items():
+            (root / f"kext-r{ratio:g}.json").write_text(json.dumps(data, indent=2))
+        (root / "kext-sources.json").write_text(json.dumps(sources, indent=2))
     configure_runtime()
     (root / "frozen.json").write_bytes(args.protocol.read_bytes())
     started = time.time()
     rows, costs = [], []
+    prefill_inputs = {} if metadata else None
 
     save = partial(write_results, root, protocol, started, rows, costs)
 
@@ -344,7 +379,7 @@ def main():
         llm = load_model(model_path, args.max_model_len)
         costs.append({"stage": "startup", "seconds": time.time() - started})
         weights, activations = collect_inputs(
-            llm, protocol, root, args.save_inputs, rows, costs, save
+            llm, protocol, root, args.save_inputs, rows, costs, save, prefill_inputs, metadata
         )
         compare_linear(
             weights,
@@ -357,6 +392,8 @@ def main():
             costs,
             save,
         )
+        if metadata:
+            compare_prefill(weights, prefill_inputs, metadata, args.timing, rows, costs, save)
         expected = len(protocol["cases"]) * len(protocol["steps"])
         assert (
             sum(r["kind"] == "resattn" for r in rows)

@@ -2,6 +2,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Linear callables shared by latency and real-input precision benchmarks."""
 
+from collections.abc import Callable
+from typing import NamedTuple
+
+
+KEXT_BASELINES = ("fi_nvfp4_cutedsl", "fi_mxfp4_mxfp8_w4a8",
+                  "trtllm_nvfp4_fp8_w4a8", "trtllm_mxfp4_mxfp8_w4a8")
+
 W4A8_CONFIG = dict(mma_sm=1, tile_m=128, tile_n=128, tile_k=128, swap_ab=True)
 # Other arms use FlashInfer's Python AutoTuner.
 STATIC_SELECTION = {
@@ -137,3 +144,73 @@ def selected_tactic(arm):
         return {}
     return {"tactic_source": adapter.last_tactic_source(),
             "tactic": adapter.last_tactic_tile()}
+
+
+class BenchmarkArm(NamedTuple):
+    """One callable and its explicit rotating inputs, plus result labels."""
+    family: str
+    ratio: float
+    forward: Callable
+    inputs: tuple
+    route: str
+    policy: object = None
+    arm: str = ""
+
+def residue_arm(x, weight, scale, base_scale, scale_inv, alpha, mask,
+                *, k, n, num_salient, ratio1, fold_eligible=True):
+    """Use the production route, exposing its active weight/scales to rotation."""
+    import torch
+    from quant.vllm_integration.residue_linear_op import _linear_policy
+    from quant.flashinfer_integration.nvfp4_linear_adapter import _route
+
+    policy = _linear_policy(k, num_salient, 0, n, fold_eligible, False, ratio1)
+    route = _route(x.shape[0], policy)
+    if route in ('sm10x_fold', 'sm120_fold', 'ratio1_prefill'):
+        weight, scale = weight[:, :k // 2], base_scale
+
+    def forward(a, w, sf):
+        return torch.ops.residue.nvfp4_linear(
+            a, w, scale_inv, sf, sf, mask, alpha,
+            k, num_salient, 0, n, fold_eligible, False, ratio1)
+
+    return forward, (x, weight, scale), route, policy
+
+
+def selected_fold_tactic(route, policy):
+    """Read the selected Fold configuration; never infer it from log messages."""
+    if route == 'sm10x_fold':
+        from quant.flashinfer_integration import sm100_fold_candidates as candidates
+        enabled = policy.sm10x_tuner
+    elif route == 'sm120_fold':
+        from quant.flashinfer_integration import sm120_fold_candidates as candidates
+        enabled = policy.sm120_tuner
+    else:
+        return {}
+    return {'fold_tactic_source': candidates.last_tactic_source() if enabled else 'offline_table',
+            'fold_tactic_tile': candidates.last_tactic_tile()}
+
+
+def make_kext_arms(x, weights, extended, ratios):
+    """Shared prefill comparison: explicit selective KEXT, ratio1 auto and W4A8."""
+    import torch
+    from .inputs import global_scale
+
+    k, n = x.shape[1], weights["reference"].shape[0]
+    xgs = global_scale(x)
+    baselines = make_runners(x, weights, KEXT_BASELINES)
+    arms = [BenchmarkArm("stock" if name == KEXT_BASELINES[0] else "w4a8",
+                        0., *baselines[name], "baseline", arm=name)
+            for name in KEXT_BASELINES]
+    for ratio in ratios:
+        if ratio == 1.0:
+            w, _, sf, gs = weights["nvfp4"]
+            base_sf, mask, salient = sf, torch.empty(1, device=x.device, dtype=torch.uint8), 0
+        else:
+            w, sf, base_sf, gs, mask, salient = extended[ratio]
+        fn, inputs, route, policy = residue_arm(
+            x, w, sf, base_sf, xgs, (1 / (xgs * gs)).reshape(()), mask,
+            k=k, n=n, num_salient=salient, ratio1=ratio == 1.0,
+            fold_eligible=ratio == 1.0)
+        arms.append(BenchmarkArm("kext", ratio, fn, inputs, route, policy,
+                                 f"kext_r{ratio:g}"))
+    return arms

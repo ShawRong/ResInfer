@@ -1,6 +1,7 @@
 """Paired attention and linear comparisons on captured decode inputs."""
 
 import hashlib
+import json
 import time
 
 
@@ -41,7 +42,7 @@ def summarize(rows):
 
     groups = defaultdict(list)
     for row in rows:
-        references = ("fp32_reference",) if row["kind"] == "mext" else (
+        references = ("fp32_reference",) if row["kind"] in ("mext", "kext") else (
             "quantized_kv_reference", "raw_kv_reference")
         for reference in references:
             groups[row["kind"], row["arm"], reference].append(row[reference])
@@ -227,3 +228,62 @@ def compare_linear(
         )
         save("mext")
         print("LINEAR", name, flush=True)
+
+
+def compare_prefill(weights, activations, metadata, timing, rows, costs, save):
+    """Compare calibrated KEXT ratios and W4A8 on each captured real prefill chunk."""
+    from benchmarks.kernel.inputs import calibrated_indices, make_extended_weights, quantize_mext_weights
+    from benchmarks.kernel.linear import KEXT_BASELINES, STATIC_SELECTION, make_kext_arms, selected_fold_tactic
+    from benchmarks.kernel.timing import fi_autotuned, timed_detail, warm_equally
+    from .reference import metrics
+
+    ratios = sorted(metadata) + [1.0]
+    for name, w in weights.items():
+        started = time.time()
+        masks = {ratio: calibrated_indices(data, name, w.shape[1], ratio)
+                 for ratio, data in metadata.items()}
+        extended = make_extended_weights(w, w.shape[1], sorted(metadata), masks)
+        packed = quantize_mext_weights(w, KEXT_BASELINES)
+        whash = digest(w)
+        for (index, start, label), captured in activations.items():
+            if label != name:
+                continue
+            x = captured.to(w.device)
+            reference = x.float() @ w.float().T
+            xhash = digest(x)
+            for arm in make_kext_arms(x, packed, extended, ratios):
+                selection = STATIC_SELECTION.get(arm.arm, "flashinfer_autotune")
+                with fi_autotuned(arm.forward, arm.inputs, m_bucket=x.shape[0],
+                                  enabled=selection == "flashinfer_autotune"):
+                    output = arm.forward(*arm.inputs)
+                    item = dict(kind="kext", phase="prefill", index=index,
+                        token_start=start, token_count=x.shape[0], layer=name,
+                        arm=arm.arm, ratio=arm.ratio, route=arm.route, selection=selection,
+                        m=x.shape[0], n=w.shape[0], k=w.shape[1],
+                        input_sha256=xhash, weight_sha256=whash,
+                        fp32_reference=metrics(output, reference))
+                    if arm.ratio in masks:
+                        item["mask_sha256"] = hashlib.sha256(
+                            json.dumps(masks[arm.ratio]).encode()).hexdigest()
+                    if arm.policy:
+                        item.update(selected_fold_tactic(arm.route, arm.policy))
+                    if timing:
+                        warm_equally(arm.forward, arm.inputs, calls=20)
+                        item["timing"] = timed_detail(arm.forward, arm.inputs)
+                rows.append(item)
+        costs.append(dict(stage="kext_projection", layer=name, seconds=time.time()-started))
+        save("kext")
+        print("PREFILL LINEAR", name, flush=True)
+    check_prefill_coverage(rows, activations, ratios)
+
+
+def check_prefill_coverage(rows, activations, ratios):
+    from benchmarks.kernel.linear import KEXT_BASELINES
+
+    arms = set(KEXT_BASELINES) | {f"kext_r{ratio:g}" for ratio in ratios}
+    expected = {(index, start, name, arm)
+                for index, start, name in activations for arm in arms}
+    actual = [(r["index"], r["token_start"], r["layer"], r["arm"])
+              for r in rows if r["kind"] == "kext"]
+    if not expected or set(actual) != expected or len(actual) != len(expected):
+        raise ValueError("Incomplete or duplicate prefill comparisons")

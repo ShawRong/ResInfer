@@ -50,7 +50,7 @@ def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
     return (base[:, None] + off[None, :]).reshape(-1).contiguous()
 
 
-def make_extended_weights(w_ref, k, ratios):
+def make_extended_weights(w_ref, k, ratios, indices_by_ratio=None):
     import torch
     import nvfp4
     from vllm._custom_ops import scaled_fp4_quant
@@ -58,7 +58,8 @@ def make_extended_weights(w_ref, k, ratios):
 
     extended = {}
     for ratio in ratios:
-        idx = salient_indices(k, ratio, w_ref.device)
+        idx = (salient_indices(k, ratio, w_ref.device) if indices_by_ratio is None else
+               torch.tensor(indices_by_ratio[ratio], device=w_ref.device, dtype=torch.long))
         w_ext = torch.cat([w_ref, w_ref.index_select(-1, idx)], dim=-1)
         gs = global_scale(w_ext)
         packed, scales = scaled_fp4_quant(w_ext, gs, is_sf_swizzled_layout=False)
@@ -96,3 +97,30 @@ def quantize_mext_weights(weight, arms):
             "mxfp4": (w_mx, ws_mx, ws_mx_flat, w_mx_batch, ws_mx_batch),
             "trtllm": (w_trt, ws_trt, wgs_trt)
             if "trtllm_nvfp4_fp8_w4a8" in arms else None}
+
+
+def calibrated_indices(metadata, layer_name, k, ratio):
+    """Resolve the export's mask, including shared HF constituents of a fused layer."""
+    from quant.vllm_integration.metadata import (
+        get_fused_hf_candidates, get_residue_layer_candidates)
+
+    layers = metadata["layers"]
+    groups = get_fused_hf_candidates(layer_name)
+    constituents = {name for group in groups for name in group}
+    whole = [name for name in get_residue_layer_candidates(layer_name)
+             if name not in constituents and name in layers]
+    candidates = [[name] for name in whole] + groups
+    records = next(([layers[name] for name in group] for group in candidates
+                    if all(name in layers for name in group)), None)
+    if not records:
+        raise ValueError(f"Missing calibrated mask for {layer_name}")
+    indices = records[0].get("salient_indices")
+    if indices is None or any(row.get("salient_indices") != indices for row in records):
+        raise ValueError(f"Fused projections need identical calibrated masks: {layer_name}")
+    per_block = int(ratio * 8)
+    if (ratio not in (.125, .25, .5) or k % 8 or len(indices) != k * per_block // 8
+            or any(type(i) is not int or i < 0 or i >= k for i in indices)
+            or any(a >= b for a, b in zip(indices, indices[1:]))
+            or any(i // 8 != j // per_block for j, i in enumerate(indices))):
+        raise ValueError(f"Mask does not match K={k}, ratio={ratio}: {layer_name}")
+    return indices

@@ -36,6 +36,27 @@ def load_protocol(path):
     return validate_protocol(json.loads(Path(path).read_text()))
 
 
+
+def load_kext_metadata(specs):
+    """Load explicit ratio=export-sidecar inputs; never infer missing calibration."""
+    from quant.vllm_integration.metadata import read_residue_metadata_json
+
+    metadata, sources = {}, {}
+    for spec in specs:
+        label, sep, filename = spec.partition("=")
+        if not sep:
+            raise ValueError("--kext-metadata expects RATIO=PATH")
+        ratio = float(label)
+        if ratio not in (.125, .25, .5) or ratio in metadata:
+            raise ValueError(f"Duplicate or unsupported selective ratio: {label}")
+        path = Path(filename).resolve(strict=True)
+        metadata[ratio] = read_residue_metadata_json(path)
+        if not metadata[ratio].get("layers"):
+            raise ValueError(f"Missing layers in calibrated metadata: {path}")
+        sources[ratio] = dict(path=str(path), sha256=hashlib.sha256(path.read_bytes()).hexdigest())
+    return metadata, sources
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--prompts', type=Path, required=True, help='JSONL with index, task, prompt_ids and prompt_ids_sha256')
