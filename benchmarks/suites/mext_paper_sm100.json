@@ -1,6 +1,6 @@
 {
-  "name": "mext_paper_sm100_v3",
-  "description": "Full online activation quantization plus GEMM; SM100 MExt paper matrix",
+  "name": "mext_paper_sm100_current",
+  "description": "Online quantization + GEMM: tuned NVFP4/MXFP4 MEXT, W4A4, official-default FI W4A8, TRT NVFP4/FP8 and MXFP4/MXFP8 W4A8; fixed MXFP4 is an ablation",
   "m_values": [
     1,
     2,
@@ -22,80 +22,30 @@
     "fi_nvfp4_cutlass",
     "fi_nvfp4_cutedsl",
     "resinfer_mxfp4_mext_r1",
+    "resinfer_mxfp4_mext_r1_tuned",
     "fi_mxfp4_mxfp4_stock",
+    "fi_mxfp4_mxfp4_cutedsl_quant",
     "fi_mxfp4_mxfp8_w4a8",
-    "trtllm_nvfp4_fp8_w4a8"
+    "trtllm_nvfp4_fp8_w4a8",
+    "trtllm_mxfp4_mxfp8_w4a8"
   ],
   "required_arms": [
     "mext_r1",
     "fi_nvfp4_cutlass",
     "fi_nvfp4_cutedsl",
     "resinfer_mxfp4_mext_r1",
+    "resinfer_mxfp4_mext_r1_tuned",
     "fi_mxfp4_mxfp4_stock",
+    "fi_mxfp4_mxfp4_cutedsl_quant",
     "fi_mxfp4_mxfp8_w4a8",
-    "trtllm_nvfp4_fp8_w4a8"
+    "trtllm_nvfp4_fp8_w4a8",
+    "trtllm_mxfp4_mxfp8_w4a8"
   ],
-  "models": {
-    "qwen3_4b": {
-      "tp_values": [
-        1
-      ],
-      "projections": [
-        "qkv",
-        "o",
-        "gate_up",
-        "down"
-      ],
-      "config": {
-        "model_type": "qwen3",
-        "hidden_size": 2560,
-        "intermediate_size": 9728,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128
-      }
-    },
-    "qwen3_8b": {
-      "tp_values": [
-        1
-      ],
-      "projections": [
-        "qkv",
-        "o",
-        "gate_up",
-        "down"
-      ],
-      "config": {
-        "model_type": "qwen3",
-        "hidden_size": 4096,
-        "intermediate_size": 12288,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
-        "head_dim": 128
-      }
-    },
-    "qwen35_27b": {
-      "tp_values": [
-        1
-      ],
-      "projections": [
-        "qkv",
-        "o",
-        "gate_up",
-        "down"
-      ],
-      "config": {
-        "model_type": "qwen3_5",
-        "text_config": {
-          "model_type": "qwen3_5_text",
-          "hidden_size": 5120,
-          "intermediate_size": 17408,
-          "num_attention_heads": 24,
-          "num_key_value_heads": 4,
-          "head_dim": 256,
-          "full_attention_interval": 4
-        }
-      }
-    }
-  }
+  "models": [
+    "qwen3_4b",
+    "qwen3_8b",
+    "qwen3_14b",
+    "qwen3_32b",
+    "qwen35_27b"
+  ]
 }

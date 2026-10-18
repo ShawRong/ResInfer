@@ -17,12 +17,12 @@ import socket
 import subprocess
 import sys
 import time
-import urllib.request
 
 REPO = pathlib.Path(__file__).resolve().parents[3]
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 from benchmarks.engine_config import accuracy_engine_config
+from benchmarks.serving import engagement, stop_server, check_port_available, wait_ready
 from benchmarks.quality.common.protocol import load_manifest, resolve_arms, SAMPLING_FIELDS
 VLLM_BIN = REPO / ".venv" / "bin" / "vllm"
 SERVING_PYTHON = REPO / ".venv" / "bin" / "python"
@@ -31,19 +31,7 @@ _SERVERS: list[subprocess.Popen] = []
 
 def teardown() -> None:
     for proc in _SERVERS:
-        if proc.poll() is None:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=6)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-        proc.wait()
+        stop_server(proc)
     _SERVERS.clear()
 
 
@@ -51,16 +39,6 @@ def on_signal(signum, _frame) -> None:
     print(f"[lighteval_driver] got signal {signum}, tearing down", flush=True)
     teardown()
     raise SystemExit(143)
-
-
-def health_ok(port: int) -> bool:
-    # ProxyHandler({}) so a shell-level SOCKS/HTTP proxy cannot swallow the
-    # localhost health check.
-    try:
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        return opener.open(f"http://localhost:{port}/health", timeout=5).status == 200
-    except Exception:
-        return False
 
 
 def free_port() -> int:
@@ -99,8 +77,7 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path) -> dict:
     if a.gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(a.gpu)
     env["VLLM_NO_USAGE_STATS"] = "1"
-    # Match runtime.install_env: use the same process mode for every arm.
-    # The patch requires in-process EngineCore on the tested runtime.
+    # Request the same process mode for all arms; verify the actual model PID in logs.
     env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
     # Keep compile-cache reuse disabled for accuracy comparisons.
     env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
@@ -114,14 +91,10 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path) -> dict:
     if arm["kind"] == "residue":
         env["RESIDUE_NVFP4"] = "1"
         env["RESIDUE_VLLM_MODEL_DIR"] = arm["abs_path"]
-        # Keep the extended-K loader enabled during compute-time ablations.
+        if arm.get("mext", "on") != "on":
+            raise ValueError("Runtime ablations belong in .dev; use a stock NVFP4 checkpoint")
         env["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
-        env["RESIDUE_FORCE_DECODE_MEXT"] = "0"
         env["RESIDUE_DECODE_MEXT_MAX_M"] = str(a.mext_max_m)
-        if str(arm.get("mext", "on")) == "off":
-            # MIN_M=0 disables residue for every M while preserving weight loading.
-            env["RESIDUE_PREFILL_RESIDUE_OFF"] = "1"
-            env["RESIDUE_PREFILL_RESIDUE_OFF_MIN_M"] = "0"
         # Cubins push modelopt_fp4 onto trtllm-gen paths that bypass or break
         # the patched linear method (vllm-integration.md rule 3).
         for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
@@ -158,24 +131,16 @@ def build_server_cmd(arm: dict, man: dict, a, port: int) -> list[str]:
 
 
 def launch_server(cmd: list[str], env: dict, case_out: pathlib.Path,
-                  port: int, timeout_s: int) -> None:
+                  port: int, timeout_s: int, model: str) -> subprocess.Popen:
+    check_port_available(port)
     with (case_out / "server.log").open("wb") as log:
         proc = subprocess.Popen(cmd, cwd=str(REPO), env=env, stdout=log,
                                 stderr=subprocess.STDOUT, start_new_session=True)
     _SERVERS.append(proc)
     print(f"[lighteval_driver] server pid={proc.pid} port={port}", flush=True)
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        returncode = proc.poll()
-        if returncode is not None:
-            raise RuntimeError(
-                f"server exited with code {returncode} before /health became "
-                f"ready -- see {case_out / 'server.log'}")
-        if health_ok(port):
-            return
-        time.sleep(2)
-    raise RuntimeError(f"server not healthy after {timeout_s}s -- see "
-                       f"{case_out / 'server.log'}")
+    if wait_ready(port, timeout_s, proc, model) is None:
+        raise RuntimeError(f"server not ready after {timeout_s}s; see {case_out / 'server.log'}")
+    return proc
 
 
 def preflight_server(arm: dict, env: dict, case_out: pathlib.Path) -> dict:
@@ -227,39 +192,12 @@ print("RESINFER_PREFLIGHT_JSON=" + json.dumps(payload, sort_keys=True))
     return payload
 
 
-def mext_resolved_gate(server_log: pathlib.Path, arm: dict) -> str | None:
-    """Check the resolved residue mode before sending the first prompt."""
+def mext_resolved_gate(server_log: pathlib.Path, arm: dict,
+                       server_pid: int | None = None) -> str | None:
     text = server_log.read_text(errors="ignore") if server_log.is_file() else ""
-    resolved = [ln for ln in text.splitlines()
-                if "[residue:env]" in ln and "mode=" in ln
-                and "WARNING" not in ln and "FATAL" not in ln]
-    if not resolved:
-        return (f"arm {arm['id']}: no [residue:env] resolved-mode line in "
-                f"{server_log}. The residue plugin never ran in the engine "
-                f"process -- the arm would serve UNPATCHED and measure the "
-                f"plain floor under a method arm's name "
-                f"(implementation constraints rule 1).")
-    line = resolved[-1].strip()
-    mext_on = str(arm.get("mext", "on")) == "on"
-    if mext_on:
-        # Primary signal is decode_mext=on; a mode naming mext (mext_r1) is
-        # also accepted as a resolved-mode confirmation.
-        if "decode_mext=on" not in line and "mode=mext" not in line:
-            return (f"arm {arm['id']}: expected decode_mext=on (or a mode "
-                    f"naming mext) in the resolved line; found: {line}")
-        if "prefill_residue=OFF" in line:
-            return (f"arm {arm['id']}: expected prefill_residue=on for a "
-                    f"method arm, but the compute-time kill is engaged; "
-                    f"found: {line}")
-    else:
-        # The mext-off floor arm relies on the compute-time kill; without it
-        # the arm silently serves residue under the floor's name -- the same
-        # hazard, inverted.
-        if "prefill_residue=OFF" not in line:
-            return (f"arm {arm['id']}: expected prefill_residue=OFF (the "
-                    f"compute-time residue kill that makes this the plain "
-                    f"floor); found: {line}")
-    return None
+    result = engagement(text, server_pid, multiprocessing=False)
+    problem = result.get("engagement_error")
+    return f"arm {arm['id']}: {problem}; see {server_log}" if problem else None
 
 
 def generation_provenance(server_log: pathlib.Path, server_env: dict) -> dict:
@@ -454,18 +392,21 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     server_log = case_out / "server.log"
     try:
         server_preflight = preflight_server(arm, env, case_out)
-        launch_server(cmd, env, case_out, port, a.ready_timeout_sec)
+        proc = launch_server(cmd, env, case_out, port, a.ready_timeout_sec, arm["abs_path"])
         if arm["kind"] == "residue":
-            problem = mext_resolved_gate(server_log, arm)
+            problem = mext_resolved_gate(server_log, arm, proc.pid)
             if problem:
                 status, error = "fail_mext", problem
                 raise RuntimeError(problem)
         if server_log.is_file():
             hits = [ln for ln in server_log.read_text(errors="ignore").splitlines()
-                    if "[residue:env]" in ln and "mode=" in ln]
+                    if "mode=" in ln and "decode_mext=" in ln]
             resolved_line = hits[-1].strip() if hits else None
         cfg_path = write_lighteval_config(arm, man, a, port, case_out, cache_dir)
         results = run_lighteval(arm, man, a, cfg_path, case_out)
+        problem = engagement(server_log.read_text(errors="ignore"), quant=None).get("engagement_error")
+        if problem:
+            raise RuntimeError(problem)
         status = "pass"
     except Exception as exc:  # recorded per case; the suite keeps going
         error = error or repr(exc)
@@ -532,7 +473,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--gpu", type=int, default=None,
                     help="CUDA_VISIBLE_DEVICES for the server (single GPU)")
     ap.add_argument("--port", type=int, default=0, help="0 = fresh free port per arm")
-    ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     ap.add_argument("--tasks", default=None,
                     help="override the manifest task spec (e.g. the avg8 shim "
                          "'custom|aime24_avg8|0,custom|aime25_avg8|0', or the "

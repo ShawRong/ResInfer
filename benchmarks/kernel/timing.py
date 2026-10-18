@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Measurement primitives shared by the benchmarks in this directory.
 
-Official FlashInfer timing, warmup and basic output checks.
+Official FlashInfer timing and warmup.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 import math
 import statistics
 from collections.abc import Callable, Sequence
@@ -13,19 +14,22 @@ from typing import Any
 
 # Match FlashInfer's default minimum; cold inputs may require a longer graph.
 ITERS_WITHIN_GRAPH = 10
-TIMING_METHOD = "flashinfer_cudagraph_rotation_v2"
+TIMING_METHOD = "flashinfer_cudagraph_rotation_v3"
 
 
 def iters_for_cold_l2(args: Sequence[Any], device: Any, *,
                       floor: int = ITERS_WITHIN_GRAPH) -> int:
-    """Visit all copies chosen by FlashInfer's cold-L2 rotation policy."""
+    """Capture whole buffer cycles so adjacent replays preserve the reuse distance."""
     import torch
     from flashinfer.testing.utils import calculate_rotation_count
 
     tensors = [a for a in args if torch.is_tensor(a) and a.is_cuda]
     if not tensors:
         raise ValueError("cold-L2 timing requires explicit CUDA tensor inputs")
-    return max(floor, int(calculate_rotation_count(tensors, device)))
+    if floor < 1:
+        raise ValueError("graph call floor must be positive")
+    rotations = int(calculate_rotation_count(tensors, device))
+    return ((floor + rotations - 1) // rotations) * rotations
 
 
 def l2_accounting(args: Sequence[Any], device: Any,
@@ -53,7 +57,8 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
                  repeats: int = 5) -> dict:
     """Use official Graph timing; retain samples and repeat medians in us.
 
-    Callers comparing arms pass one graph length sufficient for every arm.
+    Each arm captures complete buffer cycles. An explicit graph length is a
+    minimum, rounded up to a multiple of that arm's rotation count.
     FlashInfer owns buffer cloning, warmup, capture, replay and CUDA events.
     """
     from flashinfer.testing.utils import bench_gpu_time_with_cudagraph
@@ -62,11 +67,8 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
     if repeats < 1 or repeat_iters < 1:
         raise ValueError("timing repeat counts must be positive")
     device = next((a.device for a in args if torch.is_tensor(a) and a.is_cuda), None)
-    required = iters_for_cold_l2(args, device)
-    if iters_within_graph is None:
-        iters_within_graph = required
-    if iters_within_graph < required:
-        raise ValueError(f"graph needs at least {required} calls for buffer rotation")
+    iters_within_graph = iters_for_cold_l2(
+        args, device, floor=ITERS_WITHIN_GRAPH if iters_within_graph is None else iters_within_graph)
     samples_us = [
         [float(ms) * 1000.0 for ms in bench_gpu_time_with_cudagraph(
             fn=fn, repeat_iters=repeat_iters,
@@ -81,6 +83,7 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
     medians = sorted(ordered)
     p50 = statistics.median(medians)
     return {
+        **l2_accounting(args, device, iters_within_graph),
         "timing_method": TIMING_METHOD,
         "us": p50, "us_stat": "p50", "p50_us": p50,
         "us_mink": medians[0], "max_us": medians[-1],
@@ -88,20 +91,23 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
         "medians_us": medians, "medians_order": ordered,
         "spread_pct": 100.0 * (medians[-1] - medians[0]) / medians[0],
         "repeats": repeats, "repeat_iters": repeat_iters,
-        "iters_within_graph": iters_within_graph,
     }
 
 
+@contextmanager
 def fi_autotuned(fn: Callable[..., Any], args: Sequence[Any],
-                 m_bucket: int, warmup: int = 3) -> None:
-    'Implementation details.'
+                 m_bucket: int, warmup: int = 3, *, enabled: bool = True):
+    """Keep the same bucket mapping while tuning and measuring the callable."""
     import torch
     from flashinfer.autotuner import autotune
 
-    with autotune(True, tuning_buckets=(m_bucket,)):
-        for _ in range(warmup):
-            fn(*args)
-    torch.cuda.synchronize()
+    with autotune(False, tuning_buckets=(m_bucket,)):
+        if enabled:
+            with autotune(True):
+                for _ in range(warmup):
+                    fn(*args)
+        torch.cuda.synchronize()
+        yield
 
 
 def warm_equally(fn: Callable[..., Any], args: Sequence[Any] = (),
@@ -112,15 +118,3 @@ def warm_equally(fn: Callable[..., Any], args: Sequence[Any] = (),
     for _ in range(int(calls)):
         fn(*args)
     torch.cuda.synchronize()
-
-
-def check_output(output, reference, *, max_rel_error=0.25) -> float:
-    """Basic shape/finiteness/BF16 sanity gate, outside the timing window."""
-    import torch
-    if output.shape != reference.shape or not bool(torch.isfinite(output).all()):
-        raise ValueError("wrong output shape or non-finite values")
-    error = float((output.float() - reference.float()).abs().max()) / (
-        float(reference.float().abs().max()) + 1e-9)
-    if error > max_rel_error:
-        raise ValueError(f"BF16 sanity gate failed: relative max={error:.4f}")
-    return error

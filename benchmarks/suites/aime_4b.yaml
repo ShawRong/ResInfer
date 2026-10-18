@@ -1,131 +1,46 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-name: aime_4b
+name: aime_4b_stock_baseline_v2
 venue: aime
-
-# Upstream, no shim. Swap to the avg8 shim ONLY with a measurement to justify it.
-tasks: "lighteval|aime24_avg|0,lighteval|aime25_avg|0"
+tasks: lighteval|aime24_avg|0,lighteval|aime25_avg|0
 metric: avg@n:n=64
 n_problems: 60
-
-# Add g-pass@16 when the driver can carry two task sets. The reason is not a
-# second number: avg@n measures mean capability, g-pass@k at thresholds
-# 0.0..1.0 measures CONSISTENCY across samples -- and the question this venue
-# exists for, in the words of the original run script, is whether
-# "quantization destabilises the trace" as distinct from "quantization costs
-# accuracy". Only the second metric family can separate those, and the project
-# has been probing trace stability with a mean-only metric.
-stability_tasks: "lighteval|aime24_gpassk|0,lighteval|aime25_gpassk|0"
-
-# Explicit Qwen3 protocol; do not reuse this manifest for Qwen3.5.
+stability_tasks: lighteval|aime24_gpassk|0,lighteval|aime25_gpassk|0
 model_type: qwen3
 protocol_source: https://huggingface.co/Qwen/Qwen3-4B#best-practices
 enable_thinking: true
 min_p: 0.0
 presence_penalty: 0.0
 repetition_penalty: 1.0
-temperature: 0.6          # Qwen3 defaults; identical across every arm
+temperature: 0.6
 top_p: 0.95
 top_k: 20
 max_new_tokens: 32768
 max_model_len: 40960
 seed: 42
-# Run-scoped, always. A cache hit REPLAYS an older run's generations: the
-# server starts, zero tokens generate, the case "finishes" in minutes, and
-# nothing in the json says so. The key sees only an HTTP endpoint, so arms
-# differing purely in server-side RESIDUE_* env collide.
 cache_dir: per-run
-
-# NOTE: `selftest` does not apply here. It asserts bit-identity, which is
-# reachable only under greedy decoding; this samples at temperature and has a
-# real sampling floor (see the table above). Do not carry the greedy
-# zero-drift result to this venue, and do not carry this venue's floor to a
-# greedy one.
-
-reference: orig_bf16   # role lives here, not in the arm's name
+reference: orig_bf16
 baseline: plain
-
 arms:
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  - id: orig_bf16
-    path: base_orig_bf16
-    kind: fp16
-  - id: plain
-    path: plain
-    kind: modelopt_fp4
-  - id: plain_runtime_off
-    path: uniform_r0125
-    kind: residue
-    mext: "off"
-  - id: uniform_r0125
-    path: uniform_r0125
-    kind: residue
-    mext: "on"
-  - id: uniform_r025
-    path: uniform_r025
-    kind: residue
-    mext: "on"
-  - id: solver_b4p5
-    path: solver_b4p5
-    kind: residue
-    mext: "on"
-  - id: solver_b5
-    path: solver_b5
-    kind: residue
-    mext: "on"
-
+- id: orig_bf16
+  path: base_orig_bf16
+  kind: bf16
+- id: plain
+  path: plain
+  kind: modelopt_fp4
+- id: uniform_r0125
+  path: uniform_r0125
+  kind: residue
+  mext: 'on'
+- id: uniform_r025
+  path: uniform_r025
+  kind: residue
+  mext: 'on'
+- id: solver_b4p5
+  path: solver_b4p5
+  kind: residue
+  mext: 'on'
+- id: solver_b5
+  path: solver_b5
+  kind: residue
+  mext: 'on'
 calibration_recipe: nemotron_sft_n1024_seq2048_seed42_activation_max

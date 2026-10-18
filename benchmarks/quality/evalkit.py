@@ -33,7 +33,6 @@ def main() -> int:
     k.add_argument("--apply-chat-template", action="store_true",
                    help="Use lm-eval chat formatting; not valid for wikitext")
     k.add_argument("--truncation-side", choices=("left", "right", "middle"), default="left")
-    k.add_argument("--prefill-only", type=int, metavar="FOLD_BAND")
     k.set_defaults(fn=cmd_task)
 
     summary = sub.add_parser("summarize", help="display native lm-eval aggregate metrics")

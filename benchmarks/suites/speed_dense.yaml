@@ -1,104 +1,20 @@
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+# Checkpoint paths are relative to --models-root. See benchmarks/README.md.
 name: speed_dense
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 kernel:
-  models: [qwen3_4b, qwen3_8b, qwen3_32b]
-  projections: [qkv, o, gate_up, down]
-  # Each family declares the M range where it actually runs. They are NOT the
-  # same range, and sharing one grid produced a table with rows that describe
-  # a path no deployment takes.
-  #
-  # The dispatch (residue_linear_op.nvfp4_linear):
-  #
-  #     use_fold = fold_eligible and (is_mext_r1 or M <= fold_max_m)
-  #
-  # and a K-extended layer IS fold-eligible in production
-  # (RESIDUE_ENABLE_DECODE_MEXT=1). So below the band a K-extended layer folds:
-  # it reads the k_base prefix and never touches its salient columns, which is
-  # precisely why decode is ratio-blind. The K-extended GEMM only runs above
-  # the band. Measuring "kext" at M=1 therefore measures the legacy path at an
-  # M where nothing takes it -- a counterfactual reported as a cost.
+  models: [qwen3_4b, qwen3_8b, qwen3_14b, qwen3_32b, qwen35_27b]
   families:
-    # Decode. Folds at every M below the band; above it a ratio-1.0 layer
-    # leaves for the wrapped K-loop. Sweeping past the band is the point: the
-    # step IS the deliverable, and the reader picks the knee off it.
     mext:
       m_grid: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
       m_max_by_arch: {sm100: 512, sm103: 512, sm120: 128}
 
-    # Prefill. Starts one step above the band because that is where this path
-    # begins to run at all. Upper end is set by the largest prefill chunk a
-    # server actually issues.
     kext:
-      ratios: [0.125, 0.25, 0.5]
+      ratios: [0.125, 0.25, 0.5, 1.0]
       m_grid: [128, 256, 512, 1024, 2048]
       m_min_by_arch: {sm100: 256, sm103: 256, sm120: 128}
 
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
   repeats: 5
-  process_reps: 5
 
-  # Tune the BASELINE at each M before timing it. FlashInfer's advantage IS a
-  # per-shape search; timing it cold measures it handicapped and flatters
-  # everything compared against it. The mirror of not letting our own fold run
-  # on its static fallback tactic table -- both sides warmed, both recorded.
-  autotune_baseline: true
-
-# =============================================================== e2e level
 e2e:
   workload:
     input_len: 1024
@@ -110,84 +26,37 @@ e2e:
   concurrencies: [1, 4, 16, 64]
 
   rounds: 8
-  # Round k starts at arm k. Without rotation, anything that drifts over an
-  # evening -- GPU temperature, page cache, a neighbour waking up -- is
-  # collinear with arm order and lands on whichever arm runs last.
   rotate_arms: true
 
-  # A COLD FlashInfer autotune is ~2.6 h per arm (benchmarks/prewarm_autotune_
-  # cache.py). Prewarm first; this ceiling covers the case where that was
-  # skipped. 2400 s was measurably not enough.
   ready_timeout_s: 5400
-
-
-
-
 
 arms:
   - id: bf16
+    kind: bf16
     path: base_bf16
     role: ceiling
   - id: plain
+    kind: modelopt_fp4
     path: plain_nvfp4
     role: floor
-  - id: b425                  # [0.037] near-zero control: SHOULD look like plain
+  - id: b425
+    kind: residue
     path: b425
     bits: 4.25
-  - id: b55                   # [0.269] most kext layers of any arm
+  - id: b55
+    kind: residue
     path: b55
     bits: 5.50
-  - id: b70                   # [0.778]
+  - id: b70
+    kind: residue
     path: b70
     bits: 7.00
-  # [1.000] every layer mext_r1: zero K-extension, so the weight is stored
-  # once at base width and its memory footprint should MATCH the plain arm
-  # despite carrying the largest budget here. Its cost mechanism is doubled
-  # token rows -- the fold below the arch's band, the wrapped K-loop above it.
   - id: b80
+    kind: residue
     path: b80
     bits: 8.00
 
-# Conditions under which a row is not a measurement. Recorded per row so the
-# judgement is made during analysis rather than lost at collection time.
 hygiene:
-  # No other compute process on the measurement GPU. A neighbour's bursts land
-  # on whichever arm happens to be running, so the contamination is
-  # arm-correlated and undetectable afterwards.
-  require_exclusive_gpu: true
-
-  
-  
-  void_row_on_jit: true
-
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  
-  lock_clocks: false
-
   env:
-    
-    
-    
-    
-    
-    
     VLLM_DISABLE_COMPILE_CACHE: "1"
-    # The tensor tap is a real op that compiles into the graph; a run with it
-    # on is measuring a different program.
     RESIDUE_TENSOR_DUMP: "<unset>"
-
-  # NOT pinned, deliberately: max_num_batched_tokens. eval-determinism.md
-  # scopes that pin to SCORING runs; for throughput it is a real tuning knob
-  # and freezing it at the eval value understates every arm for no gain.

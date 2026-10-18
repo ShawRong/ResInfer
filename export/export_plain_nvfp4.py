@@ -13,7 +13,8 @@ def main() -> int:
     # so did running it with no arguments. The positional interface is
     # unchanged; only the two ways of asking it what it wants now work.
     ap = argparse.ArgumentParser(
-        description="Export a plain ModelOpt NVFP4 checkpoint (no residue).")
+        description="Legacy synthetic text-only NVFP4 smoke. For quality exports, "
+                    "use python -m export.export_nvfp4 with an explicit dataset.")
     ap.add_argument("base", type=pathlib.Path,
                     help="bf16 base model: a local path, or a HF repo id "
                          "(which downloads)")
@@ -21,11 +22,18 @@ def main() -> int:
                     help="output directory for the exported checkpoint")
     a = ap.parse_args()
     base, out = a.base, a.out
-    out.mkdir(parents=True, exist_ok=True)
+    if out.exists() and any(out.iterdir()):
+        raise FileExistsError(f"refusing to overwrite export: {out}")
 
     import modelopt.torch.quantization as mtq
     from modelopt.torch.export import export_hf_checkpoint
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+
+    config = AutoConfig.from_pretrained(str(base))
+    if any(getattr(config, key, None) is not None for key in ("vision_config", "audio_config")):
+        raise ValueError("The legacy smoke supports text-only models. Use "
+                         "python -m export.export_nvfp4 to preserve multimodal scopes.")
+    out.mkdir(parents=True, exist_ok=True)
 
     print(f">>> loading base {base}", flush=True)
     tok = AutoTokenizer.from_pretrained(str(base))
@@ -33,7 +41,7 @@ def main() -> int:
         str(base), torch_dtype=torch.bfloat16, device_map="cuda"
     ).eval()
 
-    # Tiny calibration set — NVFP4 only needs activation ranges, not accuracy.
+    # Wiring smoke only. These short prompts are not quality calibration.
     prompts = [
         "The capital of France is Paris, a city known for",
         "In machine learning, a transformer is a neural network that",

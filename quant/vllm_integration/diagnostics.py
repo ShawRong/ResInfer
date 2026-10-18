@@ -71,12 +71,12 @@ def log_tp_load(layer, loaded_weight, param, expected, interleaved):
 
 
 def log_settings(cfg):
-    _logger().info("mode=%s decode_mext=%s max_m=%s ratio1_prefill=%s",
-                   cfg.mode, cfg.decode_mext, cfg.decode_max_m, cfg.ratio1_prefill)
+    _logger().info("mode=%s decode_mext=%s max_m=%s ratio1_prefill=%s pid=%s",
+                   cfg.mode, cfg.decode_mext, cfg.decode_max_m, cfg.ratio1_prefill, os.getpid())
 
 
 def log_patch(method_name, mode):
-    _logger().info("ModelOpt NVFP4 -> %s (%s)", method_name, mode)
+    _logger().info("ModelOpt NVFP4 -> %s (%s) pid=%s", method_name, mode, os.getpid())
 
 
 def log_registration_failure(reason, detail=None):

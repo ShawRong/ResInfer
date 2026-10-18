@@ -1,8 +1,5 @@
-# Official audited LiveCodeBench release_v6; new protocol, historical scores unchanged.
-# Qwen3-4B weight comparison. Validate batching and the full generation budget first.
-# The reference is the original model; deltas include GPTQ + NVFP4 effects.
-# orig_bf16 and gptq_bf16 are distinct checkpoints. Plain uses a separate export.
-name: lcb_4b_official_v6
+
+name: lcb_4b_official_v6_stock_baseline_v2
 venue: lcb
 benchmark: lcb
 release_version: release_v6
@@ -24,50 +21,46 @@ seed: 42
 reference: orig_bf16
 baseline: plain
 arms:
-  - id: gptq_bf16
-    path: base_gptq_bf16
-    kind: fp16
-  - id: orig_bf16
-    path: base_orig_bf16
-    kind: fp16
-  - id: plain
-    path: plain
-    kind: modelopt_fp4
-  - id: plain_runtime_off
-    path: uniform_r0125
-    kind: residue
-    mext: "off"
-  - id: uniform_r0125
-    path: uniform_r0125
-    kind: residue
-    mext: "on"
-  - id: uniform_r025
-    path: uniform_r025
-    kind: residue
-    mext: "on"
-  - id: uniform_r05
-    path: uniform_r05
-    kind: residue
-    mext: "on"
-  - id: uniform_r10
-    path: uniform_r10
-    kind: residue
-    mext: "on"
-  - id: solver_b4p5
-    path: solver_b4p5
-    kind: residue
-    mext: "on"
-  - id: solver_b5
-    path: solver_b5
-    kind: residue
-    mext: "on"
-  - id: solver_b6
-    path: solver_b6
-    kind: residue
-    mext: "on"
-  - id: solver_b8
-    path: solver_b8
-    kind: residue
-    mext: "on"
+- id: gptq_bf16
+  path: base_gptq_bf16
+  kind: bf16
+- id: orig_bf16
+  path: base_orig_bf16
+  kind: bf16
+- id: plain
+  path: plain
+  kind: modelopt_fp4
+- id: uniform_r0125
+  path: uniform_r0125
+  kind: residue
+  mext: 'on'
+- id: uniform_r025
+  path: uniform_r025
+  kind: residue
+  mext: 'on'
+- id: uniform_r05
+  path: uniform_r05
+  kind: residue
+  mext: 'on'
+- id: uniform_r10
+  path: uniform_r10
+  kind: residue
+  mext: 'on'
+- id: solver_b4p5
+  path: solver_b4p5
+  kind: residue
+  mext: 'on'
+- id: solver_b5
+  path: solver_b5
+  kind: residue
+  mext: 'on'
+- id: solver_b6
+  path: solver_b6
+  kind: residue
+  mext: 'on'
+- id: solver_b8
+  path: solver_b8
+  kind: residue
+  mext: 'on'
 calibration_recipe: nemotron_sft_n1024_seq2048_seed42_activation_max
 recipe_fingerprint: 7bf7ffff68af72b8

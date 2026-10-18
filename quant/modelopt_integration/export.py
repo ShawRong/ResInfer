@@ -27,6 +27,8 @@ def export_residue_checkpoint(
     from .kernel_metadata import _collect_export_metadata, _write_kernel_metadata
 
     path = Path(export_dir)
+    if path.exists() and any(path.iterdir()):
+        raise FileExistsError(f"refusing to overwrite export: {path}")
     mxfp4 = has_mxfp4_weights(model)
     metadata, mask_dims = _collect_export_metadata(
         model, residue_ratio, block_size, save_channel_masks, calibration,
@@ -37,11 +39,10 @@ def export_residue_checkpoint(
         model_type = getattr(model.config, "model_type", None)
         if model_type == "qwen3_5" and source_checkpoint is None:
             raise ValueError("Qwen3.5 requires the source checkpoint to preserve vision/MTP")
-        if path.exists() and any(path.iterdir()):
-            raise FileExistsError(f"refusing to overwrite export: {path}")
         hf_layers = _collect_mxfp4_layers(model, metadata["layers"])
         # Validate fused activation contracts before writing anything.
         runtime_layer_specs(hf_layers, model_type)
+    nvfp4_shapes = {}
     if source_checkpoint is not None or mxfp4:
         if preserve_unloaded_prefixes is None:
             preserve_unloaded_prefixes = (("mtp.",) if
@@ -50,6 +51,10 @@ def export_residue_checkpoint(
             name: {} for name, module in model.named_modules()
             if getattr(getattr(module, "weight_quantizer", None), "is_enabled", False)
         }
+        if not mxfp4:
+            nvfp4_shapes = {name: list(module.weight.shape)
+                           for name, module in model.named_modules()
+                           if name in quantized_layers}
         extra, preserved, source_record = _collect_preserved_state(
             model, source_checkpoint, quantized_layers, preserve_unloaded_prefixes)
         if extra:
@@ -69,8 +74,11 @@ def export_residue_checkpoint(
         export_hf_checkpoint(model, export_dir=path, dtype=dtype, **export_kwargs)
     _normalize_quant_algo_for_vllm(path)
     manifest = None
-    if mxfp4:
-        _, native, hashes = _validate_modelopt_export(path, hf_layers, preserved)
+    if mxfp4 or source_checkpoint is not None:
+        if mxfp4:
+            _, native, hashes = _validate_modelopt_export(path, hf_layers, preserved)
+        else:
+            native, hashes = _validate_nvfp4_export(path, nvfp4_shapes, preserved)
         manifest = {
             "status": "structure_validated", "runtime_validated": False,
             "native_quantization_config": native,
@@ -107,6 +115,50 @@ def export_residue_checkpoint(
                                        if device.type == "cuda" else None)
         (path / "export_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return path
+
+
+def _validate_nvfp4_export(path, shapes, preserved):
+    """Check the packed inventory and preserved source scopes for NVFP4."""
+    from safetensors import safe_open
+
+    config = json.loads((path / "config.json").read_text())
+    native = config.get("quantization_config", {})
+    if (native.get("quant_method") != "modelopt" or
+            str(native.get("quant_algo", "")).upper() not in ("NVFP4", "FP4")):
+        raise ValueError(f"unexpected ModelOpt NVFP4 config: {native!r}")
+    shards = sorted(path.glob("*.safetensors"))
+    actual, hashes = {}, {}
+    expected = set(preserved) | {f"{name}.{suffix}" for name in shapes
+                                for suffix in ("weight", "weight_scale", "weight_scale_2", "input_scale")}
+    for shard in shards:
+        with safe_open(shard, framework="pt") as handle:
+            for name in handle.keys():
+                if name in actual or "quantizer." in name or "_salient_indices" in name:
+                    raise ValueError(f"duplicate or private exported tensor: {name}")
+                actual[name] = shard.name
+                tensor = handle.get_tensor(name)
+                if tensor.is_floating_point() and not tensor.float().isfinite().all().item():
+                    raise ValueError(f"nonfinite exported tensor: {name}")
+                if name in preserved and _hash(tensor) != preserved[name]:
+                    raise ValueError(f"unquantized parameter changed during export: {name}")
+                prefix, _, leaf = name.rpartition(".")
+                if prefix in shapes:
+                    rows, cols = shapes[prefix]
+                    if leaf == "weight" and (tensor.dtype != torch.uint8 or
+                                              list(tensor.shape) != [rows, cols // 2]):
+                        raise ValueError(f"invalid packed NVFP4 weight: {name} {tensor.shape}")
+                    if leaf == "weight_scale" and list(tensor.shape) != [rows, cols // 16]:
+                        raise ValueError(f"invalid NVFP4 block scales: {name} {tensor.shape}")
+                    hashes[name] = _hash(tensor)
+    if not shards or expected - set(actual):
+        raise ValueError(f"missing NVFP4 tensors: {sorted(expected - set(actual))[:20]}")
+    index = path / "model.safetensors.index.json"
+    if index.exists():
+        if json.loads(index.read_text()).get("weight_map") != actual:
+            raise ValueError("ModelOpt shard index does not match exported tensors")
+    elif len(shards) != 1:
+        raise ValueError("multi-shard ModelOpt export is missing its safetensors index")
+    return native, hashes
 
 
 def _normalize_quant_algo_for_vllm(export_path: Path) -> None:

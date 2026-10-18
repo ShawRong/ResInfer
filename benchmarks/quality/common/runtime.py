@@ -6,6 +6,7 @@ import os
 import pathlib
 import sys
 
+from benchmarks.checkpoints import validate_kind
 from benchmarks.engine_config import accuracy_engine_config, load_engine_config
 
 
@@ -25,10 +26,12 @@ def install_env(a):
     quantization = getattr(a, "quantization", None)
     if a.bf16 and quantization:
         raise ValueError("--bf16 cannot be combined with --quantization")
+    if a.bf16 and pathlib.Path(a.model).is_dir():
+        validate_kind(a.model, "bf16")
     mxfp4 = quantization == "modelopt_mxfp4"
-    if mxfp4 and any(getattr(a, key, False) for key in (
-            "prefill_residue_off", "residue_off", "prefill_only")):
-        raise ValueError("MXFP4 phase ablations have not been validated by this runner")
+    if (any(getattr(a, key, False) for key in ("prefill_residue_off", "residue_off"))
+            or getattr(a, "prefill_only", None) is not None):
+        raise ValueError("Runtime ablations belong in .dev; use a stock checkpoint for the baseline")
     os.environ["RESIDUE_MXFP4"] = "1" if mxfp4 else "0"
     if mxfp4:
         os.environ["RESIDUE_NVFP4"] = "0"
@@ -43,8 +46,6 @@ def install_env(a):
     if not a.plain and not mxfp4:
         os.environ["RESIDUE_NVFP4"] = "1"
         os.environ["RESIDUE_VLLM_MODEL_DIR"] = a.model
-        # Keep the extended-K loader enabled during ablations. Disable residue
-        # at compute time with the PREFILL_RESIDUE_OFF bounds below.
         os.environ["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
         os.environ["RESIDUE_FORCE_DECODE_MEXT"] = "0"
         os.environ["RESIDUE_DECODE_MEXT_MAX_M"] = str(getattr(a, "mext_max_m", 64))
@@ -52,24 +53,6 @@ def install_env(a):
         for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
             if os.environ.pop(var, None) is not None:
                 print(f"[kit] dropped {var}: incompatible with a residue arm")
-    if getattr(a, "prefill_residue_off", False) or getattr(a, "residue_off", False):
-        if a.plain:
-            raise SystemExit("--prefill-residue-off is meaningless with --plain/--bf16")
-        os.environ["RESIDUE_PREFILL_RESIDUE_OFF"] = "1"
-        if getattr(a, "residue_off", False):
-            # threshold 0 -> every M is "> 0" -> residue killed everywhere
-            os.environ["RESIDUE_PREFILL_RESIDUE_OFF_MIN_M"] = "0"
-    # MAX_M disables residue in the decode band, preserving prefill residue.
-    if getattr(a, "prefill_only", None) is not None:
-        if a.plain:
-            raise SystemExit("--prefill-only is meaningless with --plain/--bf16")
-        os.environ["RESIDUE_PREFILL_RESIDUE_OFF"] = "1"
-        os.environ["RESIDUE_PREFILL_RESIDUE_OFF_MAX_M"] = str(a.prefill_only)
-        if os.environ.get("RESIDUE_PREFILL_RESIDUE_OFF_MIN_M") is not None:
-            # Reject overlapping ablations that would disable residue in both bands.
-            raise SystemExit(
-                "--prefill-only cannot be combined with --residue-off: both "
-                "bounds set kills BOTH bands and yields the plain cell.")
     repo = a.repo or os.environ.get("RESINFER_REPO", "")
     if repo:
         parts = [repo, str(pathlib.Path(repo) / "csrc")]
@@ -99,8 +82,9 @@ def install_env(a):
             "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M",
             "VLLM_DISABLE_COMPILE_CACHE")), flush=True)
     # flashinfer JIT links -lcuda from a stub dir that may not contain it
-    os.environ["LIBRARY_PATH"] = ("/usr/lib/x86_64-linux-gnu:"
-                                  + os.environ.get("LIBRARY_PATH", ""))
+    # Empty entries make GCC search cwd for its own `specs` file.
+    os.environ["LIBRARY_PATH"] = os.pathsep.join(
+        p for p in ["/usr/lib/x86_64-linux-gnu", *os.environ.get("LIBRARY_PATH", "").split(os.pathsep)] if p)
 
 
 def quality_quantization(a):
@@ -201,7 +185,7 @@ def add_runtime_arguments(parser):
     parser.add_argument("--gpu-mem-util", type=float, default=0.55)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--mext-max-m", type=int, default=64)
-    for flag in ("bf16", "plain", "prefill-residue-off", "residue-off"):
+    for flag in ("bf16", "plain"):
         parser.add_argument("--" + flag, action="store_true")
     parser.add_argument("--flashinfer-autotune", action="store_true",
                         help="enable FlashInfer autotuning (default: disabled)")

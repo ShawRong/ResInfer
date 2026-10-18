@@ -19,12 +19,7 @@ def global_scale(t: torch.Tensor) -> torch.Tensor:
 
 
 def make_weight(n: int, k: int, device: torch.device, dtype: torch.dtype):
-    """Quantise a random weight the way vLLM does, and return both forms.
-
-    Both the packed FP4 weight and the bf16 tensor it came from: the latter is
-    the reference the correctness check compares against, so it must be the
-    exact tensor that was quantised, not a fresh draw.
-    """
+    """Quantize a weight with vLLM; retain BF16 for selective K-extension."""
     import torch
     from vllm._custom_ops import scaled_fp4_quant
     from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (

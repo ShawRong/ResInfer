@@ -1,17 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Load a benchmark spec and reconcile it with what the call site supplied.
-
-A spec makes two runs comparable, but only if the run actually obeyed it. So
-loading is not just parsing: `resolve_arms` refuses a run whose arms disagree
-with the spec in EITHER direction. A missing arm silently shrinks the table and
-an extra one silently widens it, and both produce something that looks like a
-complete result.
-
-Paths deliberately live outside the spec (see the header of
-`suites/speed_dense.yaml`): they are site-specific, and putting them in the
-file would destroy the portability the file exists to provide.
-"""
+"""Load benchmark workloads and resolve architecture grids and checkpoint paths."""
 from __future__ import annotations
 
 import pathlib
@@ -49,18 +38,7 @@ def stamp(spec: dict) -> dict:
 
 
 def m_grid_for(spec: dict, family: str, sm: str) -> list[int]:
-    """The M values this manifest says are meaningful for one family on one arch.
-
-    The two families do NOT share a range, and giving them one produced rows
-    describing a path no deployment takes. A K-extended layer is fold-eligible
-    in production, so below the arch's fold band it FOLDS -- it reads the
-    k_base prefix and never touches its salient columns, which is why decode is
-    ratio-blind. The K-extended GEMM only runs above the band. So `kext`
-    declares a floor and `mext` declares a ceiling, and each is read here.
-
-    An architecture the manifest has never sized is refused by the caller
-    rather than handed another arch's numbers.
-    """
+    """Filter each family's grid by its architecture-specific dispatch range."""
     fam = (spec.get("kernel", {}).get("families", {}) or {}).get(family)
     if not isinstance(fam, dict):
         raise SystemExit(
@@ -80,24 +58,13 @@ def m_grid_for(spec: dict, family: str, sm: str) -> list[int]:
 
 
 def ratios_for(spec: dict, family: str) -> list[float]:
-    """Ratios a family sweeps. Only `kext` has any; mext IS ratio 1.0."""
+    """Ratios a family sweeps. `kext` includes ratio-1 prefill; `mext` covers the small-M grid."""
     fam = (spec.get("kernel", {}).get("families", {}) or {}).get(family) or {}
     return [float(x) for x in (fam.get("ratios") or [])]
 
 
 def resolve_arms(spec: dict, models_root: str | pathlib.Path) -> list[dict]:
-    """Turn the manifest's relative arm paths into absolute ones, or refuse.
-
-    Same convention as the quality suites in this directory: each arm's `path`
-    is relative to `--models-root`, so the manifest itself holds no
-    machine-specific path and is the spec you commit.
-
-    Every arm must resolve to something that exists. A manifest whose arms are
-    partly missing would otherwise produce a table that is short a column and
-    looks complete -- so the whole set is checked up front, before any GPU time
-    is spent, and every missing arm is reported at once rather than one per
-    failed run.
-    """
+    """Resolve every declared arm before starting GPU work."""
     root = pathlib.Path(models_root).expanduser().resolve()
     arms = spec.get("arms") or []
     if not arms:
@@ -105,8 +72,8 @@ def resolve_arms(spec: dict, models_root: str | pathlib.Path) -> list[dict]:
 
     resolved, missing = [], []
     for arm in arms:
-        if "id" not in arm or "path" not in arm:
-            raise SystemExit(f"{spec.get('_path')}: arm needs `id` and `path`: {arm}")
+        if not {"id", "path", "kind"} <= arm.keys():
+            raise SystemExit(f"{spec.get('_path')}: arm needs `id`, `path` and `kind`: {arm}")
         full = root / arm["path"]
         if not full.exists():
             missing.append(f"    {arm['id']:<8} -> {full}")

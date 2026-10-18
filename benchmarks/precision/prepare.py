@@ -5,6 +5,8 @@ import json
 import random
 from pathlib import Path
 
+from .compare import LINEAR_SCOPE
+
 
 def token_hash(tokens):
     return hashlib.sha256(json.dumps(tokens).encode()).hexdigest()
@@ -70,7 +72,7 @@ def main():
     protocol = dict(seed=args.seed, selection_population=population, layers=args.layers,
         steps=sorted(args.steps), cases=cases,
         scope='fixed-token B1 replay; same-state operator precision, not model accuracy or E2E speed',
-        mext_scope='shared in-memory quantized weights; activation-residue ablation, not calibrated checkpoint recipes')
+        mext_scope=LINEAR_SCOPE)
     validate_protocol(protocol)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open('x') as f:

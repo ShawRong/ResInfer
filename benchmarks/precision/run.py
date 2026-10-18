@@ -10,7 +10,8 @@ import time
 from functools import partial
 from pathlib import Path
 
-from .compare import compare_attention, compare_linear
+from .compare import (LINEAR_ARMS, LINEAR_SCOPE, check_linear_coverage,
+                      compare_attention, compare_linear, summarize)
 from .prepare import load_protocol
 
 
@@ -137,7 +138,6 @@ def collect_inputs(llm, protocol, root, save_inputs, rows, costs, save):
             kv_cache,
             md,
             output,
-            original,
             history[name],
             case,
             generated,
@@ -265,7 +265,7 @@ def write_runtime(llm, root, names, weights):
                 "device": torch.cuda.get_device_name(),
                 "capability": torch.cuda.get_device_capability(),
                 "source_root": str(Path(__file__).resolve().parents[2]),
-                "mode": "eager collection; isolated ResAttn Graph check",
+                "mode": "eager fixed-token collection",
                 "layers": list(names.values()),
                 "weight_modules": list(weights),
                 "tf32": False,
@@ -305,9 +305,11 @@ def write_results(root, protocol, started, rows, costs, state):
     data = {
         "status": state,
         "scope": protocol["scope"],
-        "mext_scope": protocol["mext_scope"],
+        "mext_scope": LINEAR_SCOPE,
+        "linear_arms": LINEAR_ARMS,
         "elapsed": time.time() - started,
         "rows": rows,
+        "summary": summarize(rows) if state == "completed" else [],
         "costs": costs,
         "peak_gpu_bytes": torch.cuda.max_memory_allocated(),
         "frozen_sha256": hashlib.sha256(
@@ -355,18 +357,12 @@ def main():
             costs,
             save,
         )
-        expected = sum(
-            sum(p < len(c["tokens"]) for p in protocol["steps"])
-            for c in protocol["cases"]
-        )
+        expected = len(protocol["cases"]) * len(protocol["steps"])
         assert (
             sum(r["kind"] == "resattn" for r in rows)
             == expected * len(protocol["layers"]) * 2
         )
-        assert (
-            sum(r["kind"] == "mext" for r in rows)
-            == expected * len(protocol["layers"]) * 4 * 4
-        )
+        check_linear_coverage(rows, protocol, weights)
         save("completed")
         print("COMPLETED", len(rows), flush=True)
     finally:

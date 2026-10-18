@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Pure-Python shape resolution for the SM100 MExt paper sweep.
+"""Shared model/TP shape resolution for Linear kernel sweeps.
 
 The physical GEMM shape is ``A[M,K] @ W[N,K].T``.  A shape may have several
 model/projection/TP aliases; time it once, then retain every alias for analysis.
@@ -20,7 +20,9 @@ def _text_config(config: dict) -> dict:
     return text
 
 
-def projection_shapes(config: dict, projections: list[str]) -> dict[str, tuple[int, int]]:
+def projection_shapes(config: dict, projections: list[str], *,
+                      tp: int = 1) -> dict[str, tuple[int, int]]:
+    """Physical per-rank projections, including gated Q and replicated KV heads."""
     text = _text_config(config)
     model_type = str(text.get("model_type", config.get("model_type", "")))
     if model_type != "qwen3" and not model_type.startswith("qwen3_5"):
@@ -32,15 +34,39 @@ def projection_shapes(config: dict, projections: list[str]) -> dict[str, tuple[i
     v_dim = int(text.get("v_head_dim", text.get("head_dim", 0)))
     if min(h, q_heads, kv_heads, qk_dim, v_dim) <= 0:
         raise ValueError("attention dimensions must be positive")
-    q_out = q_heads * qk_dim
-    k_out = kv_heads * qk_dim
-    v_out = kv_heads * v_dim
-    shapes = {"qkv": (q_out + k_out + v_out, h), "o": (h, q_heads * v_dim)}
+    if type(tp) is not int or tp < 1 or q_heads % tp:
+        raise ValueError(f"Q heads={q_heads} cannot split TP={tp}")
+    if (kv_heads >= tp and kv_heads % tp) or (kv_heads < tp and tp % kv_heads):
+        raise ValueError(f"KV heads={kv_heads} cannot split or replicate for TP={tp}")
+    local_q_heads = q_heads // tp
+    local_kv_heads = max(1, kv_heads // tp)
+    gated_q = model_type.startswith("qwen3_5") and text.get("attn_output_gate", True)
+    q_out = local_q_heads * qk_dim * (2 if gated_q else 1)
+    k_out = local_kv_heads * qk_dim
+    v_out = local_kv_heads * v_dim
+    shapes = {"qkv": (q_out + k_out + v_out, h),
+              "o": (h, local_q_heads * v_dim)}
+    if any(name.startswith("linear_") for name in projections):
+        if not model_type.startswith("qwen3_5"):
+            raise ValueError("linear attention projections require Qwen3.5 config")
+        fields = ("linear_num_key_heads", "linear_num_value_heads",
+                  "linear_key_head_dim", "linear_value_head_dim")
+        missing = [name for name in fields if name not in text]
+        if missing:
+            raise ValueError(f"linear attention config missing {missing}")
+        nk, nv, dk, dv = (int(text[name]) for name in fields)
+        if min(nk, nv, dk, dv) <= 0 or nk % tp or nv % tp or nv % nk:
+            raise ValueError(f"linear attention heads={nk}/{nv} cannot split TP={tp}")
+        key_width, value_width = nk * dk // tp, nv * dv // tp
+        # vLLM QwenGatedDeltaNetAttention: fused Q/K/V/Z and row-parallel out.
+        # The small b/a gate is generally excluded from FP4 exports.
+        shapes.update({"linear_in_proj_qkvz": (2 * (key_width + value_width), h),
+                       "linear_out_proj": (h, value_width)})
     if "gate_up" in projections or "down" in projections:
         inter = int(text["intermediate_size"])
-        if inter <= 0:
-            raise ValueError("intermediate_size must be positive")
-        shapes.update({"gate_up": (2 * inter, h), "down": (h, inter)})
+        if inter <= 0 or inter % tp:
+            raise ValueError(f"intermediate_size={inter} cannot split TP={tp}")
+        shapes.update({"gate_up": (2 * (inter // tp), h), "down": (h, inter // tp)})
     return {name: shapes[name] for name in projections}
 
 
@@ -69,18 +95,10 @@ def resolve(suite: dict, overrides: dict[str, Path],
         sources[model] = {**source,
                           "model_type": text.get("model_type", config.get("model_type")),
                           "tp_values": tp_values}
-        for projection, (n_full, k_full) in projection_shapes(
-            config, model_spec["projections"]
-        ).items():
-            for tp in tp_values:
-                if projection in {"qkv", "gate_up"}:
-                    if n_full % tp:
-                        raise ValueError(f"{model}/{projection} N={n_full} cannot split TP={tp}")
-                    n, k = n_full // tp, k_full
-                else:
-                    if k_full % tp:
-                        raise ValueError(f"{model}/{projection} K={k_full} cannot split TP={tp}")
-                    n, k = n_full, k_full // tp
+        for tp in tp_values:
+            for projection, (n, k) in projection_shapes(
+                config, model_spec["projections"], tp=tp,
+            ).items():
                 if n % 32 or k % 64:
                     raise ValueError(f"{model}/{projection}/tp{tp} yields unaligned N={n},K={k}")
                 item = by_shape.setdefault((n, k), {"n": n, "k": k, "aliases": []})

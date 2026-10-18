@@ -14,7 +14,7 @@ import sys
 from benchmarks.quality.common.results import input_hash
 
 COMMIT = "28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24"
-PROTOCOL = "lcb-release_v6-audited-20261013"
+PROTOCOL = "lcb-release_v6-audited-20261015-fd-stdout"
 CHECKS = json.loads(Path(__file__).with_name("checks.json").read_text())
 
 

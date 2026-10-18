@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Dense TensorRT-LLM NVFP4-weight/FP8-activation paper arm.
+"""Dense TensorRT-LLM W4A8 benchmark callables.
 
-The contract follows TensorRT-LLM's W4A8NVFP4FP8LinearMethod: block-32
-weight scales, shuffled weight rows/scales, per-tensor FP8 activation
-quantization, and fp4_fp8_gemm_trtllmgen. Imports remain lazy so dry-run and
-CPU-only aggregation do not depend on TensorRT-LLM.
+NVFP4/FP8 follows W4A8NVFP4FP8LinearMethod with block-32 weight scales.
+MXFP4/MXFP8 shares the existing packed MXFP4 weights and uses TRT's native
+quantizer/GEMM runner, with tactic selection delegated to FlashInfer.
+Imports stay lazy so CPU aggregation and dry-run need no GPU packages.
 """
 
 from __future__ import annotations
@@ -37,8 +37,7 @@ def require_dense_ops():
         raise RuntimeError("cannot load TensorRT-LLM FP4 layout utility")
     fp4_utils = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(fp4_utils)
-    for namespace, name in (("trtllm", "fp4_quantize"),
-                            ("trtllm", "shuffle_matrix"),
+    for namespace, name in (("trtllm", "shuffle_matrix"),
                             ("trtllm", "fp4_fp8_gemm_trtllmgen"),
                             ("tensorrt_llm", "static_quantize_e4m3_per_tensor")):
         if not hasattr(getattr(torch.ops, namespace), name):
@@ -47,7 +46,7 @@ def require_dense_ops():
 
 
 def prepare_weight(weight, fp4_utils):
-    """Encode one synthetic BF16 [N,K] weight in the ModelOpt W4A8 layout."""
+    """Encode a BF16/FP16 [N,K] weight in the ModelOpt W4A8 layout."""
     import torch
 
     n, k = weight.shape
@@ -90,3 +89,39 @@ def linear(x, weight, weight_scale, input_global_scale, alpha):
         x, input_global_scale)
     return torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(
         x_fp8, weight, weight_scale, alpha, torch.bfloat16)
+
+
+def make_mxfp8_runner(device):
+    """Use TRT's native MXFP4/MXFP8 runner with the shared FlashInfer tuner.
+
+    Loading only the native library avoids importing TRT's serving/MPI stack.
+    Quantization is inside the runner, so tuning and timing cover the same work.
+    """
+    import torch
+    from flashinfer.autotuner import AutoTuner, TunableRunner, TuningConfig
+
+    fp4_utils = require_dense_ops()
+    native = torch.classes.trtllm.FP4GemmRunner(
+        torch.bfloat16, int(fp4_utils.FP4GemmType.W4A8_MXFP4_MXFP8))
+    alpha = torch.ones(1, device=device, dtype=torch.float32)
+
+    class Runner(TunableRunner):
+        def get_valid_tactics(self, inputs, profile):
+            return list(range(native.get_num_configs()))
+
+        def forward(self, inputs, tactic=-1, **kwargs):
+            x, weight, weight_scale = inputs
+            x_fp8, x_scale = torch.ops.trtllm.mxfp8_quantize(x, True)
+            return native.run_gemm(
+                x_fp8, weight, x_scale, weight_scale, alpha,
+                0, tactic, None, None)  # TRT BufferKind.DEFAULT
+
+    runners, config = [Runner()], TuningConfig()
+
+    def linear_mxfp8(x, weight, weight_scale):
+        inputs = [x, weight, weight_scale]
+        runner, tactic = AutoTuner.get().choose_one(
+            "resinfer_bench::trtllm_mxfp4_mxfp8", runners, config, inputs)
+        return runner.forward(inputs, tactic=tactic)
+
+    return linear_mxfp8

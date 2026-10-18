@@ -35,18 +35,24 @@ def call_method(method, inputs, source_fd=None):
             os.close(saved_stdin)
 
 
-class _CaptureBuffer(io.BytesIO):
-    def close(self):
-        if not self.closed:
-            self.final_value = self.getvalue()
-        super().close()
-
-
 class Capturing(list):
+    def __init__(self, source_fd=None):
+        super().__init__()
+        self.source_fd = source_fd
+
     def __enter__(self):
         self.previous = sys.stdout
-        self.buffer = _CaptureBuffer()
-        self.stream = io.TextIOWrapper(self.buffer, encoding='utf-8', write_through=True)
+        self.previous.flush()
+        self.source = (os.fdopen(os.dup(self.source_fd), 'w+b') if self.source_fd is not None else
+                       os.fdopen(os.memfd_create('lcb-stdout'), 'w+b')
+                       if hasattr(os, 'memfd_create') else tempfile.TemporaryFile('w+b'))
+        self.source.seek(0)
+        self.source.truncate()
+        self.saved_stdout = os.dup(1)
+        os.dup2(self.source.fileno(), 1)
+        # Keep a separate reader alive even if the candidate closes stdout.
+        self.stream = io.TextIOWrapper(io.FileIO(1, 'w', closefd=False),
+                                       encoding='utf-8', write_through=True)
         sys.stdout = self.stream
         return self
 
@@ -54,11 +60,17 @@ class Capturing(list):
         try:
             if not self.stream.closed:
                 self.stream.flush()
-            value = self.buffer.final_value if self.buffer.closed else self.buffer.getvalue()
+            self.source.seek(0)
+            value = self.source.read()
             self.append(value.decode('utf-8', errors='replace'))
         finally:
             sys.stdout = self.previous
-            self.stream.close()
+            os.dup2(self.saved_stdout, 1)
+            os.close(self.saved_stdout)
+            try:
+                self.stream.close()
+            finally:
+                self.source.close()
 
 
 def install(executor):
@@ -67,5 +79,8 @@ def install(executor):
         # Prepare the unlinked file before run_test's reliability_guard disables
         # unlink/getcwd. Linux uses memfd and needs no persistent backing file.
         executor._resinfer_stdin_file = tempfile.TemporaryFile('w+b')
+        executor._resinfer_stdout_file = tempfile.TemporaryFile('w+b')
         executor.call_method = partial(call_method, source_fd=executor._resinfer_stdin_file.fileno())
-    executor.Capturing = Capturing
+        executor.Capturing = partial(Capturing, source_fd=executor._resinfer_stdout_file.fileno())
+    else:
+        executor.Capturing = Capturing

@@ -1,0 +1,107 @@
+{
+  "qwen3_4b": {
+    "tp_values": [
+      1
+    ],
+    "projections": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down"
+    ],
+    "config": {
+      "model_type": "qwen3",
+      "hidden_size": 2560,
+      "intermediate_size": 9728,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128
+    }
+  },
+  "qwen3_8b": {
+    "tp_values": [
+      1
+    ],
+    "projections": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down"
+    ],
+    "config": {
+      "model_type": "qwen3",
+      "hidden_size": 4096,
+      "intermediate_size": 12288,
+      "num_attention_heads": 32,
+      "num_key_value_heads": 8,
+      "head_dim": 128
+    }
+  },
+  "qwen3_14b": {
+    "tp_values": [
+      1
+    ],
+    "projections": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down"
+    ],
+    "config": {
+      "model_type": "qwen3",
+      "hidden_size": 5120,
+      "intermediate_size": 17408,
+      "num_attention_heads": 40,
+      "num_key_value_heads": 8,
+      "head_dim": 128
+    }
+  },
+  "qwen3_32b": {
+    "tp_values": [
+      1
+    ],
+    "projections": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down"
+    ],
+    "config": {
+      "model_type": "qwen3",
+      "hidden_size": 5120,
+      "intermediate_size": 25600,
+      "num_attention_heads": 64,
+      "num_key_value_heads": 8,
+      "head_dim": 128
+    }
+  },
+  "qwen35_27b": {
+    "tp_values": [
+      1
+    ],
+    "projections": [
+      "qkv",
+      "o",
+      "gate_up",
+      "down",
+      "linear_in_proj_qkvz",
+      "linear_out_proj"
+    ],
+    "config": {
+      "model_type": "qwen3_5",
+      "text_config": {
+        "model_type": "qwen3_5_text",
+        "hidden_size": 5120,
+        "intermediate_size": 17408,
+        "num_attention_heads": 24,
+        "num_key_value_heads": 4,
+        "head_dim": 256,
+        "full_attention_interval": 4,
+        "linear_num_key_heads": 16,
+        "linear_num_value_heads": 48,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128
+      }
+    }
+  }
+}

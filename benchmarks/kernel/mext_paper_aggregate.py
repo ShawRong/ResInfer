@@ -14,9 +14,11 @@ from pathlib import Path
 _COMPARISONS = (
     ("by_m", "mext", "mext_r1", None),
     ("mxfp4_by_m", "mxfp4_mext", "resinfer_mxfp4_mext_r1",
-     ("fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp4_cutedsl_quant", "fi_mxfp4_mxfp8_w4a8")),
+     ("fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp4_cutedsl_quant",
+      "fi_mxfp4_mxfp8_w4a8", "trtllm_mxfp4_mxfp8_w4a8")),
     ("mxfp4_tuned_by_m", "mxfp4_tuned", "resinfer_mxfp4_mext_r1_tuned",
-     ("resinfer_mxfp4_mext_r1", "fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp4_cutedsl_quant")),
+     ("resinfer_mxfp4_mext_r1", "fi_mxfp4_mxfp4_stock", "fi_mxfp4_mxfp4_cutedsl_quant",
+      "fi_mxfp4_mxfp8_w4a8", "trtllm_nvfp4_fp8_w4a8", "trtllm_mxfp4_mxfp8_w4a8")),
 )
 
 
@@ -82,7 +84,8 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
     macro = {field: defaultdict(list) for field, *_ in _COMPARISONS}
     for shape in shapes:
         for m in m_values:
-            latency, process_range, ratios = {}, {}, {}
+            latency, process_range, ratios, selections = {}, {}, {}, {}
+            samples_by_arm = {}
             for arm in arms:
                 rows = [observed[(rep, shape["shape_id"], m, arm)] for rep in range(len(files))]
                 samples = [row["us"] for row in rows if row["status"] == "passed"]
@@ -90,18 +93,22 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                     continue
                 if len(samples) != len(files):
                     raise ValueError(f"incomplete repetitions: {shape['shape_id']} M={m} {arm}")
+                selections[arm] = sorted({row.get("selection", "unrecorded") for row in rows})
+                samples_by_arm[arm] = samples
                 latency[arm] = statistics.median(samples)
                 process_range[arm] = [min(samples), max(samples)]
             for field, prefix, numerator, comparisons in _COMPARISONS:
                 for arm in (arms if comparisons is None else comparisons):
                     if numerator in latency and arm in latency and arm != numerator:
-                        ratio = latency[numerator] / latency[arm]
+                        ratio = statistics.median(
+                            a / b for a, b in zip(samples_by_arm[numerator], samples_by_arm[arm]))
                         ratios[f"{prefix}_over_{arm}"] = ratio
                         macro[field][(arm, m)].append(ratio)
             points.append({**shape, "m": m, "latency_us": latency,
-                           "process_range_us": process_range, "ratios": ratios})
+                           "process_range_us": process_range, "selection": selections, "ratios": ratios})
     summary = {"schema": 1, "status": "complete",
-               "run_id": run_id,
+               "ratio_stat": "median_of_paired_process_ratios",
+               "run_id": run_id, "arms": arms, "required_arms": sorted(required),
                "process_reps": len(files), "unique_shapes": len(shapes), "points": points}
     for field, groups in macro.items():
         summary[field] = [
@@ -118,7 +125,7 @@ def write_outputs(summary: dict, directory: Path) -> None:
     with (directory / "points.csv").open("w", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=[
             "shape_id", "n", "k", "m", "models_projections_tp", "arm",
-            "latency_us", "process_min_us", "process_max_us", *ratio_columns])
+            "latency_us", "selection", "process_min_us", "process_max_us", *ratio_columns])
         writer.writeheader()
         for point in summary["points"]:
             base = {key: point[key] for key in ("shape_id", "n", "k", "m")}
@@ -127,6 +134,7 @@ def write_outputs(summary: dict, directory: Path) -> None:
             for arm, us in point["latency_us"].items():
                 low, high = point["process_range_us"][arm]
                 writer.writerow({**base, "arm": arm, "latency_us": us,
+                                 "selection": ";".join(point["selection"][arm]),
                                  "process_min_us": low, "process_max_us": high,
                                  **{f"{prefix}_over_arm": point["ratios"].get(f"{prefix}_over_{arm}")
                                     for _, prefix, *_ in _COMPARISONS}})

@@ -45,6 +45,8 @@ def resolve_hf_auto_model_class(
 
     if model_loader == "multimodal_lm" or has_multimodal_config:
         auto_cls = getattr(transformers_module, "AutoModelForMultimodalLM", None)
+        if auto_cls is None and getattr(config, "vision_config", None) is not None:
+            auto_cls = getattr(transformers_module, "AutoModelForImageTextToText", None)
         if auto_cls is None:
             raise RuntimeError(
                 "This checkpoint requires AutoModelForMultimodalLM, but the "

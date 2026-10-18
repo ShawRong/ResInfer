@@ -7,10 +7,24 @@ import json
 from pathlib import Path
 
 
+MODEL_CATALOG = Path(__file__).resolve().parents[1] / "suites" / "linear_models.json"
+
+
+def load_models(names: list[str]) -> dict:
+    """Select model definitions from the shared Linear benchmark catalog."""
+    catalog = json.loads(MODEL_CATALOG.read_text())
+    unknown = set(names) - catalog.keys()
+    if unknown or len(set(names)) != len(names):
+        raise ValueError(f"unknown or duplicate models: {names}")
+    return {name: dict(catalog[name], config_source=str(MODEL_CATALOG)) for name in names}
+
+
 def load_suite(path: str | Path) -> dict:
     suite = json.loads(Path(path).read_text())
     if not suite.get("name") or not suite.get("models"):
         raise ValueError("suite needs name and models")
+    if isinstance(suite["models"], list):
+        suite["models"] = load_models(suite["models"])
     for model, spec in suite["models"].items():
         tp_values = spec.get("tp_values")
         if tp_values is None:
@@ -62,7 +76,7 @@ def load_model_config(model: str, spec: dict, path: Path | None) -> tuple[dict, 
     elif "config" in spec:
         config = spec["config"]
         raw = json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
-        origin = "suite:inline"
+        origin = spec.get("config_source", "suite:inline")
     else:
         raise ValueError(
             f"{model} needs --model-config {model}=<checkpoint/config.json>; "

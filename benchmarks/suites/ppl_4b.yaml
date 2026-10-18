@@ -1,30 +1,27 @@
-# Official lm-eval WikiText word/byte metrics; distinct from historical token PPL.
-# Run with --no-gate after a dedicated likelihood repeatability preflight.
-name: wikitext_4b_lmeval
+
+name: wikitext_4b_lmeval_stock_baseline_v2
 venue: ppl
 tasks: wikitext
 max_model_len: 2048
 max_num_seqs: 8
-
 reference: bf16
 baseline: plain
-
-# Run with --no-gate; the A-B-A diagnostic covers generation tasks only.
-
 arms:
-  - id: bf16
-    path: base_bf16
-    flags: ["--bf16"]
-  - id: plain
-    path: uniform_r0125
-    flags: ["--residue-off"]
-  - id: uniform_r0125
-    path: uniform_r0125
-  - id: uniform_r025
-    path: uniform_r025
-  - id: uniform_r05
-    path: uniform_r05
-  - id: uniform_r10
-    path: uniform_r10
-  - id: anchor
-    path: anchor
+- id: bf16
+  path: base_bf16
+  flags:
+  - --bf16
+- id: plain
+  path: plain_nvfp4
+  flags:
+  - --plain
+- id: uniform_r0125
+  path: uniform_r0125
+- id: uniform_r025
+  path: uniform_r025
+- id: uniform_r05
+  path: uniform_r05
+- id: uniform_r10
+  path: uniform_r10
+- id: anchor
+  path: anchor

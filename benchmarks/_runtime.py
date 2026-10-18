@@ -107,12 +107,17 @@ TRACKED_ENV = (
     "RESIDUE_PREFILL_RESIDUE_OFF", "RESIDUE_TENSOR_DUMP", "RESIDUE_SWAP",
     "VLLM_DISABLE_COMPILE_CACHE", "VLLM_BATCH_INVARIANT", "VLLM_PLUGINS",
     "FLASHINFER_CUBIN_DIR", "CUDA_VISIBLE_DEVICES",
+    "RESIDUE_MXFP4", "RESIDUE_MXFP4_FOLD_TUNER", "RESIDUE_MXFP4_TP_EXPERIMENTAL",
+    "RESIDUE_SHARE_AUTOTUNE_CACHE", "RESIDUE_ATTN", "VLLM_ENABLE_V1_MULTIPROCESSING",
+    "CPATH", "CUDA_HOME",
 )
 
 
-def assert_gpu_exclusive(gpu: int, exclusive: bool = True) -> list[dict]:
+def assert_gpu_exclusive(gpu: int, exclusive: bool = True, *,
+                         physical: bool = False) -> list[dict]:
     """Reject other compute processes; failed ownership queries are errors."""
-    rows = _nvsmi(physical_index(gpu), "compute-apps=pid,used_memory", required=True)
+    rows = _nvsmi(gpu if physical else physical_index(gpu),
+                  "compute-apps=pid,used_memory", required=True)
     me = os.getpid()
     others = []
     for line in rows:
@@ -120,41 +125,26 @@ def assert_gpu_exclusive(gpu: int, exclusive: bool = True) -> list[dict]:
         if not parts[0].isdigit():
             raise RuntimeError(f"Unrecognized GPU process row: {line!r}")
         if int(parts[0]) != me:
-            # Identity NOW: the neighbour may exit before anyone asks whose
-            # job it was, and then the pid alone answers nothing.
-            other = {"used_mib": parts[1] if len(parts) > 1 else None}
-            other.update(pid_identity(int(parts[0])))
-            others.append(other)
+            others.append({"pid": int(parts[0]),
+                           "used_mib": parts[1] if len(parts) > 1 else None})
     if others and exclusive:
-        listing = "\n".join(
-            f"    pid {o['pid']}  {o['used_mib']} MiB"
-            + (f"\n      cmd  {o['cmdline']}" if o.get("cmdline") else "")
-            + (f"\n      cwd  {o['cwd']}" if o.get("cwd") else "")
-            + (f"\n      ({o['note']})" if o.get("note") else "")
-            for o in others)
-        raise SystemExit(
-            f"gpu{gpu} is NOT exclusive -- {len(others)} other compute "
-            f"process(es):\n{listing}\n"
-            f"  This benchmark measures time, so a neighbour invalidates it. "
-            f"Free memory is not\n  the test: 1.4 GiB clears any threshold and "
-            f"still takes SMs. Use an empty GPU,\n  or --allow-shared-gpu, "
-            f"which annotates every row instead of cleaning anything.")
+        raise SystemExit(f"GPU {gpu} is NOT exclusive: {others}. Use an idle GPU.")
     if others:
-        print(f"[bench] WARNING: sharing gpu{gpu} with "
-              f"{[o['pid'] for o in others]} -- every row is annotated; these "
-              f"timings are not clean.", flush=True)
+        print(f"[bench] WARNING: GPU {gpu} is shared: {others}", flush=True)
     return others
 
 
-def provenance(gpu: int, run_id: str) -> dict:
+def runtime_provenance() -> dict:
+    """Record source, installed extension and versions without selecting a GPU."""
     import torch
 
-    spec = importlib.util.find_spec("nvfp4._C")
+    try:
+        spec = importlib.util.find_spec("nvfp4._C")
+    except ModuleNotFoundError:
+        spec = None
     so = pathlib.Path(spec.origin) if spec and spec.origin else None
-    major, minor = torch.cuda.get_device_capability(gpu)
     return {
         "kind": "provenance",
-        "run_id": run_id,
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "repo_root": str(REPO_ROOT),
         "git_commit": _git("rev-parse", "HEAD"),
@@ -165,50 +155,19 @@ def provenance(gpu: int, run_id: str) -> dict:
                                        time.gmtime(so.stat().st_mtime))
                          if so else None),
         "ext_so_md5": _md5(so) if so else None,
-        "sm": f"sm{major}{minor}",
         "python": sys.version.split()[0],
         "platform": platform.platform(),
         "torch": _version("torch"),
         "vllm": _version("vllm"),
         "flashinfer": _version("flashinfer"),
         "cuda": torch.version.cuda,
-        "gpu": gpu_state(gpu),
         "env": {k: os.environ.get(k, "<unset>") for k in TRACKED_ENV},
     }
 
 
+def provenance(gpu: int, run_id: str) -> dict:
+    import torch
 
-
-def pid_identity(pid: int) -> dict:
-    """Capture available /proc identity now; missing fields mean the PID exited."""
-    import os
-    import pathlib
-
-    out: dict = {"pid": int(pid)}
-    base = pathlib.Path(f"/proc/{int(pid)}")
-    try:
-        raw = (base / "cmdline").read_bytes()
-        cmd = raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
-        if cmd:
-            out["cmdline"] = cmd[:300]
-    except OSError:
-        pass
-    try:
-        # os.readlink, not Path.resolve(): resolve() is non-strict by default
-        # and happily returns "/proc/<dead pid>/cwd" for a process that no
-        # longer exists -- a plausible-looking string standing in for a
-        # missing fact, which is the one thing this helper must not produce.
-        out["cwd"] = os.readlink(str(base / "cwd"))
-    except OSError:
-        pass
-    try:
-        # Field 22 of /proc/pid/stat is starttime in clock ticks since boot.
-        # comm may contain spaces/parens, so split after the last ')'.
-        stat = (base / "stat").read_text()
-        fields = stat[stat.rfind(")") + 1:].split()
-        out["start_ticks"] = int(fields[19])
-    except (OSError, IndexError, ValueError):
-        pass
-    if len(out) == 1:
-        out["note"] = "process already exited -- identity unrecoverable"
-    return out
+    major, minor = torch.cuda.get_device_capability(gpu)
+    return {**runtime_provenance(), "run_id": run_id,
+            "sm": f"sm{major}{minor}", "gpu": gpu_state(gpu)}

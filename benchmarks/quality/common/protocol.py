@@ -4,6 +4,8 @@ from __future__ import annotations
 import json
 import pathlib
 
+from benchmarks.checkpoints import validate_kind
+
 SAMPLING_FIELDS = (
     "temperature",
     "top_p",
@@ -80,11 +82,13 @@ def resolve_arms(man: dict, models_root: str, only: str | None) -> list[dict]:
     for arm in arms:
         if "id" not in arm or "path" not in arm or "kind" not in arm:
             raise SystemExit(f"{man['_path']}: arm needs id/path/kind: {arm}")
-        if arm["kind"] not in ("fp16", "residue", "modelopt_fp4"):
+        if arm["kind"] not in ("bf16", "fp16", "residue", "modelopt_fp4"):
             raise SystemExit(
                 f"arm {arm['id']}: unknown kind {arm['kind']!r} "
-                f"(expected fp16 | residue | modelopt_fp4)"
+                f"(expected bf16 | residue | modelopt_fp4)"
             )
+        if arm.get("mext", "on") != "on":
+            raise ValueError("Runtime ablations moved to .dev/suites/quality_ablations")
         full = root / arm["path"]
         if not full.exists():
             missing.append(f"    {arm['id']:<16} -> {full}")
@@ -108,7 +112,9 @@ def resolve_arms(man: dict, models_root: str, only: str | None) -> list[dict]:
                 f"arm {arm['id']}: model_type {actual_type!r} does not match "
                 f"protocol {man['model_type']!r}; choose a model-specific manifest"
             )
-        resolved.append(dict(arm, abs_path=str(full)))
+        validate_kind(full, arm["kind"])
+        resolved.append(dict(arm, kind="bf16" if arm["kind"] == "fp16" else arm["kind"],
+                             abs_path=str(full)))
     if missing:
         raise SystemExit(
             f"manifest {man['name']}: {len(missing)} arm path(s) not found "

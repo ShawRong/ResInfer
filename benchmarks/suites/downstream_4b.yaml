@@ -1,33 +1,28 @@
 
-
-
-
-
-name: downstream_4b
+name: downstream_4b_stock_baseline_v2
 venue: task
 tasks: gsm8k,arc_challenge,hellaswag,piqa,winogrande
 max_model_len: 4096
 max_num_seqs: 8
-
 reference: bf16
 baseline: plain
-
 gate:
   model_a: anchor
   model_b: uniform_r0125
   task: 2wikimqa
   limit: 100
-
 arms:
-  - id: bf16
-    path: base_bf16
-    flags: ["--bf16"]
-  - id: plain
-    path: uniform_r0125
-    flags: ["--residue-off"]
-  - id: uniform_r0125
-    path: uniform_r0125
-  - id: uniform_r025
-    path: uniform_r025
-  - id: anchor
-    path: anchor
+- id: bf16
+  path: base_bf16
+  flags:
+  - --bf16
+- id: plain
+  path: plain_nvfp4
+  flags:
+  - --plain
+- id: uniform_r0125
+  path: uniform_r0125
+- id: uniform_r025
+  path: uniform_r025
+- id: anchor
+  path: anchor

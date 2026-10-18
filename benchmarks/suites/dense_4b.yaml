@@ -1,124 +1,34 @@
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-name: dense_4b_lmeval
+name: dense_4b_lmeval_stock_baseline_v2
 tasks: longbench_passage_retrieval_en,longbench_2wikimqa,longbench_musique,longbench_hotpotqa
 apply_chat_template: false
 truncation_side: middle
 max_model_len: 32768
 max_num_seqs: 8
-
-
-
-
-
 reference: bf16
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 baseline: plain_stock
-
-# Without this the suite prints scores and venue conditioning and NO paired
-# comparison -- the thing the table exists to produce -- and nothing says the
-# comparisons were never declared. Same failure family as a scores table
-# printed without its conditioning gate: an absence that reads as a result.
-#
-# The last pair is the one the paper turns on. `anchor` and `uniform_r0125`
-# cost the SAME 4.4998 bits (parameter-weighted, metadata-less layers at ratio
-# 0), so this is like-for-like: does spending that budget where the solver
-# says beat spreading it evenly?
-#
-# Kept on ONE line deliberately. A folded block scalar (`>-`) parses under
-# PyYAML and not under this kit's no-dependency fallback -- the exact
-# machine-dependent split already closed once in this directory, and the kit's
-# premise is that it installs nothing on the machine it was written for.
-compare: uniform_r0125 vs uniform_r0125_off; uniform_r025 vs uniform_r025_off; anchor vs anchor_off; uniform_r0125 vs plain_stock; uniform_r0125 vs plain_runtime_off; anchor vs uniform_r0125
-
-# Runs before any arm and blocks the suite. Two DIFFERENT checkpoints, because
-# a same-checkpoint gate cannot see queue contamination.
+compare: uniform_r0125 vs plain_stock; uniform_r025 vs plain_stock; anchor vs plain_stock
 gate:
   model_a: anchor
   model_b: uniform_r0125
   task: longbench_2wikimqa
   limit: 100
-
 arms:
-  # --- reference points ---------------------------------------------------
-  - id: bf16
-    path: base_bf16
-    flags: ["--bf16"]
-  # The deployment alternative: a separate plain NVFP4 export, stock vLLM.
-  # Verified bit-identical base weights to the residue exports
-  # (q_proj base slice md5 685d99484524), so this differs from them in the
-  # method and the serving path, not in the quantisation of the base.
-  - id: plain_stock
-    path: plain_nvfp4
-    flags: ["--plain"]
-  # The mechanism isolation: same checkpoint as uniform_r0125, residue killed
-  # at every M. Kept because it needs no second export and varies exactly one
-  # thing -- but it is NOT the floor a recovery percentage should divide by.
-  - id: plain_runtime_off
-    path: uniform_r0125
-    flags: ["--residue-off"]
-
-  # --- the uniform ladder -------------------------------------------------
-  - id: uniform_r0125
-    path: uniform_r0125
-  - id: uniform_r025
-    path: uniform_r025
-  - id: uniform_r05
-    path: uniform_r05
-  - id: uniform_r10
-    path: uniform_r10
-
-  # --- the solver's plan, read against the uniform arm of EQUAL budget -----
-  - id: anchor
-    path: anchor
-
-  # --- prefill isolated: same weights, one environment variable -----------
-  # A within-checkpoint contrast, so it needs no bf16 ceiling. The ceiling is
-  # only required to express a result as "% of quantisation damage recovered".
-  - id: uniform_r0125_off
-    path: uniform_r0125
-    flags: ["--prefill-residue-off"]
-  - id: uniform_r025_off
-    path: uniform_r025
-    flags: ["--prefill-residue-off"]
-  - id: uniform_r10_off
-    path: uniform_r10
-    flags: ["--prefill-residue-off"]
-  - id: anchor_off
-    path: anchor
-    flags: ["--prefill-residue-off"]
+- id: bf16
+  path: base_bf16
+  flags:
+  - --bf16
+- id: plain_stock
+  path: plain_nvfp4
+  flags:
+  - --plain
+- id: uniform_r0125
+  path: uniform_r0125
+- id: uniform_r025
+  path: uniform_r025
+- id: uniform_r05
+  path: uniform_r05
+- id: uniform_r10
+  path: uniform_r10
+- id: anchor
+  path: anchor
