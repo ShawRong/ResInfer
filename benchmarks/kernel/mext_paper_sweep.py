@@ -96,10 +96,6 @@ def _prepare(args: argparse.Namespace) -> dict:
         source_commit = live_commit
     if not args.dry_run and not source_commit:
         raise ValueError("archive-based GPU runs require --source-commit")
-    required_arms = suite.get("required_arms", suite["arms"])
-    if len(set(required_arms)) != len(required_arms) or set(required_arms) - set(suite["arms"]):
-        raise ValueError("required_arms must be a unique subset of suite arms")
-    required_arms = [arm for arm in required_arms if arm in arms]
     subset = bool(args.models or args.shape_id or set(m_values) != set(suite["m_values"])
                   or set(arms) != set(suite["arms"]) or reps != suite["process_reps"])
     return {"scope": "subset" if subset else "full_suite", "suite_arms": suite["arms"],
@@ -108,7 +104,7 @@ def _prepare(args: argparse.Namespace) -> dict:
             "suite_sha256": hashlib.sha256(args.suite.read_bytes()).hexdigest(),
             "source_commit": source_commit,
             "config_sources": sources, "shapes": shapes, "m_values": m_values,
-            "arms": arms, "required_arms": required_arms, "process_reps": reps,
+            "arms": arms, "process_reps": reps,
             "timing_repeats": suite["timing_repeats"], "required_env": REQUIRED_ENV}
 
 
@@ -153,7 +149,7 @@ def _driver(args: argparse.Namespace) -> int:
                                    cwd=pathlib.Path(__file__).resolve().parents[2], check=True)
                 stream.write(stem.with_suffix(".jsonl").read_text())
     summary = aggregate(files, resolved["shapes"], resolved["m_values"],
-                        resolved["arms"], resolved["required_arms"],
+                        resolved["arms"],
                         run_id=resolved["run_id"])
     summary.update(scope=resolved["scope"], suite=resolved["suite"],
                    suite_arms=resolved["suite_arms"])

@@ -29,18 +29,6 @@
     "trtllm_nvfp4_fp8_w4a8",
     "trtllm_mxfp4_mxfp8_w4a8"
   ],
-  "required_arms": [
-    "mext_r1",
-    "fi_nvfp4_cutlass",
-    "fi_nvfp4_cutedsl",
-    "resinfer_mxfp4_mext_r1",
-    "resinfer_mxfp4_mext_r1_tuned",
-    "fi_mxfp4_mxfp4_stock",
-    "fi_mxfp4_mxfp4_cutedsl_quant",
-    "fi_mxfp4_mxfp8_w4a8",
-    "trtllm_nvfp4_fp8_w4a8",
-    "trtllm_mxfp4_mxfp8_w4a8"
-  ],
   "models": [
     "qwen3_4b",
     "qwen3_8b",

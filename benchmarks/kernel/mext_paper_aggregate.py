@@ -36,18 +36,11 @@ def _rows(path: Path) -> list[dict]:
 
 
 def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
-              arms: list[str], required_arms: list[str] | None = None, *,
+              arms: list[str], *,
               run_id: str | None = None) -> dict:
-    """Validate one run and summarize its complete measurement matrix.
-
-    All requested arms are required unless required_arms is supplied. An optional
-    arm can be skipped in every repetition; partial samples cannot form a median.
-    """
+    """Summarize a complete run: every selected arm must pass every repetition."""
     if not files or not shapes or not m_values or not arms:
         raise ValueError("empty measurement matrix")
-    required = set(arms if required_arms is None else required_arms)
-    if required - set(arms):
-        raise ValueError("required arms missing from suite")
     expected = {(rep, shape["shape_id"], m, arm)
                 for rep in range(len(files)) for shape in shapes
                 for m in m_values for arm in arms}
@@ -67,15 +60,11 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
             shape = shape_by_id[key[1]]
             if any(row.get(field) != shape[field] for field in ("n", "k", "aliases")):
                 raise ValueError(f"shape metadata mismatch: {key}")
-            status = row.get("status")
-            if key[3] in required and status != "passed":
-                raise ValueError(f"required arm did not pass: {key}")
-            if status == "passed":
-                us = row.get("us")
-                if type(us) not in (int, float) or not math.isfinite(us) or us <= 0:
-                    raise ValueError(f"invalid latency: {key}")
-            elif status != "skipped" or not row.get("reason"):
-                raise ValueError(f"failed or invalid measurement: {key}")
+            if row.get("status") != "passed":
+                raise ValueError(f"selected arm did not pass: {key}")
+            us = row.get("us")
+            if type(us) not in (int, float) or not math.isfinite(us) or us <= 0:
+                raise ValueError(f"invalid latency: {key}")
             observed[key] = row
     if expected - observed.keys():
         raise ValueError(f"missing {len(expected - observed.keys())} cells")
@@ -88,11 +77,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
             samples_by_arm = {}
             for arm in arms:
                 rows = [observed[(rep, shape["shape_id"], m, arm)] for rep in range(len(files))]
-                samples = [row["us"] for row in rows if row["status"] == "passed"]
-                if not samples:
-                    continue
-                if len(samples) != len(files):
-                    raise ValueError(f"incomplete repetitions: {shape['shape_id']} M={m} {arm}")
+                samples = [row["us"] for row in rows]
                 selections[arm] = sorted({row.get("selection", "unrecorded") for row in rows})
                 samples_by_arm[arm] = samples
                 latency[arm] = statistics.median(samples)
@@ -108,7 +93,7 @@ def aggregate(files: list[Path], shapes: list[dict], m_values: list[int],
                            "process_range_us": process_range, "selection": selections, "ratios": ratios})
     summary = {"schema": 1, "status": "complete",
                "ratio_stat": "median_of_paired_process_ratios",
-               "run_id": run_id, "arms": arms, "required_arms": sorted(required),
+               "run_id": run_id, "arms": arms,
                "process_reps": len(files), "unique_shapes": len(shapes), "points": points}
     for field, groups in macro.items():
         summary[field] = [

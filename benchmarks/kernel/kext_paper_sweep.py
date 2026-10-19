@@ -63,9 +63,13 @@ def measure_projection(n, k, *, device, grids, args):
     extended = make_extended_weights(weights['reference'], k, [r for r in ratios if r < 1])
     for m_index, m in enumerate(sorted(set(grids['mext']) | set(grids['kext']))):
         x = torch.randn(m, k, device=device, dtype=torch.bfloat16)
-        arms = make_kext_arms(x, weights, extended, ratios if m in grids['kext'] else ())
+        requested = list(ratios) if m in grids['kext'] else []
+        active = requested + ([1.0] if m in grids['mext'] and 1.0 not in requested else [])
+        arms = make_kext_arms(x, weights, extended, active)
         if m in grids['mext']:
-            full = make_kext_arms(x, weights, extended, [1.0])[-1]
+            full = next(arm for arm in arms if arm.ratio == 1.0)
+            if 1.0 not in requested:
+                arms.remove(full)
             arms.append(full._replace(family='mext', arm='mext_r1'))
         for row in measure_arms(arms, args, order_offset=args.rep + m_index):
             yield dict(row, n=n, k=k, m=m)

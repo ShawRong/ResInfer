@@ -21,19 +21,6 @@ def global_scale(t: torch.Tensor) -> torch.Tensor:
     return (448.0 * 6.0 / t.abs().max().float()).reshape(())
 
 
-def make_weight(n: int, k: int, device: torch.device, dtype: torch.dtype):
-    """Quantize a weight with vLLM; retain BF16 for selective K-extension."""
-    import torch
-    from vllm._custom_ops import scaled_fp4_quant
-    from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
-        swizzle_blockscale)
-
-    w_bf16 = torch.randn(n, k, device=device, dtype=dtype) / (k ** 0.5)
-    w_gs = global_scale(w_bf16)
-    w_fp4, w_sf = scaled_fp4_quant(w_bf16, w_gs, is_sf_swizzled_layout=False)
-    return w_bf16, w_fp4, swizzle_blockscale(w_sf), w_gs
-
-
 def salient_indices(k: int, ratio: float, device: torch.device) -> torch.Tensor:
     """The per-8-channel salient pattern the export format uses.
 

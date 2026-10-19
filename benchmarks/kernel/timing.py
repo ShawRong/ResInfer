@@ -17,9 +17,8 @@ ITERS_WITHIN_GRAPH = 10
 TIMING_METHOD = "flashinfer_cudagraph_rotation_v3"
 
 
-def iters_for_cold_l2(args: Sequence[Any], device: Any, *,
-                      floor: int = ITERS_WITHIN_GRAPH) -> int:
-    """Capture whole buffer cycles so adjacent replays preserve the reuse distance."""
+def cold_l2_layout(args: Sequence[Any], device: Any, *, floor: int) -> dict:
+    """Compute complete rotation cycles and their accounting from the same inputs."""
     import torch
     from flashinfer.testing.utils import calculate_rotation_count
 
@@ -29,25 +28,13 @@ def iters_for_cold_l2(args: Sequence[Any], device: Any, *,
     if floor < 1:
         raise ValueError("graph call floor must be positive")
     rotations = int(calculate_rotation_count(tensors, device))
-    return ((floor + rotations - 1) // rotations) * rotations
-
-
-def l2_accounting(args: Sequence[Any], device: Any,
-                  iters_within_graph: int) -> dict:
-    """Record buffer coverage, not a claim about hardware cache residency."""
-    import torch
-    from flashinfer.testing.utils import calculate_rotation_count
-
-    tensors = [a for a in args if torch.is_tensor(a) and a.is_cuda]
-    if not tensors:
-        raise ValueError("cold-L2 timing requires explicit CUDA tensor inputs")
-    rotations = int(calculate_rotation_count(tensors, device))
+    iters = ((floor + rotations - 1) // rotations) * rotations
     return {
         "arg_mb": sum(t.numel() * t.element_size() for t in tensors) / 1e6,
         "rotations": rotations,
-        "visited_rotations": min(rotations, iters_within_graph),
-        "rotation_covered": iters_within_graph >= rotations,
-        "iters_within_graph": iters_within_graph,
+        "visited_rotations": min(rotations, iters),
+        "rotation_covered": iters >= rotations,
+        "iters_within_graph": iters,
     }
 
 
@@ -67,8 +54,9 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
     if repeats < 1 or repeat_iters < 1:
         raise ValueError("timing repeat counts must be positive")
     device = next((a.device for a in args if torch.is_tensor(a) and a.is_cuda), None)
-    iters_within_graph = iters_for_cold_l2(
+    layout = cold_l2_layout(
         args, device, floor=ITERS_WITHIN_GRAPH if iters_within_graph is None else iters_within_graph)
+    iters_within_graph = layout["iters_within_graph"]
     samples_us = [
         [float(ms) * 1000.0 for ms in bench_gpu_time_with_cudagraph(
             fn=fn, repeat_iters=repeat_iters,
@@ -83,7 +71,7 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
     medians = sorted(ordered)
     p50 = statistics.median(medians)
     return {
-        **l2_accounting(args, device, iters_within_graph),
+        **layout,
         "timing_method": TIMING_METHOD,
         "us": p50, "us_stat": "p50", "p50_us": p50,
         "us_mink": medians[0], "max_us": medians[-1],
