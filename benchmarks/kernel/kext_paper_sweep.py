@@ -17,15 +17,15 @@ if __package__ in (None, ""):
 from benchmarks import manifest as spec_mod
 from benchmarks.kernel.json_config import load_models, parse_config_overrides, parse_tp_overrides
 from benchmarks.kernel.shapes import resolve
-from benchmarks.kernel.inputs import prepare_mext_weights, make_extended_weights
-from benchmarks.kernel.linear import (BenchmarkArm, KEXT_BASELINES, STATIC_SELECTION,
+from benchmarks.kernel.inputs import SELECTIVE_RATIOS, prepare_mext_weights, make_extended_weights
+from benchmarks.kernel.linear import (KEXT_BASELINES, STATIC_SELECTION,
                                       make_kext_arms, selected_fold_tactic)
 from benchmarks.kernel.timing import fi_autotuned, timed_detail, warm_equally
 from benchmarks._runtime import assert_gpu_exclusive, gpu_state, provenance
 
 
 # Ratio 1.0 reuses the base weight and the runtime ratio1_prefill route.
-SUPPORTED_RATIOS = (0.125, 0.25, 0.5, 1.0)
+SUPPORTED_RATIOS = (*SELECTIVE_RATIOS, 1.0)
 
 
 def measure_arms(arms, args, *, order_offset=0):
@@ -172,7 +172,7 @@ def main() -> None:
     if not a.models or (a.family != "mext" and not a.ratios):
         p.error("models and ratios must not be empty")
     for r in a.ratios:
-        if not any(abs(r - s) < 1e-9 for s in SUPPORTED_RATIOS):
+        if r not in SUPPORTED_RATIOS:
             raise SystemExit(f"unsupported ratio {r}; expected one of "
                              f"{SUPPORTED_RATIOS}")
     models = load_models(a.models)

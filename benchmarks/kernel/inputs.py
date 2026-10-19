@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+SELECTIVE_RATIOS = (0.125, 0.25, 0.5)
+
+
 if TYPE_CHECKING:
     import torch
 
@@ -118,7 +121,7 @@ def calibrated_indices(metadata, layer_name, k, ratio):
     if indices is None or any(row.get("salient_indices") != indices for row in records):
         raise ValueError(f"Fused projections need identical calibrated masks: {layer_name}")
     per_block = int(ratio * 8)
-    if (ratio not in (.125, .25, .5) or k % 8 or len(indices) != k * per_block // 8
+    if (ratio not in SELECTIVE_RATIOS or k % 8 or len(indices) != k * per_block // 8
             or any(type(i) is not int or i < 0 or i >= k for i in indices)
             or any(a >= b for a, b in zip(indices, indices[1:]))
             or any(i // 8 != j // per_block for j, i in enumerate(indices))):

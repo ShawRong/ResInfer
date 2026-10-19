@@ -5,6 +5,7 @@ import json
 import random
 from pathlib import Path
 
+from benchmarks.kernel.inputs import SELECTIVE_RATIOS
 from .compare import LINEAR_SCOPE
 
 
@@ -47,7 +48,7 @@ def load_kext_metadata(specs):
         if not sep:
             raise ValueError("--kext-metadata expects RATIO=PATH")
         ratio = float(label)
-        if ratio not in (.125, .25, .5) or ratio in metadata:
+        if ratio not in SELECTIVE_RATIOS or ratio in metadata:
             raise ValueError(f"Duplicate or unsupported selective ratio: {label}")
         path = Path(filename).resolve(strict=True)
         metadata[ratio] = read_residue_metadata_json(path)

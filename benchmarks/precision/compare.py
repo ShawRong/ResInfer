@@ -1,4 +1,4 @@
-"""Paired attention and linear comparisons on captured decode inputs."""
+"""Paired attention and linear comparisons on captured decode/prefill inputs."""
 
 import hashlib
 import json
@@ -243,6 +243,8 @@ def compare_prefill(weights, activations, metadata, timing, rows, costs, save):
         masks = {ratio: calibrated_indices(data, name, w.shape[1], ratio)
                  for ratio, data in metadata.items()}
         extended = make_extended_weights(w, w.shape[1], sorted(metadata), masks)
+        mask_hashes = {ratio: hashlib.sha256(json.dumps(indices).encode()).hexdigest()
+                       for ratio, indices in masks.items()}
         packed = quantize_mext_weights(w, KEXT_BASELINES)
         whash = digest(w)
         for (index, start, label), captured in activations.items():
@@ -263,8 +265,7 @@ def compare_prefill(weights, activations, metadata, timing, rows, costs, save):
                         input_sha256=xhash, weight_sha256=whash,
                         fp32_reference=metrics(output, reference))
                     if arm.ratio in masks:
-                        item["mask_sha256"] = hashlib.sha256(
-                            json.dumps(masks[arm.ratio]).encode()).hexdigest()
+                        item["mask_sha256"] = mask_hashes[arm.ratio]
                     if arm.policy:
                         item.update(selected_fold_tactic(arm.route, arm.policy))
                     if timing:
