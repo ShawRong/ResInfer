@@ -1,0 +1,689 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo (modifications)
+// SPDX-License-Identifier: Apache-2.0
+/*
+ * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+
+#include <torch/all.h>
+
+#include <cuda_runtime_api.h>
+#include <cuda_runtime.h>
+
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAGuard.h>
+
+#include <cuda_fp8.h>
+#include "dispatch_utils.h"
+
+#include "cuda_utils.h"
+#include "launch_bounds_utils.h"
+#include "nvfp4_utils.cuh"
+
+namespace vllm {
+
+
+template <class Type, bool UE8M0_SF = false, int RESIDUE_PER_8_ELTS = 1, bool SWAP_RESIDUE = false>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4(int32_t numRows, int32_t numTotalCols, int32_t numMainCols, Type const* in,
+                    float const* SFScale, uint32_t* out, uint32_t* SFout,
+                    uint8_t const* channelIndices) {
+  using PackedVec = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched.");
+
+
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+
+
+	uint8_t* extraSFStart = reinterpret_cast<uint8_t*>(SFout);
+	int32_t effectiveRows = computeEffectiveRows(numRows);
+	int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+	if (colIdx >= numMainCols / CVT_FP4_ELTS_PER_THREAD) return;
+
+
+	for (int rowIdx = blockIdx.x; rowIdx < effectiveRows; rowIdx += gridDim.x) {
+	  bool validRow = rowIdx < numRows;
+	      PackedVec in_vec{};
+	      if (validRow) {
+	        int64_t inOffset =
+	            rowIdx * (numMainCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+	        in_vec = reinterpret_cast<PackedVec const*>(in)[inOffset];
+	      }
+
+	      auto sf_out =
+	          cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+	                                             CVT_FP4_NUM_THREADS_PER_SF>(
+	              rowIdx, colIdx, numTotalCols, SFout);
+
+
+	      uint32_t* out_pos = nullptr;
+	      uint32_t* residue_data_out = nullptr;
+	      if (validRow) {
+	        int64_t outOffset =
+	            rowIdx * (numTotalCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+	        out_pos = out + outOffset;
+	        if constexpr (SWAP_RESIDUE) {
+	          residue_data_out =
+	              cvt_swap_residue_data_get_offset<uint32_t, RESIDUE_PER_8_ELTS>(
+	                  rowIdx, colIdx, numMainCols, numTotalCols, out);
+	        } else {
+	          residue_data_out =
+	              cvt_residue_data_get_offset<uint32_t, RESIDUE_PER_8_ELTS>(
+	                  rowIdx, colIdx, numMainCols, numTotalCols, out);
+	        }
+	      }
+
+
+	      auto residue_sf_out =
+	          cvt_residue_sf_get_offset<uint8_t, RESIDUE_PER_8_ELTS>(rowIdx, colIdx, numTotalCols, numMainCols, extraSFStart);
+
+
+      uint8_t mask = channelIndices[colIdx];
+
+	      uint32_t packed;
+	      if constexpr (SWAP_RESIDUE) {
+	        packed = cvt_warp_fp16_to_fp4_swap<Type, UE8M0_SF, RESIDUE_PER_8_ELTS>(
+	            in_vec, SFScaleVal, sf_out, mask, residue_data_out, residue_sf_out);
+	      } else {
+	        packed = cvt_warp_fp16_to_fp4<Type, UE8M0_SF, RESIDUE_PER_8_ELTS>(
+	            in_vec, SFScaleVal, sf_out, mask, residue_data_out, residue_sf_out);
+	      }
+	      if (out_pos) {
+	        *out_pos = packed;
+	      }
+	  }
+
+}
+
+template <class Type, bool UE8M0_SF = false>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4_mext_r1_pack8(int32_t inputRows, int32_t outputRows,
+                                  int32_t numCols,
+                                  Type const* in, float const* SFScale,
+                                  uint32_t* out, uint32_t* SFout,
+                                  int32_t layoutMode,
+                                  int32_t numSFScales,
+                                  bool enablePDL) {
+  using PackedVec8 = PackedVec<Type>;
+  static constexpr int CVT_FP4_NUM_THREADS_PER_SF =
+      (CVT_FP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD);
+  static_assert(sizeof(PackedVec8) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
+                "Vec size is not matched for 8-element base helper.");
+
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  float const SFScaleResVal =
+      (SFScale != nullptr && numSFScales > 1) ? SFScale[1] : SFScaleVal;
+
+  int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+  int colGroups = numCols / CVT_FP4_ELTS_PER_THREAD;
+
+  if (colIdx < colGroups)
+  for (int rowIdx = blockIdx.x; rowIdx < outputRows; rowIdx += gridDim.x) {
+    bool validRow = rowIdx < inputRows;
+    int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
+    int32_t residueRow =
+        compute_mext_r1_residue_row(rowIdx, outputRows, layoutMode);
+    int32_t baseSfRow =
+        compute_mext_r1_base_sf_row(rowIdx, outputRows, layoutMode);
+    int32_t residueSfRow =
+        compute_mext_r1_residue_sf_row(rowIdx, outputRows, layoutMode);
+
+    PackedVec8 in_vec{};
+    if (validRow) {
+      int64_t inOffset =
+          rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
+      in_vec = reinterpret_cast<PackedVec8 const*>(in)[inOffset];
+    }
+
+
+    int32_t colsPerRow = numCols / CVT_FP4_ELTS_PER_THREAD;
+    bool kConcatK = layoutMode == 3;
+    int64_t outOffset =
+        kConcatK ? (int64_t)rowIdx * (2 * colsPerRow) + colIdx
+                 : (int64_t)baseRow * colsPerRow + colIdx;
+    auto& out_pos = out[outOffset];
+
+    auto sf_out =
+        kConcatK
+            ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  rowIdx, colIdx, 2 * numCols, SFout)
+            : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  baseSfRow, colIdx, numCols, SFout);
+
+    int64_t residueOutOffset =
+        kConcatK
+            ? (int64_t)rowIdx * (2 * colsPerRow) + colsPerRow + colIdx
+            : (int64_t)residueRow * colsPerRow + colIdx;
+    uint32_t* residue_data_out = out + residueOutOffset;
+
+    auto residue_sf_out =
+        kConcatK
+            ? cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  rowIdx, colIdx + colsPerRow, 2 * numCols, SFout)
+            : cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                                 CVT_FP4_NUM_THREADS_PER_SF>(
+                  residueSfRow, colIdx, numCols, SFout);
+
+    out_pos = cvt_warp_fp16_to_fp4_mext_r1_fast<Type, UE8M0_SF>(
+        in_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out, residue_sf_out);
+  }
+  __syncthreads();
+  if (enablePDL && threadIdx.x == 0) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
+
+template <class Type, bool UE8M0_SF = false>
+__global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
+    cvt_fp16_to_fp4_mext_r1_pack16(int32_t inputRows, int32_t outputRows,
+                                   int32_t numCols,
+                                   Type const* in, float const* SFScale,
+                                   uint32_t* out, uint32_t* SFout,
+                                   int32_t layoutMode,
+                                   int32_t numSFScales,
+                                   bool enablePDL) {
+  using PackedVec8 = PackedVec<Type>;
+  constexpr int CVT_FP4_NUM_THREADS_PER_SF = 1;
+
+  float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+  float const SFScaleResVal =
+      (SFScale != nullptr && numSFScales > 1) ? SFScale[1] : SFScaleVal;
+
+  int colIdx = blockIdx.y * blockDim.x + threadIdx.x;
+  int colGroups = numCols / 16;
+
+  if (colIdx < colGroups)
+  for (int rowIdx = blockIdx.x; rowIdx < outputRows; rowIdx += gridDim.x) {
+    bool validRow = rowIdx < inputRows;
+    int32_t baseRow = compute_mext_r1_base_row(rowIdx, outputRows, layoutMode);
+    int32_t residueRow =
+        compute_mext_r1_residue_row(rowIdx, outputRows, layoutMode);
+    int32_t baseSfRow =
+        compute_mext_r1_base_sf_row(rowIdx, outputRows, layoutMode);
+    int32_t residueSfRow =
+        compute_mext_r1_residue_sf_row(rowIdx, outputRows, layoutMode);
+
+    PackedVec8 lo_vec{};
+    PackedVec8 hi_vec{};
+    if (validRow) {
+
+
+      load_packed_vec16(
+          in + static_cast<int64_t>(rowIdx) * numCols + colIdx * 16,
+          lo_vec, hi_vec);
+    }
+
+    int64_t outOffset =
+        baseRow * (numCols / CVT_FP4_ELTS_PER_UINT32) + colIdx * 2;
+
+    auto sf_out =
+        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                           CVT_FP4_NUM_THREADS_PER_SF>(
+            baseSfRow, colIdx, numCols, SFout);
+
+    int64_t residueOutOffset =
+        residueRow * (numCols / CVT_FP4_ELTS_PER_UINT32) + colIdx * 2;
+    uint32_t* residue_data_out = out + residueOutOffset;
+
+    auto residue_sf_out =
+        cvt_quant_to_fp4_get_sf_out_offset<uint32_t,
+                                           CVT_FP4_NUM_THREADS_PER_SF>(
+            residueSfRow, colIdx, numCols, SFout);
+
+    u32x2 packed = cvt_warp_fp16_to_fp4_mext_r1_fast16<Type, UE8M0_SF>(
+        lo_vec, hi_vec, SFScaleVal, SFScaleResVal, sf_out, residue_data_out,
+        residue_sf_out);
+
+    *reinterpret_cast<uint2*>(out + outOffset) =
+        make_uint2(packed.lo, packed.hi);
+  }
+  __syncthreads();
+  if (enablePDL && threadIdx.x == 0) {
+    cudaTriggerProgrammaticLaunchCompletion();
+  }
+}
+
+
+template <typename T, bool UE8M0_SF, bool SWAP_RESIDUE>
+void launchKernelByResidue(int residue_per_8, dim3 grid, dim3 block, cudaStream_t stream,
+                           int m, int n_ext, int n, T const* input, float const* SFScale,
+                           uint32_t* output, uint32_t* SFOuput, uint8_t const* channelIndices) {
+  switch (residue_per_8) {
+    case 1:
+      cvt_fp16_to_fp4<T, UE8M0_SF, 1, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
+          m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
+      break;
+    case 2:
+      cvt_fp16_to_fp4<T, UE8M0_SF, 2, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
+          m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
+      break;
+    case 4:
+      cvt_fp16_to_fp4<T, UE8M0_SF, 4, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
+          m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
+      break;
+
+
+    default:
+
+      fprintf(stderr, "Warning: Unsupported residue_per_8 value %d. Supported values: 1 (12.5%%), 2 (25%%), 4 (50%%). Defaulting to 1 (12.5%%).\n", residue_per_8);
+      cvt_fp16_to_fp4<T, UE8M0_SF, 1, SWAP_RESIDUE><<<grid, block, 0, stream>>>(
+          m, n_ext, n, input, SFScale, output, SFOuput, channelIndices);
+      break;
+  }
+}
+
+template <typename T>
+void invokeFP4Quantization(int m, int n_ext, int n, T const* input, float const* SFScale,
+                           int64_t* output, int32_t* SFOuput, bool useUE8M0,
+                           uint8_t const* channelIndices, int residue_per_8, bool useSwappedResidue,
+                           int multiProcessorCount, cudaStream_t stream) {
+
+
+	  int numThreads = n / ELTS_PER_THREAD;
+	  numThreads = std::max(numThreads, 32);
+	  dim3 block(std::min(numThreads, 512));
+
+	  int const numBlocksPerSM =
+	      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
+	  dim3 grid(std::min(computeEffectiveRows(m),
+	                     multiProcessorCount * numBlocksPerSM),
+	            cuda_utils::ceil_div(numThreads, static_cast<int>(block.x)));
+
+
+  if (useUE8M0) {
+    if (useSwappedResidue) {
+      launchKernelByResidue<T, true, true>(residue_per_8, grid, block, stream,
+                                           m, n_ext, n, input, SFScale,
+                                           reinterpret_cast<uint32_t*>(output),
+                                           reinterpret_cast<uint32_t*>(SFOuput), channelIndices);
+    } else {
+      launchKernelByResidue<T, true, false>(residue_per_8, grid, block, stream,
+                                            m, n_ext, n, input, SFScale,
+                                            reinterpret_cast<uint32_t*>(output),
+                                            reinterpret_cast<uint32_t*>(SFOuput), channelIndices);
+    }
+  } else {
+    if (useSwappedResidue) {
+      launchKernelByResidue<T, false, true>(residue_per_8, grid, block, stream,
+                                            m, n_ext, n, input, SFScale,
+                                            reinterpret_cast<uint32_t*>(output),
+                                            reinterpret_cast<uint32_t*>(SFOuput), channelIndices);
+    } else {
+      launchKernelByResidue<T, false, false>(residue_per_8, grid, block, stream,
+                                             m, n_ext, n, input, SFScale,
+                                             reinterpret_cast<uint32_t*>(output),
+                                             reinterpret_cast<uint32_t*>(SFOuput), channelIndices);
+    }
+  }
+}
+
+enum class MExtR1EltsMode : int {
+  kAuto = 0,
+  kElts8 = 8,
+  kElts16 = 16,
+};
+
+enum class MExtR1LayoutMode : int {
+  kConcat = 0,
+  kRowPair = 1,
+  kTile8 = 2,
+
+  kConcatK = 3,
+
+
+  kAttnTile8 = 4,
+};
+
+inline bool use_pack16_for_mode(int elts_mode, int cc_major) {
+  switch (static_cast<MExtR1EltsMode>(elts_mode)) {
+    case MExtR1EltsMode::kElts8:
+      return false;
+    case MExtR1EltsMode::kElts16:
+
+
+      return true;
+    case MExtR1EltsMode::kAuto:
+    default:
+
+      return cc_major == 10;
+  }
+}
+
+inline int normalize_mext_r1_layout_mode(int layout_mode) {
+  switch (static_cast<MExtR1LayoutMode>(layout_mode)) {
+    case MExtR1LayoutMode::kAttnTile8:
+      return static_cast<int>(MExtR1LayoutMode::kAttnTile8);
+    case MExtR1LayoutMode::kTile8:
+      return static_cast<int>(MExtR1LayoutMode::kTile8);
+    case MExtR1LayoutMode::kRowPair:
+      return static_cast<int>(MExtR1LayoutMode::kRowPair);
+    case MExtR1LayoutMode::kConcatK:
+      return static_cast<int>(MExtR1LayoutMode::kConcatK);
+    case MExtR1LayoutMode::kConcat:
+    default:
+      return static_cast<int>(MExtR1LayoutMode::kConcat);
+  }
+}
+
+template <typename T>
+void invokeFP4QuantizationMExtR1(int input_m, int output_m, int n,
+                                 T const* input,
+                                 float const* SFScale, int64_t* output,
+                                 int32_t* SFOuput, bool useUE8M0,
+                                 int elts_mode, int layout_mode,
+                                 int numSFScales,
+                                 int multiProcessorCount, int ccMajor,
+                                 cudaStream_t stream, bool enablePDL) {
+  bool pack16 = use_pack16_for_mode(elts_mode, ccMajor);
+  int normalized_layout_mode = normalize_mext_r1_layout_mode(layout_mode);
+
+
+  if (normalized_layout_mode == static_cast<int>(MExtR1LayoutMode::kConcatK)) {
+    pack16 = false;
+  }
+  int colGroups = n / (pack16 ? 16 : CVT_FP4_ELTS_PER_THREAD);
+  colGroups = std::max(colGroups, 1);
+
+
+  int desiredGridY =
+      std::max(1, cuda_utils::ceil_div(computeEffectiveRows(output_m),
+                                       std::max(output_m, 1)));
+  desiredGridY = std::min(desiredGridY, colGroups);
+  int numThreads = cuda_utils::ceil_div(colGroups, desiredGridY);
+  numThreads = std::max(round_up(numThreads, 32), 32);
+  dim3 block(std::min(numThreads, 512));
+  int const numBlocksPerSM =
+      vllm_runtime_blocks_per_sm(static_cast<int>(block.x));
+  dim3 grid(std::min(int(output_m), multiProcessorCount * numBlocksPerSM),
+            cuda_utils::ceil_div(colGroups, static_cast<int>(block.x)));
+
+  cudaLaunchConfig_t launchConfig{};
+  launchConfig.gridDim = grid;
+  launchConfig.blockDim = block;
+  launchConfig.dynamicSmemBytes = 0;
+  launchConfig.stream = stream;
+  cudaLaunchAttribute launchAttr{};
+  if (enablePDL) {
+    launchAttr.id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    launchAttr.val.programmaticStreamSerializationAllowed = 1;
+    launchConfig.attrs = &launchAttr;
+    launchConfig.numAttrs = 1;
+  }
+
+  if (useUE8M0) {
+    if (pack16) {
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack16<T, true>,
+          input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+          reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
+          numSFScales, enablePDL);
+    } else {
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack8<T, true>,
+          input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+          reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
+          numSFScales, enablePDL);
+    }
+  } else {
+    if (pack16) {
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack16<T, false>,
+          input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+          reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
+          numSFScales, enablePDL);
+    } else {
+      cudaLaunchKernelEx(
+          &launchConfig, cvt_fp16_to_fp4_mext_r1_pack8<T, false>,
+          input_m, output_m, n, input, SFScale, reinterpret_cast<uint32_t*>(output),
+          reinterpret_cast<uint32_t*>(SFOuput), normalized_layout_mode,
+          numSFScales, enablePDL);
+    }
+  }
+}
+
+
+template void invokeFP4Quantization(int m, int n_ext, int n, half const* input,
+                                    float const* SFScale, int64_t* output,
+                                    int32_t* SFOuput, bool useUE8M0,
+                                    uint8_t const* channelIndices, int residue_per_8, bool useSwappedResidue,
+                                    int multiProcessorCount,
+                                    cudaStream_t stream);
+
+template void invokeFP4Quantization(int m, int n_ext, int n, __nv_bfloat16 const* input,
+                                    float const* SFScale, int64_t* output,
+                                    int32_t* SFOuput, bool useUE8M0,
+                                    uint8_t const* channelIndices, int residue_per_8, bool useSwappedResidue,
+                                    int multiProcessorCount,
+                                    cudaStream_t stream);
+
+template void invokeFP4QuantizationMExtR1(
+    int input_m, int output_m, int n, half const* input, float const* SFScale,
+    int64_t* output, int32_t* SFOuput, bool useUE8M0, int elts_mode, int layout_mode,
+    int numSFScales, int multiProcessorCount, int ccMajor, cudaStream_t stream,
+    bool enablePDL);
+
+template void invokeFP4QuantizationMExtR1(
+    int input_m, int output_m, int n, __nv_bfloat16 const* input,
+    float const* SFScale, int64_t* output, int32_t* SFOuput, bool useUE8M0,
+    int elts_mode, int layout_mode, int numSFScales, int multiProcessorCount,
+    int ccMajor, cudaStream_t stream, bool enablePDL);
+
+}
+
+void scaled_fp4_quant_with_residue_ext(torch::Tensor const& output,
+                                       torch::Tensor const& input,
+                                       torch::Tensor const& output_sf,
+                                       torch::Tensor const& input_sf,
+                                       torch::Tensor const& channel_indices,
+                                       int64_t n_ext,
+                                       int64_t residue_per_8,
+                                       bool use_swapped_residue) {
+  int32_t m = input.size(0);
+  int32_t n = input.size(1);
+
+  TORCH_CHECK(n % 16 == 0, "The N dimension must be multiple of 16.");
+  TORCH_CHECK(input.scalar_type() == at::ScalarType::Half ||
+                  input.scalar_type() == at::ScalarType::BFloat16,
+              "Unsupported input data type for quantize_to_fp4.");
+
+  int multiProcessorCount =
+      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
+
+  auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
+  auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
+  auto output_ptr = static_cast<int64_t*>(output.data_ptr());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+
+  bool useUE8M0 = false;
+
+
+  auto channel_indices_ptr = static_cast<uint8_t const*>(channel_indices.data_ptr());
+
+  VLLM_DISPATCH_HALF_TYPES(input.scalar_type(), "nvfp4_quant_kernel", [&] {
+    using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
+    auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
+    vllm::invokeFP4Quantization(m, n_ext, n, input_ptr, input_sf_ptr, output_ptr,
+                                sf_out, useUE8M0, channel_indices_ptr,
+                                static_cast<int>(residue_per_8), use_swapped_residue,
+                                multiProcessorCount, stream);
+  });
+}
+
+void scaled_fp4_quant_mext_r1_impl(torch::Tensor const& output,
+                                   torch::Tensor const& input,
+                                   torch::Tensor const& output_sf,
+                                   torch::Tensor const& input_sf,
+                                   int64_t elts_mode,
+                                   int64_t layout_mode,
+                                   bool enable_pdl) {
+  int32_t m = input.size(0);
+  int32_t n = input.size(1);
+
+
+  bool tile8_layout =
+      static_cast<int>(layout_mode) ==
+          static_cast<int>(vllm::MExtR1LayoutMode::kTile8) ||
+      static_cast<int>(layout_mode) ==
+          static_cast<int>(vllm::MExtR1LayoutMode::kAttnTile8);
+  int64_t output_m =
+      tile8_layout
+          ? ((static_cast<int64_t>(m) + 7) / 8) * 8
+          : static_cast<int64_t>(m);
+
+  TORCH_CHECK(n % 16 == 0,
+              "The N dimension must be multiple of 16.");
+  TORCH_CHECK(input.scalar_type() == at::ScalarType::Half ||
+                  input.scalar_type() == at::ScalarType::BFloat16,
+              "Unsupported input data type for quantize_to_fp4.");
+  TORCH_CHECK(output.numel() >= 2 * output_m * n / 2,
+              "M-extension output tensor is too small for the derived "
+              "output_m (caller buffer undersized for the padded row count).");
+  int64_t sf_m_tiles;
+  int64_t sf_k_tiles;
+  if (static_cast<int>(layout_mode) ==
+      static_cast<int>(vllm::MExtR1LayoutMode::kConcatK)) {
+    sf_m_tiles = (output_m + 127) / 128;
+    sf_k_tiles = (2 * static_cast<int64_t>(n) + 63) / 64;
+  } else if (static_cast<int>(layout_mode) ==
+             static_cast<int>(vllm::MExtR1LayoutMode::kAttnTile8)) {
+    sf_m_tiles = output_m / 8;
+    sf_k_tiles = (static_cast<int64_t>(n) + 63) / 64;
+  } else {
+    sf_m_tiles = (2 * output_m + 127) / 128;
+    sf_k_tiles = (static_cast<int64_t>(n) + 63) / 64;
+  }
+  TORCH_CHECK(output_sf.numel() >= sf_m_tiles * sf_k_tiles * 512,
+              "M-extension output scale tensor is too small for layout mode ",
+              layout_mode, ": need ", sf_m_tiles * sf_k_tiles * 512,
+              " bytes, got ", output_sf.numel());
+
+  int multiProcessorCount =
+      get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
+
+
+  static const int ccMajor = [] {
+    int device = 0;
+    cudaGetDevice(&device);
+    int v = 0;
+    cudaDeviceGetAttribute(&v, cudaDevAttrComputeCapabilityMajor, device);
+    return v;
+  }();
+
+  TORCH_CHECK(input_sf.numel() >= 1 && input_sf.numel() <= 2,
+              "input_sf must have 1 (single-alpha) or 2 (dual-alpha: "
+              "[base, residue]) elements.");
+  auto input_sf_ptr = static_cast<float const*>(input_sf.data_ptr());
+  auto sf_out = static_cast<int32_t*>(output_sf.data_ptr());
+  auto output_ptr = static_cast<int64_t*>(output.data_ptr());
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(input));
+  auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+
+  bool useUE8M0 = false;
+
+  VLLM_DISPATCH_HALF_TYPES(input.scalar_type(), "nvfp4_quant_kernel_mext_r1", [&] {
+    using cuda_type = vllm::CUDATypeConverter<scalar_t>::Type;
+    auto input_ptr = static_cast<cuda_type const*>(input.data_ptr());
+    vllm::invokeFP4QuantizationMExtR1(
+        m, static_cast<int>(output_m), n, input_ptr, input_sf_ptr, output_ptr, sf_out, useUE8M0,
+        static_cast<int>(elts_mode), static_cast<int>(layout_mode),
+        static_cast<int>(input_sf.numel()), multiProcessorCount, ccMajor,
+        stream, enable_pdl);
+  });
+}
+
+
+namespace {
+__global__ void quantize_mext_grouped_q_kernel(
+    const __nv_bfloat16* __restrict__ q,
+    uint8_t* __restrict__ q_pack,
+    uint8_t* __restrict__ q_sf,
+    int logical_rows, int physical_rows, int head_dim) {
+  const int group = blockIdx.x;
+  const int scale_groups = head_dim / CVT_FP4_SF_VEC_SIZE;
+  const int base_rows = physical_rows / 2;
+  const int64_t input_base = int64_t(group) * logical_rows * head_dim;
+  const int64_t data_base = int64_t(group) * physical_rows * (head_dim / 2);
+  const int64_t scale_base = int64_t(group) * 128 * scale_groups;
+  for (int index = threadIdx.x; index < logical_rows * scale_groups;
+       index += blockDim.x) {
+    const int row = index / scale_groups;
+    const int column = index % scale_groups;
+    vllm::PackedVec<__nv_bfloat16> lo{}, hi{};
+    vllm::load_packed_vec16(
+        q + input_base + int64_t(row) * head_dim +
+            column * CVT_FP4_SF_VEC_SIZE,
+        lo, hi);
+    uint8_t* base_data = q_pack + data_base +
+                         int64_t(row) * (head_dim / 2) + column * 8;
+    uint8_t* residue_data = q_pack + data_base +
+                            int64_t(base_rows + row) * (head_dim / 2) +
+                            column * 8;
+    uint8_t* base_scale = q_sf + scale_base +
+        vllm::compute_tiled_sf_offset<uint8_t>(row, column, head_dim);
+    uint8_t* residue_scale = q_sf + scale_base +
+        vllm::compute_tiled_sf_offset<uint8_t>(base_rows + row, column,
+                                               head_dim);
+    const vllm::u32x2 packed =
+        vllm::cvt_warp_fp16_to_fp4_mext_r1_fast16<__nv_bfloat16, false>(
+            lo, hi, 1.0f, 1.0f, base_scale,
+            reinterpret_cast<uint32_t*>(residue_data), residue_scale);
+    *reinterpret_cast<uint2*>(base_data) = make_uint2(packed.lo, packed.hi);
+  }
+}
+}
+
+void scaled_fp4_quant_mext_r1_grouped_q(torch::Tensor const& q,
+                                         torch::Tensor& q_pack,
+                                         torch::Tensor& q_sf) {
+  TORCH_CHECK(q.is_cuda() && q_pack.is_cuda() && q_sf.is_cuda() &&
+                  q.device() == q_pack.device() && q.device() == q_sf.device(),
+              "grouped Q tensors must share one CUDA device");
+  TORCH_CHECK(q.scalar_type() == torch::kBFloat16 && q.is_contiguous() &&
+                  q.dim() == 4, "q must be contiguous BF16 [B, Hkv, G, D]");
+  TORCH_CHECK(q_pack.scalar_type() == torch::kUInt8 &&
+                  q_sf.scalar_type() == torch::kUInt8 &&
+                  q_pack.is_contiguous() && q_sf.is_contiguous(),
+              "grouped Q outputs must be contiguous uint8");
+  const int batch = q.size(0), heads = q.size(1);
+  const int rows = q.size(2), head_dim = q.size(3);
+  const int physical_rows = rows == 4 ? 8 : 16;
+  TORCH_CHECK(rows == 4 || rows == 6 || rows == 8,
+              "grouped residue Q supports GQA4/6/8");
+  TORCH_CHECK(head_dim == 128 || head_dim == 256,
+              "grouped residue Q requires head_dim=128 or 256");
+  TORCH_CHECK(q_pack.dim() == 4 && q_pack.size(0) == batch &&
+                  q_pack.size(1) == heads &&
+                  q_pack.size(2) == physical_rows &&
+                  q_pack.size(3) == head_dim / 2,
+              "q_pack shape must match the physical Q tile");
+  TORCH_CHECK(q_sf.numel() >= int64_t(batch) * heads * 128 *
+                                  (head_dim / CVT_FP4_SF_VEC_SIZE),
+              "grouped Q scale buffer is too small");
+  if (batch == 0) return;
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(q));
+  const auto stream = at::cuda::getCurrentCUDAStream(q.get_device());
+  quantize_mext_grouped_q_kernel<<<batch * heads, 128, 0, stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+      q_pack.data_ptr<uint8_t>(), q_sf.data_ptr<uint8_t>(),
+      rows, physical_rows, head_dim);
+}

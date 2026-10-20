@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rong Shuo
+# SPDX-License-Identifier: Apache-2.0
+# Static metadata avoids importing Torch just to discover the package identity.
+
+[project]
+name = "nvfp4"
+version = "0.1.0"
+description = "FP4 quantization and residue kernels (CUDA extension + CuTeDSL)"
+requires-python = ">=3.10"
+license = "Apache-2.0 AND BSD-3-Clause"
+license-files = ["NOTICE", "licenses/*.txt"]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"

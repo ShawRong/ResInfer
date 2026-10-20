@@ -1,0 +1,39 @@
+ResInfer
+Copyright (c) 2025-2026 Rong Shuo (original work and modifications)
+
+Original ResInfer work is licensed under Apache-2.0. Upstream portions retain
+their respective copyrights and conditions; no ownership of upstream work
+is claimed. Source-file notices identify exceptions to the project license.
+
+NVIDIA BSD-3-Clause portions:
+- csrc/common/fold/sm10x/kernel_sm100_fold.py: FlashInfer block-scaled GEMM,
+  originally ported from TensorRT-LLM dense_blockscaled_gemm_persistent.py;
+  ResInfer adds residue Fold support.
+- csrc/resattn/kernel_paged_decode.py: FlashInfer CuTeDSL GQA decode,
+  adapted for paged NVFP4 residue attention.
+- csrc/common/fold/sm120/kernel.py: CUTLASS dense block-scaled GEMM example
+  and dispatch helpers, adapted for residue Fold; ResInfer additions are Apache-2.0.
+
+Apache-2.0 portions:
+- quant/modelopt_integration/{algo,algo_helper,residue_linear,tensor_quantizer}.py:
+  adapted from NVIDIA ModelOpt; original NVIDIA notices are retained.
+- csrc/common/fp4/ and csrc/nvfp4/cuda/: NVIDIA/vLLM FP4 quantization and
+  ResInfer residue extensions. csrc/mxfp4/cuda/ extends that quantization flow.
+- csrc/common/cuda/: vLLM utilities. dispatch_utils.h also uses PyTorch
+  ATen dispatch macros under BSD-3-Clause.
+
+MIT portion:
+- quant/modelopt_integration/algo_helper.py:get_act_scale: MIT HAN Lab llm-awq.
+
+Complete license texts are in LICENSE and csrc/licenses/. PyTorch's contributor
+copyright notices are included in csrc/licenses/BSD-3-Clause-PyTorch.txt.
+The native wheel includes these texts in its distribution metadata.
+
+Upstream projects:
+https://github.com/flashinfer-ai/flashinfer
+https://github.com/NVIDIA/TensorRT-LLM
+https://github.com/NVIDIA/cutlass
+https://github.com/NVIDIA/Model-Optimizer
+https://github.com/vllm-project/vllm
+https://github.com/pytorch/pytorch
+https://github.com/mit-han-lab/llm-awq

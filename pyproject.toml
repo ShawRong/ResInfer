@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "resinfer"
+version = "0.1.0"
+description = "Residue-compensated NVFP4 calibration, export, and vLLM serving"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+license = "Apache-2.0 AND BSD-3-Clause AND MIT"
+license-files = ["LICENSE", "NOTICE", "csrc/licenses/*.txt"]
+classifiers = ["Development Status :: 3 - Alpha", "Intended Audience :: Developers", "Intended Audience :: Science/Research", "Programming Language :: Python :: 3.12", "Topic :: Scientific/Engineering :: Artificial Intelligence"]
+# Install framework dependencies in the caller's CUDA environment.
+
+[tool.setuptools.packages.find]
+include = ["export", "export.*", "quant", "quant.*"]

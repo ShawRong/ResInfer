@@ -1,0 +1,5 @@
+recursive-include bindings *.cpp
+recursive-include common *.h *.cuh *.cu *.py
+recursive-include nvfp4 *.h *.cuh *.cu *.py
+recursive-include mxfp4 *.h *.cuh *.cu *.py
+recursive-include resattn *.h *.cuh *.cu *.py
