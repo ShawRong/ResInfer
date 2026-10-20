@@ -1,4 +1,4 @@
-"""Matched no-AWQ NVFP4 / Residue export from local HF and JSONL inputs.
+"""Matched no-AWQ NVFP4/MXFP4 plain / Residue export from local HF and JSONL inputs.
 
 Run as ``python -m export.export_nvfp4 --help``. Outputs are create-only.
 Preflight measures BF16 calibration forward throughput; export records the
@@ -105,12 +105,13 @@ def load_model(source, device):
     return model, info
 
 
-def quant_config(model, residue):
+def quant_config(model, residue, ratio=0.125, fmt="nvfp4"):
     import torch
     import modelopt.torch.quantization as mtq
     from quant.modelopt_integration.registry import build_residue_cfg
-    cfg = (build_residue_cfg("nvfp4", 0.125, calib_block_size=8)
-           if residue else copy.deepcopy(mtq.NVFP4_DEFAULT_CFG))
+    cfg = (build_residue_cfg(fmt, ratio, calib_block_size=8)
+           if residue else copy.deepcopy(
+               mtq.NVFP4_DEFAULT_CFG if fmt == "nvfp4" else mtq.MXFP4_DEFAULT_CFG))
     # Explicit allowlist: all language-trunk linears, excluding small GDN gates.
     # Never calibrate an unvisited vision module from text-only calibration.
     prefix = "model.language_model.layers." if model.config.model_type == "qwen3_5" else "model.layers."
@@ -138,6 +139,8 @@ def main():
     ap.add_argument("--dataset", required=True, type=Path)
     ap.add_argument("--output", required=True, type=Path)
     ap.add_argument("--mode", choices=("preflight", "plain", "residue"), required=True)
+    ap.add_argument("--format", choices=("nvfp4", "mxfp4"), default="nvfp4")
+    ap.add_argument("--ratio", type=float, choices=(0.125, 0.25, 0.5, 1.0), default=0.125)
     ap.add_argument("--samples", type=int, default=1024)
     ap.add_argument("--seq-len", type=int, default=2048)
     ap.add_argument("--batch-size", type=int, default=4)
@@ -171,6 +174,8 @@ def main():
                       source_index_sha256=sha(args.source / "model.safetensors.index.json"),
                       samples=args.samples, seq_len=args.seq_len, batch_size=args.batch_size,
                       seed=args.seed, mode=args.mode, awq=False,
+                      quant_format=args.format, residue_ratio=args.ratio if args.mode == "residue" else 0,
+                      salience_statistic="batch_mean_abs" if args.mode == "residue" else None,
                       rendering_policy="assistant_embedded_think_to_reasoning_content_v1",
                       template_kwargs=dict(enable_thinking=True, preserve_thinking=True,
                                            reasoning_effort=args.reasoning_effort,
@@ -217,7 +222,7 @@ def main():
     import modelopt.torch.quantization as mtq
     from quant.modelopt_integration import inject_residue_salient_map
     from quant.modelopt_integration.export import export_residue_checkpoint
-    cfg, names = quant_config(model, args.mode == "residue")
+    cfg, names = quant_config(model, args.mode == "residue", args.ratio, args.format)
     (args.output / "quant-config.json").write_text(json.dumps(cfg, indent=2, default=str))
     torch.cuda.reset_peak_memory_stats()
     model = mtq.quantize(model, cfg, forward_loop=forward)
@@ -226,29 +231,33 @@ def main():
                if getattr(getattr(m, "weight_quantizer", None), "is_enabled", False)}
     if enabled != set(names):
         raise ValueError(f"quantization scope mismatch: missing={set(names)-enabled}, extra={enabled-set(names)}")
-    for n in names:
-        for suffix in ("input_quantizer", "weight_quantizer"):
-            q = getattr(modules[n], suffix)
-            if q.amax is None or not q.amax.isfinite().all().item():
-                raise ValueError(f"uncalibrated quantizer: {n}.{suffix}")
+    if args.format == "nvfp4":
+        for n in names:
+            for suffix in ("input_quantizer", "weight_quantizer"):
+                q = getattr(modules[n], suffix)
+                if q.amax is None or not q.amax.isfinite().all().item():
+                    raise ValueError(f"uncalibrated quantizer: {n}.{suffix}")
     if args.mode == "residue":
         from quant.modelopt_integration.fused_salience import align_runtime_fused_salience
-        alignment = align_runtime_fused_salience(model, ratio=0.125, block_size=8,
+        alignment = align_runtime_fused_salience(model, ratio=args.ratio, block_size=8,
                                                  salience_metric="activation_max")
         (args.output / "fused-salience.json").write_text(json.dumps(alignment, indent=2))
         salient = {n: modules[n].input_quantizer._salient_indices for n in names}
         if any(v is None or not v.numel() for v in salient.values()):
             raise ValueError("missing residue channel selection")
-        inject_residue_salient_map(model, salient, residue_ratio=0.125,
-                                  block_size=8, preserve_existing_amax=True)
+        inject_residue_salient_map(model, salient, residue_ratio=args.ratio,
+                                  block_size=8)
     tokenizer.pad_token = original_padding
     # Preserve original generation/cache configuration; calibration disabled KV only.
     from transformers import AutoConfig
-    model.config.use_cache = getattr(AutoConfig.from_pretrained(args.source), "use_cache", True)
+    source_config = AutoConfig.from_pretrained(args.source, local_files_only=True)
+    model.config.use_cache = getattr(source_config, "use_cache", True)
+    if hasattr(model.config, "text_config"):
+        model.config.text_config.use_cache = getattr(source_config.text_config, "use_cache", True)
     output = args.output / "checkpoint"
     export_residue_checkpoint(model, output, dtype=torch.bfloat16,
                               source_checkpoint=args.source, tokenizer=tokenizer,
-                              residue_ratio=0.125, calibration=provenance,
+                              residue_ratio=args.ratio, calibration=provenance,
                               save_kernel_metadata=args.mode == "residue", max_shard_size="4GB")
     from export.hf_runtime_assets import copy_hf_runtime_assets
     copy_hf_runtime_assets(args.source, output)
@@ -261,7 +270,10 @@ def main():
     from export.stages.inspect_quant_export import InspectQuantExportStage
     if args.mode == "residue":
         meta = json.loads((output / "residue_kernel_metadata.json").read_text())
-        InspectQuantExportStage._assert_extended_widths(output, meta["layers"])
+        if args.format == "mxfp4":
+            InspectQuantExportStage._assert_mxfp4_tensors(output, meta["layers"])
+        else:
+            InspectQuantExportStage._assert_extended_widths(output, meta["layers"])
     manifest_path = output / "export_manifest.json"
     manifest = json.loads(manifest_path.read_text())
     manifest["metadata_file_sha256"] = {p.name: sha(p) for p in output.iterdir()
