@@ -4,7 +4,6 @@
 
 The external lighteval 0.13 environment owns tasks and metrics. Its scheduled
 items are recorded before generation and checked against the saved details.
-Throughput logs are diagnostic only; they do not prove cache use or generation.
 """
 from __future__ import annotations
 
@@ -24,8 +23,8 @@ if str(REPO) not in sys.path:
 from benchmarks.engine_config import accuracy_engine_config
 from benchmarks.serving import engagement, stop_server, check_port_available, wait_ready
 from benchmarks.quality.common.protocol import load_manifest, resolve_arms, SAMPLING_FIELDS
-VLLM_BIN = REPO / ".venv" / "bin" / "vllm"
-SERVING_PYTHON = REPO / ".venv" / "bin" / "python"
+from benchmarks.quality.common.runtime import configure_env
+SERVING_PYTHON = pathlib.Path(sys.executable)
 _SERVERS: list[subprocess.Popen] = []
 
 
@@ -62,7 +61,7 @@ def write_json(path: pathlib.Path, payload) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str) + "\n")
 
 
-def build_server_env(arm: dict, a, case_out: pathlib.Path) -> dict:
+def build_server_env(arm: dict, a) -> dict:
     env = os.environ.copy()
     strip_proxies(env)
     # Start from a clean residue slate: an inherited RESIDUE_* would make the
@@ -76,44 +75,19 @@ def build_server_env(arm: dict, a, case_out: pathlib.Path) -> dict:
 
     if a.gpu is not None:
         env["CUDA_VISIBLE_DEVICES"] = str(a.gpu)
-    env["VLLM_NO_USAGE_STATS"] = "1"
-    # Request the same process mode for all arms; verify the actual model PID in logs.
-    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    # Keep compile-cache reuse disabled for accuracy comparisons.
-    env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-    # FlashInfer JIT needs the driver library when the stub directory lacks libcuda.
-    env["LIBRARY_PATH"] = "/usr/lib/x86_64-linux-gnu:" + env.get("LIBRARY_PATH", "")
-    # The repository sitecustomize registers the selected runtime integration.
-    env["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO), str(REPO / "csrc")]
-        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
-
-    if arm["kind"] == "residue":
-        env["RESIDUE_NVFP4"] = "1"
-        env["RESIDUE_VLLM_MODEL_DIR"] = arm["abs_path"]
-        if arm.get("mext", "on") != "on":
-            raise ValueError("Runtime ablations belong in .dev; use a stock NVFP4 checkpoint")
-        env["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
-        env["RESIDUE_DECODE_MEXT_MAX_M"] = str(a.mext_max_m)
-        # Cubins push modelopt_fp4 onto trtllm-gen paths that bypass or break
-        # the patched linear method (vllm-integration.md rule 3).
-        for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
-            if env.pop(var, None) is not None:
-                print(f"[lighteval_driver] dropped {var}: incompatible with a "
-                      f"residue arm", flush=True)
+    if arm["kind"] == "residue" and arm.get("mext", "on") != "on":
+        raise ValueError("Runtime ablations belong in .dev; use a stock NVFP4 checkpoint")
+    configure_env(env, model=arm["abs_path"], kind=arm["kind"], repo=REPO,
+                  mext_max_m=getattr(a, "mext_max_m", 64))
     return env
 
 
 def build_server_cmd(arm: dict, man: dict, a, port: int) -> list[str]:
-    if not VLLM_BIN.exists():
-        raise SystemExit(f"vLLM entrypoint not found: {VLLM_BIN} -- the server "
-                         f"runs from the MAIN venv; is .venv bootstrapped?")
     template_kwargs = {"enable_thinking": man["enable_thinking"]}
     if "reasoning_effort" in man:
         template_kwargs["reasoning_effort"] = man["reasoning_effort"]
-    # Migrated venv console scripts can retain a stale absolute shebang.
-    # Run the script with the selected serving interpreter explicitly.
-    cmd = [str(SERVING_PYTHON), str(VLLM_BIN), "serve", arm["abs_path"],
+    cmd = [str(SERVING_PYTHON), "-m", "benchmarks.quality.common.vllm_server",
+           "serve", arm["abs_path"],
            "--port", str(port),
            "--dtype", a.dtype,
            "--generation-config", "vllm",
@@ -127,6 +101,8 @@ def build_server_cmd(arm: dict, man: dict, a, port: int) -> list[str]:
            "--no-enable-flashinfer-autotune"]
     if arm["kind"] in ("residue", "modelopt_fp4"):
         cmd += ["--quantization", "modelopt_fp4"]
+    elif arm["kind"] == "modelopt_mxfp4":
+        cmd += ["--quantization", "modelopt_mxfp4"]
     return cmd
 
 
@@ -143,73 +119,13 @@ def launch_server(cmd: list[str], env: dict, case_out: pathlib.Path,
     return proc
 
 
-def preflight_server(arm: dict, env: dict, case_out: pathlib.Path) -> dict:
-    """Verify the residue package, extension ABI, and vLLM patch before serve."""
-    if arm["kind"] != "residue":
-        return {}
-    if not SERVING_PYTHON.exists():
-        raise RuntimeError(f"serving interpreter not found: {SERVING_PYTHON}")
-
-    script = r'''import hashlib, importlib.util, json, pathlib, sys
-import nvfp4, quant, torch
-from nvfp4.extension import ensure_loaded
-from quant.vllm_integration.patch import is_patched
-assert ensure_loaded(True), "nvfp4 extension did not load"
-assert is_patched(), "residue vLLM patch is not installed"
-spec = importlib.util.find_spec("nvfp4._C")
-origin = pathlib.Path(spec.origin).resolve() if spec and spec.origin else None
-assert origin and origin.is_file(), "nvfp4._C origin is unavailable"
-payload = {
-    "python": sys.version.split()[0],
-    "torch": torch.__version__,
-    "torch_cuda": torch.version.cuda,
-    "extension": str(origin),
-    "extension_sha256": hashlib.sha256(origin.read_bytes()).hexdigest(),
-}
-print("RESINFER_PREFLIGHT_JSON=" + json.dumps(payload, sort_keys=True))
-'''
-    proc = subprocess.run(
-        [str(SERVING_PYTHON), "-c", script], cwd=str(REPO), env=env,
-        capture_output=True, text=True,
-    )
-    log_path = case_out / "server_preflight.log"
-    log_path.write_text(proc.stdout + proc.stderr)
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"residue server preflight exited {proc.returncode}; see {log_path}")
-    marker = "RESINFER_PREFLIGHT_JSON="
-    lines = [line for line in proc.stdout.splitlines() if line.startswith(marker)]
-    if not lines:
-        raise RuntimeError(f"server preflight produced no ABI record; see {log_path}")
-    payload = json.loads(lines[-1][len(marker):])
-    extension = pathlib.Path(payload["extension"])
-    try:
-        extension.relative_to(REPO / "csrc" / "nvfp4")
-    except ValueError as exc:
-        raise RuntimeError(
-            f"nvfp4 extension is not from this checkout: {extension}") from exc
-    payload["source_commit"] = git_head()
-    return payload
-
-
 def mext_resolved_gate(server_log: pathlib.Path, arm: dict,
                        server_pid: int | None = None) -> str | None:
     text = server_log.read_text(errors="ignore") if server_log.is_file() else ""
-    result = engagement(text, server_pid, multiprocessing=False)
+    quant = "modelopt_mxfp4" if arm["kind"] == "modelopt_mxfp4" else "residue_nvfp4"
+    result = engagement(text, server_pid, multiprocessing=False, quant=quant)
     problem = result.get("engagement_error")
     return f"arm {arm['id']}: {problem}; see {server_log}" if problem else None
-
-
-def generation_provenance(server_log: pathlib.Path, server_env: dict) -> dict:
-    """Record observations; periodic logs cannot prove cache replay or completion."""
-    served = 0
-    if server_log.is_file():
-        served = server_log.read_text(errors="ignore").count(
-            "Avg generation throughput")
-    env_fp = {k: v for k, v in sorted(server_env.items())
-              if k.startswith(("RESIDUE_", "VLLM_")) or k == "CUDA_VISIBLE_DEVICES"}
-    return {"generated": None, "cache_replay": None,
-            "decode_throughput_lines": served, "runtime_env": env_fp}
 
 
 def sampling_parameters(man: dict) -> dict:
@@ -383,17 +299,15 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     t0 = time.time()
     port = a.port or free_port()
 
-    env = build_server_env(arm, a, case_out)
+    env = build_server_env(arm, a)
     cmd = build_server_cmd(arm, man, a, port)
     cache_dir = case_out / "lighteval_cache"
 
     status, results, error, resolved_line = "fail", {}, None, None
-    server_preflight = {}
     server_log = case_out / "server.log"
     try:
-        server_preflight = preflight_server(arm, env, case_out)
         proc = launch_server(cmd, env, case_out, port, a.ready_timeout_sec, arm["abs_path"])
-        if arm["kind"] == "residue":
+        if arm["kind"] in ("residue", "modelopt_mxfp4"):
             problem = mext_resolved_gate(server_log, arm, proc.pid)
             if problem:
                 status, error = "fail_mext", problem
@@ -414,18 +328,15 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
     finally:
         teardown()
 
-    prov = generation_provenance(server_log, env)
     wall = time.time() - t0
     write_json(case_out / "provenance.json", {
         "arm": arm["id"], "model": arm["abs_path"], "kind": arm["kind"],
         "mext": arm.get("mext"), "manifest": man["_path"],
         "git_head": git_head(),
-        "server_preflight": server_preflight,
         "resolved_mode": resolved_line,
-        "runtime_env": prov["runtime_env"],
+        "runtime_env": {k: v for k, v in sorted(env.items())
+                        if k.startswith(("RESIDUE_", "VLLM_")) or k == "CUDA_VISIBLE_DEVICES"},
         "cache_dir": str(cache_dir),
-        "decode_throughput_lines": prov["decode_throughput_lines"],
-        "generated": prov["generated"], "cache_replay": prov["cache_replay"],
         "wall_time_sec": round(wall, 1),
         "server_cmd": cmd,
         "sampling": sampling_parameters(man),
@@ -444,12 +355,11 @@ def run_case(arm: dict, man: dict, a, out_root: pathlib.Path) -> tuple[str, dict
             "seed": man["seed"],
         },
     })
-    write_json(case_out / "lighteval_results.json",
-               {"results": results, "provenance": prov})
     write_json(case_out / "bench_result.json", {
         "status": status, "arm": arm["id"], "model": arm["abs_path"],
         "kind": arm["kind"], "mext": arm.get("mext"),
-        "tasks": a.tasks or man["_tasks"], "error": error, "results": results,
+        "tasks": a.tasks or man["_tasks"], "error": error,
+        "results_file": "validated_results.json" if results else None,
         "wall_time_sec": round(wall, 1),
     })
     for task, metrics in results.items():

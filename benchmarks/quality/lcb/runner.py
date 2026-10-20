@@ -82,7 +82,9 @@ def runtime_args(arm, manifest, args, out):
         repo=str(Path(__file__).resolve().parents[3]),
         bf16=arm["kind"] in ("bf16", "fp16"),
         plain=arm["kind"] != "residue",
-        quantization=None if arm["kind"] in ("bf16", "fp16") else "modelopt_fp4",
+        quantization=(None if arm["kind"] in ("bf16", "fp16")
+                      else "modelopt_mxfp4" if arm["kind"] == "modelopt_mxfp4"
+                      else "modelopt_fp4"),
         mext_max_m=args.mext_max_m,
         seed=manifest["seed"],
         max_num_seqs=args.max_num_seqs,
@@ -120,6 +122,7 @@ def final_answer(text, token_ids, tokenizer, thinking):
 def generate_arm(args, manifest, arm):
     from benchmarks.quality.common.runtime import (
         install_env,
+        initialize_runtime,
         pinned_engine_kwargs,
         write_effective_engine_config,
         write_provenance,
@@ -132,6 +135,7 @@ def generate_arm(args, manifest, arm):
         if key.startswith("RESIDUE_"):
             os.environ.pop(key)
     install_env(runtime)
+    initialize_runtime()
     from vllm import LLM, SamplingParams
     from lcb_runner.benchmarks.code_generation import CodeGenerationProblem
     from lcb_runner.prompts.code_generation import format_prompt_generation

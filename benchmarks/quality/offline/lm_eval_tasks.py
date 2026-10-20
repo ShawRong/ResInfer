@@ -80,7 +80,7 @@ def run(a):
         claim_arm_output, target_logprob_sum, require_output_count,
     )
     from benchmarks.quality.common.runtime import (
-        install_env, pinned_engine_kwargs, quality_quantization,
+        install_env, initialize_runtime, pinned_engine_kwargs, quality_quantization,
         write_provenance, write_effective_engine_config,
     )
     if importlib.metadata.version('lm-eval') != VERSION:
@@ -97,6 +97,7 @@ def run(a):
     if a.max_gen is not None and a.max_gen <= 0:
         raise ValueError('--max-gen must be positive')
     install_env(a)
+    initialize_runtime()
     from lm_eval import simple_evaluate
     from lm_eval.models.vllm_causallms import VLLM
     from lm_eval.tasks import TaskManager

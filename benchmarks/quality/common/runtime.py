@@ -26,71 +26,67 @@ def install_env(a):
     quantization = getattr(a, "quantization", None)
     if a.bf16 and quantization:
         raise ValueError("--bf16 cannot be combined with --quantization")
-    if a.bf16 and pathlib.Path(a.model).is_dir():
-        validate_kind(a.model, "bf16")
     mxfp4 = quantization == "modelopt_mxfp4"
+    kind = ("bf16" if a.bf16 else "modelopt_mxfp4" if mxfp4
+            else "modelopt_fp4" if a.plain else "residue")
+    if pathlib.Path(a.model).is_dir():
+        validate_kind(a.model, kind)
     if (any(getattr(a, key, False) for key in ("prefill_residue_off", "residue_off"))
             or getattr(a, "prefill_only", None) is not None):
         raise ValueError("Runtime ablations belong in .dev; use a stock checkpoint for the baseline")
-    os.environ["RESIDUE_MXFP4"] = "1" if mxfp4 else "0"
-    if mxfp4:
-        os.environ["RESIDUE_NVFP4"] = "0"
-        os.environ["RESIDUE_VLLM_MODEL_DIR"] = a.model
     if a.bf16:
         a.plain = True
-    if a.plain:
-        os.environ["RESIDUE_NVFP4"] = "0"
-    # Use the same process mode for every arm. The patch requires in-process
-    # EngineCore on the tested vLLM runtime.
-    os.environ["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
-    if not a.plain and not mxfp4:
-        os.environ["RESIDUE_NVFP4"] = "1"
-        os.environ["RESIDUE_VLLM_MODEL_DIR"] = a.model
-        os.environ["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
-        os.environ["RESIDUE_FORCE_DECODE_MEXT"] = "0"
-        os.environ["RESIDUE_DECODE_MEXT_MAX_M"] = str(getattr(a, "mext_max_m", 64))
-        # Prevent inherited GEMM backend overrides from bypassing the residue patch.
-        for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
-            if os.environ.pop(var, None) is not None:
-                print(f"[kit] dropped {var}: incompatible with a residue arm")
     repo = a.repo or os.environ.get("RESINFER_REPO", "")
-    if repo:
-        parts = [repo, str(pathlib.Path(repo) / "csrc")]
-        os.environ["PYTHONPATH"] = ":".join(
-            [p for p in parts + [os.environ.get("PYTHONPATH", "")] if p])
-        # Update this process as well as the worker import path.
-        for p in reversed(parts):
-            if p not in sys.path:
-                sys.path.insert(0, p)
-    # Disable compile-cache reuse across accuracy arms by default.
-    if os.environ.get("RESIDUE_EVALKIT_ALLOW_CACHE", "0") == "1":
-        # Report the explicit cache override in the run log.
-        print("[kit] " + "!" * 62, flush=True)
-        print("[kit] !! RESIDUE_EVALKIT_ALLOW_CACHE=1 -- torch.compile cache is ON.")
-        print("[kit] !! NUMBERS FROM THIS RUN ARE NOT PUBLISHABLE. An arm's score")
-        print("[kit] !! depends on what ran before it in the queue.")
-        print("[kit] " + "!" * 62, flush=True)
-    else:
-        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
-    os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
-    # Log effective environment settings for comparison across arms.
+    configure_env(os.environ, model=a.model, kind=kind, repo=repo,
+                  mext_max_m=getattr(a, "mext_max_m", 64))
+    if repo and repo not in sys.path:
+        sys.path.insert(0, repo)
     print("[kit] execution contract: " + " ".join(
-        f"{k}={os.environ.get(k, '<unset>')}" for k in (
-            "VLLM_ENABLE_V1_MULTIPROCESSING", "RESIDUE_NVFP4",
-            "RESIDUE_ENABLE_DECODE_MEXT", "RESIDUE_PREFILL_RESIDUE_OFF",
-            "RESIDUE_PREFILL_RESIDUE_OFF_MIN_M",
-            "RESIDUE_PREFILL_RESIDUE_OFF_MAX_M",
-            "VLLM_DISABLE_COMPILE_CACHE")), flush=True)
-    # flashinfer JIT links -lcuda from a stub dir that may not contain it
-    # Empty entries make GCC search cwd for its own `specs` file.
-    os.environ["LIBRARY_PATH"] = os.pathsep.join(
-        p for p in ["/usr/lib/x86_64-linux-gnu", *os.environ.get("LIBRARY_PATH", "").split(os.pathsep)] if p)
+        f"{key}={os.environ.get(key, '<unset>')}" for key in (
+            "VLLM_ENABLE_V1_MULTIPROCESSING", "RESIDUE_NVFP4", "RESIDUE_MXFP4",
+            "RESIDUE_ENABLE_DECODE_MEXT", "VLLM_DISABLE_COMPILE_CACHE")), flush=True)
+
+
+def configure_env(env, *, model, kind, repo, mext_max_m=64):
+    """Set the same arm environment for offline engines and HTTP servers."""
+    env["RESIDUE_NVFP4"] = "1" if kind == "residue" else "0"
+    env["RESIDUE_MXFP4"] = "1" if kind == "modelopt_mxfp4" else "0"
+    env["RESIDUE_ATTN"] = "0"
+    if kind in ("residue", "modelopt_mxfp4"):
+        env["RESIDUE_VLLM_MODEL_DIR"] = model
+    if kind == "residue":
+        env["RESIDUE_ENABLE_DECODE_MEXT"] = "1"
+        env["RESIDUE_FORCE_DECODE_MEXT"] = "0"
+        env["RESIDUE_DECODE_MEXT_MAX_M"] = str(mext_max_m)
+        for var in ("FLASHINFER_CUBIN_DIR", "VLLM_HAS_FLASHINFER_CUBIN"):
+            if env.pop(var, None) is not None:
+                print(f"[kit] dropped {var}: incompatible with a residue arm")
+    # The patch requires in-process EngineCore on the tested runtime, for every arm.
+    env["VLLM_ENABLE_V1_MULTIPROCESSING"] = "0"
+    if env.get("RESIDUE_EVALKIT_ALLOW_CACHE", "0") == "1":
+        print("[kit] compile-cache override enabled; not an isolated accuracy run", flush=True)
+    else:
+        env["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+    env.setdefault("VLLM_NO_USAGE_STATS", "1")
+    if repo:
+        env["PYTHONPATH"] = os.pathsep.join(p for p in (
+            str(repo), env.get("PYTHONPATH", "")) if p)
+    # FlashInfer needs libcuda; empty entries make GCC search cwd for its specs file.
+    env["LIBRARY_PATH"] = os.pathsep.join(p for p in (
+        "/usr/lib/x86_64-linux-gnu", *env.get("LIBRARY_PATH", "").split(os.pathsep)) if p)
 
 
 def quality_quantization(a):
     if a.bf16:
         return None
     return getattr(a, "quantization", None) or "modelopt_fp4"
+
+
+def initialize_runtime():
+    """Use the repository plugin even when its wheel entry point is not installed."""
+    from runtime.vllm_plugin.residue_vllm_plugin import initialize
+
+    initialize()
 
 
 def pinned_engine_kwargs(a, max_model_len: int) -> dict:

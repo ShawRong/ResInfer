@@ -82,10 +82,10 @@ def resolve_arms(man: dict, models_root: str, only: str | None) -> list[dict]:
     for arm in arms:
         if "id" not in arm or "path" not in arm or "kind" not in arm:
             raise SystemExit(f"{man['_path']}: arm needs id/path/kind: {arm}")
-        if arm["kind"] not in ("bf16", "fp16", "residue", "modelopt_fp4"):
+        if arm["kind"] not in ("bf16", "fp16", "residue", "modelopt_fp4", "modelopt_mxfp4"):
             raise SystemExit(
                 f"arm {arm['id']}: unknown kind {arm['kind']!r} "
-                f"(expected bf16 | residue | modelopt_fp4)"
+                f"(expected bf16 | residue | modelopt_fp4 | modelopt_mxfp4)"
             )
         if arm.get("mext", "on") != "on":
             raise ValueError("Runtime ablations moved to .dev/suites/quality_ablations")
@@ -95,16 +95,10 @@ def resolve_arms(man: dict, models_root: str, only: str | None) -> list[dict]:
             continue
         config = json.loads((full / "config.json").read_text())
         quant = config.get("quantization_config") or {}
-        quant_details = quant.get("quantization", quant)
-        if (
-            quant.get("quant_method") == "residue_mxfp4"
-            or str(quant_details.get("quant_algo", "")).upper() == "MXFP4"
-        ):
+        if quant.get("quant_method") == "residue_mxfp4":
             raise SystemExit(
-                f"arm {arm['id']}: this manifest runner has no MXFP4 "
-                "serving path; do not route MXFP4 through modelopt_fp4. "
-                "Native ModelOpt MXFP4 uses the offline evalkit; legacy "
-                "residue_mxfp4 requires its isolated historical adapter."
+                f"arm {arm['id']}: legacy residue_mxfp4 requires its isolated "
+                "historical adapter; use a native ModelOpt MXFP4 export."
             )
         actual_type = config.get("text_config", config).get("model_type")
         if actual_type != man["model_type"]:
