@@ -93,7 +93,7 @@ def _run(inputs, policy, tactic):
 
 
 def _fallback(inputs, policy):
-    # The vLLM caller owns the existing CUTLASS and static Fold paths.  Import
+    # The vLLM caller owns the FlashInfer GEMM and static Fold paths.  Import
     # only when that callback is needed; this module remains standalone.
     from quant.vllm_integration.residue_linear_op import _nvfp4_linear_impl
 
@@ -129,6 +129,6 @@ def tuned_nvfp4_linear(inputs, policy):
         candidates_hash(), fold_tiles_hash(), KLOOP_SM100_CFGS, KLOOP_TILES))
     spec = LinearSpec(
         "nvfp4", cache_policy, buckets, enabled, _fallback, _valid, _run,
-        _route, "vllm_cutlass_and_static_fold_v2", _record,
+        _route, "flashinfer_auto_and_static_fold_v4", _record,
     )
     return tuned_linear(inputs, spec)

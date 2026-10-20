@@ -172,7 +172,7 @@ def _measure_arm(arm, runner, base, *, repeats):
                physical_m=max(4, m) if arm == "fi_mxfp4_mxfp8_w4a8" else m)
     if arm == "fi_mxfp4_mxfp8_w4a8":
         row["kernel_config"] = dict(W4A8_CONFIG)
-    with fi_autotuned(fn, inputs, m_bucket=m, enabled=selection == "flashinfer_autotune"):
+    with fi_autotuned(fn, inputs, tuning_buckets=(m,), enabled=selection == "flashinfer_autotune"):
         warm_equally(fn, inputs, calls=20)
         row.update(timed_detail(fn, inputs, repeats=repeats))
         row.update(selected_tactic(arm))

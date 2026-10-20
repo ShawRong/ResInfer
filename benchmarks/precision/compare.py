@@ -189,7 +189,7 @@ def compare_linear(
                 fn, inputs = runners[arm]
                 selection = STATIC_SELECTION.get(arm, "flashinfer_autotune")
                 weight_format, activation_format, provider = ARM_FORMAT[arm]
-                with fi_autotuned(fn, inputs, m_bucket=1,
+                with fi_autotuned(fn, inputs, tuning_buckets=(1,),
                                   enabled=selection == "flashinfer_autotune"):
                     output = fn(*inputs).clone()
                     item = {
@@ -255,7 +255,7 @@ def compare_prefill(weights, activations, metadata, timing, rows, costs, save):
             xhash = digest(x)
             for arm in make_kext_arms(x, packed, extended, ratios):
                 selection = STATIC_SELECTION.get(arm.arm, "flashinfer_autotune")
-                with fi_autotuned(arm.forward, arm.inputs, m_bucket=x.shape[0],
+                with fi_autotuned(arm.forward, arm.inputs, tuning_buckets=arm.tuning_buckets,
                                   enabled=selection == "flashinfer_autotune"):
                     output = arm.forward(*arm.inputs)
                     item = dict(kind="kext", phase="prefill", index=index,

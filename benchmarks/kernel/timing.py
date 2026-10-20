@@ -84,12 +84,12 @@ def timed_detail(fn: Callable[..., Any], args: Sequence[Any] = (),
 
 @contextmanager
 def fi_autotuned(fn: Callable[..., Any], args: Sequence[Any],
-                 m_bucket: int, warmup: int = 3, *, enabled: bool = True):
+                 tuning_buckets: tuple[int, ...], warmup: int = 3, *, enabled: bool = True):
     """Keep the same bucket mapping while tuning and measuring the callable."""
     import torch
     from flashinfer.autotuner import autotune
 
-    with autotune(False, tuning_buckets=(m_bucket,)):
+    with autotune(False, tuning_buckets=tuning_buckets):
         if enabled:
             with autotune(True):
                 for _ in range(warmup):

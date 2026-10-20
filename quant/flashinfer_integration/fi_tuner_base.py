@@ -59,7 +59,8 @@ def make_runner_pair(
         def get_valid_tactics(self, inputs, profile):
             return [0]
 
-        def forward(self, inputs, tactic=-1, **kwargs):
+        def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
+            # FlashInfer calls preparation eagerly: tune nested GEMMs before capture.
             return fallback_forward(inputs)
 
         def get_cache_key_extras(self, inputs):

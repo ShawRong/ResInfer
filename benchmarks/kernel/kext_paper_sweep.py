@@ -30,13 +30,12 @@ SUPPORTED_RATIOS = (*SELECTIVE_RATIOS, 1.0)
 
 def measure_arms(arms, args, *, order_offset=0):
     """Rotate measurement order; compute ratios after the stock result is known."""
-    m = arms[0].inputs[0].shape[0]
     shift = order_offset % len(arms)
     ordered_arms = arms[shift:] + arms[:shift]
     rows = []
     for arm in ordered_arms:
         selection = STATIC_SELECTION.get(arm.arm, "flashinfer_autotune")
-        with fi_autotuned(arm.forward, arm.inputs, m_bucket=m,
+        with fi_autotuned(arm.forward, arm.inputs, tuning_buckets=arm.tuning_buckets,
                           enabled=selection == "flashinfer_autotune"):
             warm_equally(arm.forward, arm.inputs)
             measured = timed_detail(arm.forward, arm.inputs,

@@ -156,6 +156,12 @@ class BenchmarkArm(NamedTuple):
     policy: object = None
     arm: str = ""
 
+    @property
+    def tuning_buckets(self):
+        m = self.inputs[0].shape[0]
+        # The ratio1 row-pair GEMM has twice the outer Linear's rows.
+        return (m, 2 * m) if self.route == "ratio1_prefill" else (m,)
+
 def residue_arm(x, weight, scale, base_scale, scale_inv, alpha, mask,
                 *, k, n, num_salient, ratio1, fold_eligible=True):
     """Use the production route, exposing its active weight/scales to rotation."""

@@ -10,12 +10,14 @@ from __future__ import annotations
 import torch
 
 import nvfp4
-from .env_contract import settings
-from vllm._custom_ops import cutlass_scaled_fp4_mm, scaled_fp4_quant
+from flashinfer import mm_fp4
+from vllm._custom_ops import scaled_fp4_quant
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     pad_nvfp4_activation_for_cutlass,
     slice_nvfp4_output,
 )
+
+from .env_contract import settings
 
 # Row-pair layout used by the two-GEMM prefill fallback.
 _LAYOUT_ROW_PAIR = 1
@@ -52,16 +54,10 @@ def _run_ratio1_prefill_two_gemm(
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """ratio-1 prefill: one backend GEMM at 2M rows + pair-sum epilogue.
+    """Ratio-1 prefill: FlashInfer GEMM at 2M rows, then sum each row pair.
 
-    out[i] = W·base_i + W·res_i, exactly the fold's math. The mext_r1 quant's
-    row_pair SF is bytewise the cutlass 128x4 swizzle over the 2M rows (the
-    kernel places SFs with the same cvt_quant_to_fp4_get_sf_out_offset the
-    stock quant uses), so the doubled activation feeds cutlass_scaled_fp4_mm
-    directly and base/residue rows come back interleaved at even/odd indices.
-
-    Every op here has a static compile space: no CuTeDSL, nothing to JIT at
-    serving time, and cudagraph capture sees ordinary torch/cutlass calls.
+    Row-pair quantization produces the same 128x4 scale layout as stock
+    NVFP4. FlashInfer tunes the GEMM before the outer Linear comparison.
     """
     x_fp4, x_sf = nvfp4.scaled_fp4_quant_mext_r1(
         x, input_global_scale_inv, layout_mode=_LAYOUT_ROW_PAIR,
@@ -71,8 +67,9 @@ def _run_ratio1_prefill_two_gemm(
     num_k_tiles = (k + 63) // 64
     x_sf_v = x_sf.view(torch.float8_e4m3fn).view(
         num_m_tiles * 128, num_k_tiles * 4)
-    y = cutlass_scaled_fp4_mm(
-        x_fp4, weight, x_sf_v, weight_scale_base, alpha, output_dtype)
+    y = mm_fp4(
+        x_fp4, weight.T, x_sf_v, weight_scale_base.T, alpha, output_dtype,
+        backend="auto")
     return y[0::2] + y[1::2]
 
 
@@ -94,7 +91,7 @@ def _linear_policy(k_base, num_salient, padding, output_size,
 
 
 def _nvfp4_linear_impl(inputs, policy):
-    """Execute the static implementation of the shared numerical route."""
+    """Quantize and run GEMM for the selected numerical route."""
     from ..flashinfer_integration.nvfp4_linear_adapter import (
         _fold_inputs, _route,
     )
@@ -137,8 +134,9 @@ def _nvfp4_linear_impl(inputs, policy):
             ((m + 127) // 128) * 128,
             ((k + policy.num_salient + 63) // 64) * 4)
     x_fp4 = pad_nvfp4_activation_for_cutlass(x_fp4, policy.padding)
-    out = cutlass_scaled_fp4_mm(
-        x_fp4, weight, x_sf, weight_scale, alpha, x.dtype)
+    out = mm_fp4(
+        x_fp4, weight.T, x_sf, weight_scale.T, alpha, x.dtype,
+        backend="auto")
     return slice_nvfp4_output(out, policy.output_size)
 
 
