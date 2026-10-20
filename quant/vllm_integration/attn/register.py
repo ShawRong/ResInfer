@@ -43,7 +43,7 @@ def _registry_shape_ok(reg) -> bool:
 
 
 def install(force: bool = False) -> bool:
-    """Register the phase-separated ResAttn backend on CUSTOM.
+    """Register the ResAttn backend on CUSTOM.
 
     Idempotent; returns True iff the backend is (now) registered. Gated on
     ``RESIDUE_ATTN=1`` unless ``force=True``. Any structural mismatch refuses

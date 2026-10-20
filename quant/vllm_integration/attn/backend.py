@@ -1,14 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025 ResInfer contributors
 # SPDX-License-Identifier: Apache-2.0
-"""Phase-separated ResAttn host adapter for the vLLM 0.26 Runtime.
+"""ResAttn decode with stock FlashInfer prefill and KV writing (vLLM 0.26).
 
-Stock FlashInfer owns metadata planning, cache shape/writing and prefill.
-Only decode consumes raw BF16 Q and invokes our existing QK-residue kernel.
-Pure prefill is delegated to stock. Mixed prefill/decode steps are rejected:
-stock would convert decode Q to FP8 and bypass ResAttn's BF16-Q residue path.
-Continuous batching is supported only while each step remains phase-separated;
-this backend does not change the scheduler or prevent it from proposing a mix.
+Mixed batches reuse upstream ordering: decode tokens first, prefill tokens last.
+Stock handles prefill query/output conversions; decode retains original BF16 Q.
 """
+from dataclasses import replace
 import os
 
 import torch
@@ -33,21 +30,6 @@ from nvfp4.cute_attn.kv_layout import NvFp4PagedKVPool
 
 from .decode import ResAttnDecodeMixin
 from .warmup import _register_decode_warmup
-
-
-def _require_separate_phases(metadata):
-    """Reject mixed steps instead of silently changing decode numerics."""
-    if metadata.num_prefill_tokens and (metadata.num_decodes or metadata.num_decode_tokens):
-        # An explicit exception also protects production runs under python -O.
-        raise NotImplementedError(
-            "ResAttn does not support mixed prefill/decode batches: "
-            f"num_prefill_tokens={metadata.num_prefill_tokens}, "
-            f"num_decodes={metadata.num_decodes}, "
-            f"num_decode_tokens={metadata.num_decode_tokens}. "
-            "Run phase-separated prefill and decode steps. Stock fallback is "
-            "disabled because it quantizes decode Q to FP8 and bypasses "
-            "ResAttn residue attention."
-        )
 
 
 def _require_trtllm_decode(metadata):
@@ -80,13 +62,12 @@ class ResAttnFlashInferMetadataBuilder(FlashInferMetadataBuilder):
     def build(self, common_prefix_len, common_attn_metadata,
               fast_build=False) -> FlashInferMetadata:
         stock = super().build(common_prefix_len, common_attn_metadata, fast_build)
-        _require_separate_phases(stock)
         if stock.use_cascade or not stock.causal:
             raise NotImplementedError("ResAttn requires causal, non-cascade attention")
         if stock.num_prefill_tokens and not isinstance(stock.prefill, TRTLLMPrefill):
             raise NotImplementedError("This adapter requires stock TRTLLM prefill")
         n = stock.num_decodes
-        if n and not stock.num_prefill_tokens:
+        if n:
             if n != stock.num_decode_tokens:
                 raise NotImplementedError("ResAttn requires one token per decode")
             decode = _require_trtllm_decode(stock)
@@ -133,9 +114,7 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
                 or self.sinks is not None
                 or self.kv_sharing_target_layer_name is not None):
             raise NotImplementedError("Unsupported ResAttn decode attention variant")
-        # Attention.forward must preserve raw BF16 Q for pure decode. Stock's
-        # forward performs its normal query conversion when we delegate a
-        # pure prefill step below; mixed steps are rejected.
+        # Preserve BF16 Q for decode; stock converts only the prefill slice.
         # Set after super(): FlashInfer's constructor sets an instance value.
         self.supports_quant_query_input = False
         self._decode_reduction_workspaces = {}
@@ -180,30 +159,45 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
         fused_nvfp4 = scales is not None
         if attn_metadata is None:
             return output.fill_(0)
-        _require_separate_phases(attn_metadata)
         if query.dtype != torch.bfloat16:
             raise ValueError("ResAttn needs original BF16 Q, not FP8 Q")
         if output.dtype != (torch.uint8 if fused_nvfp4 else torch.bfloat16):
             raise ValueError("ResAttn output dtype does not match fusion mode")
         md = attn_metadata
         if md.num_prefill_tokens:
-            # vLLM already invoked the inherited stock cache writer exactly
-            # once. Only pure prefill can reach the stock execution path.
-            if scales is None:
-                return super().forward(layer, query, key, value, kv_cache,
-                                       md, output)
-            output_scale, output_block_scale = scales
-            stock_output = torch.empty_like(query, dtype=torch.bfloat16)
-            super().forward(layer, query, key, value, kv_cache,
-                            md, stock_output)
-            n = md.num_actual_tokens
-            torch.ops._C.scaled_fp4_quant.out(
-                input=stock_output[:n].reshape(n, self.num_heads * self.head_size),
-                input_scale=output_scale,
-                is_sf_swizzled_layout=True,
-                output=output[:n].reshape(n, self.num_heads * self.head_size // 2),
-                output_scale=output_block_scale.view(torch.int32),
-            )
+            # vLLM already wrote KV once before this forward.
+            prefill_md = md
+            q_pre, k_pre, v_pre = query, key, value
+            bf16_output = output if scales is None else torch.empty_like(query)
+            prefill_output = bf16_output
+            if md.num_decodes:
+                n, end = md.num_decode_tokens, md.num_actual_tokens
+                prefill_md = replace(
+                    md, num_actual_tokens=md.num_prefill_tokens,
+                    num_decodes=0, num_decode_tokens=0, decode=None,
+                    slot_mapping=md.slot_mapping[n:end])
+                q_pre, k_pre, v_pre = query[n:end], key[n:end], value[n:end]
+                prefill_output = bf16_output[n:end]
+            # Stock NVFP4 prefill uses FP8 Q/output and converts back to BF16.
+            # These upstream conversions remain part of mixed E2E cost.
+            super().forward(layer, q_pre, k_pre, v_pre, kv_cache,
+                            prefill_md, prefill_output)
+            if md.num_decodes:
+                _require_trtllm_decode(md)
+                self._decode_forward(query, self._pool_for(kv_cache, layer),
+                                     md, bf16_output)
+            if scales is not None:
+                # shortcut: pack combined BF16 output to avoid overlapping scale
+                # tiles; revisit when prefill supports compatible direct output.
+                output_scale, output_block_scale = scales
+                n = md.num_actual_tokens
+                torch.ops._C.scaled_fp4_quant.out(
+                    input=bf16_output[:n].reshape(n, self.num_heads * self.head_size),
+                    input_scale=output_scale,
+                    is_sf_swizzled_layout=True,
+                    output=output[:n].reshape(n, self.num_heads * self.head_size // 2),
+                    output_scale=output_block_scale.view(torch.int32),
+                )
             return output
         if md.num_decodes:
             _require_trtllm_decode(md)
@@ -220,7 +214,7 @@ class ResAttnFlashInferImpl(ResAttnDecodeMixin, FlashInferImpl):
 
 
 class ResAttnFlashInferBackend(FlashInferBackend):
-    """Stock prefill/cache contract with a pure-decode ResAttn dispatch."""
+    """Stock prefill/cache contract with ResAttn decode, including mixed batches."""
     supported_dtypes = [torch.bfloat16]
     supported_kv_cache_dtypes = ["nvfp4"]
 
