@@ -1,6 +1,6 @@
 {
   "name": "mext_paper_sm100_current",
-  "description": "Online quantization + GEMM: tuned NVFP4/MXFP4 MEXT, W4A4, official-default FI W4A8, TRT NVFP4/FP8 and MXFP4/MXFP8 W4A8; fixed MXFP4 is an ablation",
+  "description": "Online quantization + GEMM: tuned NVFP4/MXFP4 MEXT, W4A4, official-default FI W4A8, TRT NVFP4/FP8 and MXFP4/MXFP8 W4A8",
   "m_values": [
     1,
     2,
@@ -21,7 +21,6 @@
     "mext_r1",
     "fi_nvfp4_cutlass",
     "fi_nvfp4_cutedsl",
-    "resinfer_mxfp4_mext_r1",
     "resinfer_mxfp4_mext_r1_tuned",
     "fi_mxfp4_mxfp4_stock",
     "fi_mxfp4_mxfp4_cutedsl_quant",
